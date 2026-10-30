@@ -27,6 +27,7 @@ const attn_nax = @import("src/attn_nax.zig");
 const index_nax = @import("src/index_nax.zig");
 const vision_key = @import("src/vision_key.zig");
 const copy_lookup = @import("src/copy_lookup.zig");
+const draft_audit = @import("src/draft_audit.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.1.0";
@@ -77,6 +78,8 @@ const Model = struct {
     open: ?Open = null,
     /// This request's copy rounds, the drafts they verified and kept; logged when the next request resets the state.
     copy: CopyStats = .{},
+    /// Experiment only: the draft audit (`SUSHI_DS41_AUDIT_OUT`, read at load); null leaves the rounds untouched.
+    audit: ?Audit = null,
     prev_cache_limit: ?usize = null,
     /// The MLX buffer-pool cap in force (`borrow.poolCap` of the last pass's rows): `pool_bytes` at decode widths.
     pool_now: u64 = pool_bytes,
@@ -169,6 +172,10 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     errdefer gpa.destroy(m);
     m.* = .{ .cfg = priv.cfg, .weights = undefined, .mdl = undefined, .engine = undefined, .experts = undefined, .s = s };
     const c = &m.cfg;
+    if (std.c.getenv("SUSHI_DS41_AUDIT_OUT")) |path| {
+        m.audit = .{ .out = path, .force_path = std.c.getenv("SUSHI_DS41_AUDIT_FORCE") };
+        log.info("[sushi_ds41] draft audit on: rounds logged to {s}, forced along {s}\n", .{ std.mem.span(path), if (m.audit.?.force_path) |f| std.mem.span(f) else "(nothing)" });
+    }
 
     var geo: stream.Geometry = .{
         .layers = @intCast(c.layers),
@@ -289,6 +296,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     m.weights.deinit();
     m.ids.deinit(gpa);
     m.lookup.deinit(gpa);
+    if (m.audit) |a| gpa.free(a.force);
     gpa.destroy(m);
 }
 
@@ -354,6 +362,7 @@ fn reset(m: *Model) void {
     m.open = null;
     clearIds(m);
     m.policy = rows_policy.Policy.init(depth_bounds.active, m.cfg.dspark.block);
+    auditBegin(m);
 }
 
 /// A prompt as sushi runs it: all but its last token in chunks (`prefill_width`, a short tail merged into the last), each
@@ -427,6 +436,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
 test {
     _ = config;
     _ = attn_nax;
+    _ = draft_audit;
 }
 
 // ── prefix cache ──
@@ -529,6 +539,7 @@ fn auxBeginPrompt(mp: *anyopaque, _: u32, prompt: abi.Span(u32), media: abi.Arra
         const st = dsv.ensureState(m.mdl) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
         if (st.n != restored_at or restored_at >= prompt.len or m.ids.items.len != restored_at)
             return Verdict.refuse(.failed, "sushi_ds41: the restored position differs from the prompt boundary");
+        auditBegin(m);
     }
     if (m.snap) |sn| {
         freeSnap(sn);
@@ -742,8 +753,13 @@ fn nativeStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callc
     defer gpa.free(best);
     var accepted: usize = 0;
     while (accepted + 1 < open.rows and best[accepted] == open.ids[1 + accepted]) accepted += 1;
+    var next = best[accepted];
+    if (auditRound(m, &open, best, accepted)) |forced| {
+        accepted = forced.accepted;
+        next = forced.next;
+    }
     closeRound(m, &open, accepted, &out.round) catch |e| return roundFailed(e);
-    out.round.next_token = best[accepted];
+    out.round.next_token = next;
     return .ok;
 }
 
@@ -797,7 +813,8 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
         o.draft_ms = nanosSince(draft_start);
         return verifyOpen(m, o);
     }
-    const plain = m.policy.next() == .plain;
+    // The audit drafts and verifies every round's whole block.
+    const plain = m.audit == null and m.policy.next() == .plain;
     o.drafted = !plain;
     if (!plain) {
         var block = try dsv.draftHeads(m.mdl, t1, .conf);
@@ -807,7 +824,7 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
         @memcpy(o.conf[0 .. o.block_len - 1], block.conf[0 .. o.block_len - 1]);
     }
     o.draft_ms = nanosSince(draft_start);
-    const wanted: usize = if (plain) 1 else m.policy.rows(o.conf[0 .. o.block_len - 1]);
+    const wanted: usize = if (plain) 1 else if (m.audit != null) o.block_len else m.policy.rows(o.conf[0 .. o.block_len - 1]);
     const rows = std.math.clamp(wanted, 1, @min(@as(usize, cap) + 1, max_verify_rows));
     o.rows = @min(rows, o.block_len);
     return verifyOpen(m, o);
@@ -816,6 +833,7 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
 /// The copy arm: writes the context's continuation after `t1` to `drafts` and returns its length, or null for a stage
 /// round.
 fn copyDrafts(m: *Model, t1: u32, cap: u32, drafts: []u32) !?usize {
+    if (m.audit != null) return null; // the audit measures stage blocks only
     try m.lookup.sync(gpa, m.ids.items);
     const room = @min(@as(usize, cap), max_verify_rows - 1, drafts.len);
     const found = m.lookup.matchBest(t1, @intCast(room));
@@ -881,4 +899,80 @@ fn argmaxRows(m: *Model, logits: mlx.mlx_array, suppress: ?mlx.mlx_array, rows: 
     const data = mlx.mlx_array_data_uint32(flat) orelse return error.InvalidInput;
     if (mlx.mlx_array_size(flat) != rows) return error.InvalidInput;
     return gpa.dupe(u32, data[0..rows]);
+}
+
+// ── draft audit (experiment only) ──
+
+const Audit = struct {
+    out: [*:0]const u8,
+    force_path: ?[*:0]const u8,
+    /// The forced continuation of the request's prompt, read at its first round.
+    force: []u32 = &.{},
+    /// The request's prompt length (the position of its first round's t1); null until that round.
+    p: ?usize = null,
+};
+
+/// A new request: its force file is read and its prompt length taken at its first round.
+fn auditBegin(m: *Model) void {
+    const a = if (m.audit) |*x| x else return;
+    gpa.free(a.force);
+    a.force = &.{};
+    a.p = null;
+}
+
+fn readForce(path: ?[*:0]const u8) []u32 {
+    const p = path orelse return &.{};
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(p), gpa, .limited(64 << 20)) catch |e| {
+        if (e != error.FileNotFound) log.warn("[sushi_ds41] audit force file: {s}\n", .{@errorName(e)});
+        return &.{};
+    };
+    defer gpa.free(raw);
+    return draft_audit.parseIds(gpa, raw) catch |e| {
+        log.warn("[sushi_ds41] audit force file: {s}\n", .{@errorName(e)});
+        return &.{};
+    };
+}
+
+/// Logs the round (before `closeRound` commits it) and returns the forced commit, or null to keep the verifier's
+/// (`stq_accepted`, no audit or the forced text has run out).
+fn auditRound(m: *Model, o: *const Open, stq: []const u32, stq_accepted: usize) ?draft_audit.Commit {
+    const a = if (m.audit) |*x| x else return null;
+    const pos = m.ids.items.len;
+    if (a.p == null) {
+        a.p = pos;
+        a.force = readForce(a.force_path);
+    }
+    const p = a.p.?;
+    if (pos < p or pos - p >= a.force.len) return null;
+    const at = pos - p;
+    const after = a.force[at + 1 ..];
+    const commit = draft_audit.forcedCommit(o.ids[1..o.rows], after);
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    draft_audit.writeLine(&buf.writer, .{
+        .p = p,
+        .pos = pos,
+        .t1 = o.ids[0],
+        .t1_matches_force = a.force[at] == o.ids[0],
+        .history_ok = std.mem.eql(u32, m.ids.items[p..pos], a.force[0..at]),
+        .drafts = o.ids[1..o.block_len],
+        .conf = o.conf[0 .. o.block_len - 1],
+        .stq = stq,
+        .force = after[0..@min(after.len, o.rows)],
+        .accepted = if (commit) |c| c.accepted else stq_accepted,
+        .rows = o.rows,
+        .forced = commit != null,
+    }) catch |e| {
+        log.warn("[sushi_ds41] audit line: {s}\n", .{@errorName(e)});
+        return commit;
+    };
+    // Opened per line: the driver moves the file between requests.
+    const f = std.c.fopen(a.out, "a") orelse {
+        log.warn("[sushi_ds41] audit: cannot open the output file\n", .{});
+        return commit;
+    };
+    _ = std.c.fwrite(buf.written().ptr, 1, buf.written().len, f);
+    _ = std.c.fclose(f);
+    return commit;
 }
