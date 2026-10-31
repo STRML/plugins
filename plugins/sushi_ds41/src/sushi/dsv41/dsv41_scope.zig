@@ -231,21 +231,53 @@ pub const Scope = struct {
     }
 };
 
+/// Diagnostic (`SUSHI_DS41_PREFILL_LOG`): the host's blocking evaluations through `evalAll`, `waitOne` and the host
+/// reads below, and the time spent in them. Counted only while `Waits.on`.
+pub const Waits = struct {
+    pub var on = false;
+    pub var n: u64 = 0;
+    pub var ns: u64 = 0;
+
+    fn now() u64 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        return @intCast(std.Io.Timestamp.now(io, .boot).nanoseconds);
+    }
+
+    pub fn start() u64 {
+        return if (on) now() else 0;
+    }
+
+    pub fn done(t0: u64) void {
+        if (!on) return;
+        n += 1;
+        ns += now() -| t0;
+    }
+};
+
 /// Evaluates `xs` together.
 pub fn evalAll(xs: []const A) !void {
     const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
     defer _ = mlx.mlx_vector_array_free(vec);
+    const t0 = Waits.start();
+    defer Waits.done(t0);
     try mlx.check(mlx.mlx_eval(vec));
 }
 
-pub fn hostF32(a: A) ![]const f32 {
+/// Evaluates `a`, a blocking wait the prefill diagnostic counts.
+pub fn waitOne(a: A) !void {
+    const t0 = Waits.start();
+    defer Waits.done(t0);
     try mlx.check(mlx.mlx_array_eval(a));
+}
+
+pub fn hostF32(a: A) ![]const f32 {
+    try waitOne(a);
     const p = mlx.mlx_array_data_float32(a) orelse return error.HostRead;
     return p[0..mlx.mlx_array_size(a)];
 }
 
 pub fn hostI32(a: A) ![]const i32 {
-    try mlx.check(mlx.mlx_array_eval(a));
+    try waitOne(a);
     const p = mlx.mlx_array_data_int32(a) orelse return error.HostRead;
     return p[0..mlx.mlx_array_size(a)];
 }

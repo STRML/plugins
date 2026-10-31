@@ -84,6 +84,11 @@ const Model = struct {
     pool_now: u64 = pool_bytes,
     /// Positions the expert cache was sized to leave room for (a request's state and one prefill chunk's working set).
     billed_context: u64 = default_context,
+    /// `SUSHI_DS41_WAVEFRONT=<N>`: state-only prefill chunks run N at a time as a layer-lagged wavefront
+    /// (`dsv.extendStateWave`); 0 runs them one by one.
+    wave: usize = 0,
+    /// `SUSHI_DS41_PREFILL_LOG`: one line per state-only chunk or wavefront group, with its wall time and host waits.
+    prefill_log: bool = false,
 };
 
 // ── bill ──
@@ -212,6 +217,13 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         pf.* = dsv.Profile.init(verify_profile);
         m.mdl.profile = pf;
     }
+    m.wave = waveSetting(std.c.getenv("SUSHI_DS41_WAVEFRONT"));
+    if (m.wave > 0 and !dsv.waveOk(m.mdl)) {
+        log.warn("[sushi_ds41] SUSHI_DS41_WAVEFRONT ignored: a stage profile, trace or tap is on, or the pack has no CED split\n", .{});
+        m.wave = 0;
+    }
+    if (m.wave > 0) log.info("[sushi_ds41] wavefront prefill: {d} state-only chunks in flight, one layer apart\n", .{m.wave});
+    m.prefill_log = std.c.getenv("SUSHI_DS41_PREFILL_LOG") != null;
     // The tower borrows its tensors from `m.weights`, which the model left them in.
     if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
     errdefer if (m.tower) |*t| t.deinit();
@@ -376,15 +388,20 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
     const prefix = if (want == .last and ids.len > 1) ids.len - 1 else 0;
     var at: usize = 0;
     while (at < prefix) {
-        var end = @min(at + sc.prefill_width, prefix);
-        if (end < prefix and prefix - end < sc.tail_merge_rows) end = prefix;
-        const next = if (end < prefix) @min(end + sc.prefill_width, prefix) else ids.len;
-        // Another chunk of the prefix follows and is wider than the window (the merge keeps tails of `tail_merge_rows`
-        // rows), so its CED tail overwrites this chunk's decoder rows before anything reads them: run this one without
-        // its decoder (`extendState`).
-        if (end < prefix and end - at > m.mdl.cfg.window and prefix - end > m.mdl.cfg.window and m.mdl.ced_split != null) try stateRows(m, ids[at..end], ids[end..next], rows) else _ = mlx.mlx_array_free(try forwardRows(m, ids[at..end], .last, ids[end..next], rows));
-        if (rows) |*r| r.offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
-        at = end;
+        const ch = chunkAt(m, at, prefix);
+        const next = aheadEnd(ch.end, prefix, ids.len);
+        // A run of state-only text chunks goes as one wavefront group; progress then moves once a group.
+        if (ch.state_only and rows == null and m.wave >= 2) {
+            const end = try waveRows(m, ids, at, prefix);
+            if (end > ch.end) {
+                at = end;
+                if (progress) |p| @atomicStore(u64, p, at, .monotonic);
+                continue;
+            }
+        }
+        if (ch.state_only) try stateRows(m, ids[at..ch.end], ids[ch.end..next], rows) else _ = mlx.mlx_array_free(try forwardRows(m, ids[at..ch.end], .last, ids[ch.end..next], rows));
+        if (rows) |*r| r.offset += std.mem.count(u32, ids[at..ch.end], &.{m.cfg.image_token_id});
+        at = ch.end;
         if (progress) |p| @atomicStore(u64, p, at, .monotonic);
     }
     try capture(m);
@@ -394,6 +411,90 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
     errdefer _ = mlx.mlx_array_free(o);
     try mlx.check(mlx.mlx_reshape(&o, logits, &[_]c_int{ -1, @intCast(m.cfg.vocab) }, 2, m.s));
     return o;
+}
+
+const Chunk = struct { end: usize, state_only: bool };
+
+/// The prefix chunk that starts at `at`: `prefill_width` rows, a short tail merged into the last. It leaves state only
+/// when another chunk of the prefix follows and is wider than the window (the merge keeps tails of `tail_merge_rows`
+/// rows), so its CED tail overwrites this chunk's decoder rows before anything reads them (`extendState`).
+fn chunkAt(m: *const Model, at: usize, prefix: usize) Chunk {
+    var end = @min(at + sc.prefill_width, prefix);
+    if (end < prefix and prefix - end < sc.tail_merge_rows) end = prefix;
+    const w = m.mdl.cfg.window;
+    return .{ .end = end, .state_only = end < prefix and end - at > w and prefix - end > w and m.mdl.ced_split != null };
+}
+
+/// Where the tokens told to a chunk ending at `end` stop: one chunk width on, or the whole request after the prefix.
+fn aheadEnd(end: usize, prefix: usize, n: usize) usize {
+    return if (end < prefix) @min(end + sc.prefill_width, prefix) else n;
+}
+
+/// The `SUSHI_DS41_WAVEFRONT` value: chunks in flight, 0 (off) when unset, unparsable or below 2, capped at
+/// `dsv.wave_max`.
+fn waveSetting(raw: ?[*:0]const u8) usize {
+    const z = raw orelse return 0;
+    const n = std.fmt.parseInt(usize, std.mem.span(z), 10) catch return 0;
+    return if (n < 2) 0 else @min(n, dsv.wave_max);
+}
+
+/// Runs the state-only text chunks from `at` on, up to `m.wave` of them, as one wavefront group and returns where the
+/// group ended; `at` when fewer than two such chunks follow (the caller runs that one alone).
+fn waveRows(m: *Model, ids: []const u32, at: usize, prefix: usize) !usize {
+    var bounds: [dsv.wave_max + 1]usize = undefined;
+    bounds[0] = at;
+    var k: usize = 0;
+    while (k < m.wave) {
+        const ch = chunkAt(m, bounds[k], prefix);
+        if (!ch.state_only or ch.end - bounds[k] > dsv.wave_rows_max) break;
+        k += 1;
+        bounds[k] = ch.end;
+    }
+    if (k < 2) return at;
+    var chunks: [dsv.wave_max][]const u32 = undefined;
+    for (0..k) |c| chunks[c] = ids[bounds[c]..bounds[c + 1]];
+    const end = bounds[k];
+    const ahead = ids[end..aheadEnd(end, prefix, ids.len)];
+    poolForRows(m, chunks[0].len);
+    m.engine.beginForward();
+    const w = waitsStart(m);
+    try dsv.extendStateWave(m.mdl, chunks[0..k], dsv.SPAN, ahead);
+    m.engine.finishForward(end - at);
+    waitsReport(m, w, "wave", k, end - at);
+    try m.ids.appendSlice(gpa, ids[at..end]);
+    return end;
+}
+
+const WaitMark = struct { t0: u64, n: u64, ns: u64 };
+
+fn waitsStart(m: *const Model) WaitMark {
+    const W = dsv.Waits;
+    W.on = m.prefill_log;
+    return .{ .t0 = W.start(), .n = W.n, .ns = W.ns };
+}
+
+/// `SUSHI_DS41_PREFILL_LOG`: the chunk's (or group's) wall time, the model's blocking host waits in it, and the expert
+/// hook's own waits for the router input and the picks.
+fn waitsReport(m: *const Model, w: WaitMark, kind: []const u8, chunks: usize, rows: usize) void {
+    if (!m.prefill_log) return;
+    const W = dsv.Waits;
+    const wall: f64 = @as(f64, @floatFromInt(W.start() -| w.t0)) / 1e6;
+    const n = W.n - w.n;
+    const b = m.engine.breakdown();
+    const layers = chunks * (m.mdl.ced_split orelse m.cfg.layers);
+    log.info("[sushi_ds41] prefill {s} chunks={d} rows={d} wall_ms={d:.1} ms_per_chunk={d:.1} waits={d} waits_per_layer={d:.2} wait_ms={d:.1} hook_layers={d} hook_xwait_ms={d:.1} hook_idswait_ms={d:.1}\n", .{
+        kind,
+        chunks,
+        rows,
+        wall,
+        wall / @as(f64, @floatFromInt(chunks)),
+        n,
+        @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(@max(layers, 1))),
+        @as(f64, @floatFromInt(W.ns - w.ns)) / 1e6,
+        b.route_full.layers + b.route_linear.layers,
+        @as(f64, @floatFromInt(b.route_full.x_wait_ns + b.route_linear.x_wait_ns)) / 1e6,
+        @as(f64, @floatFromInt(b.route_full.ids_wait_ns + b.route_linear.ids_wait_ns)) / 1e6,
+    });
 }
 
 /// One pass over `rows`; the logits are the caller's to free (an intermediate chunk's are dropped).
@@ -410,8 +511,10 @@ fn forwardRows(m: *Model, rows: []const u32, want: dsv.Want, ahead: []const u32,
 fn stateRows(m: *Model, rows: []const u32, ahead: []const u32, media: ?dsv.VisionRows) !void {
     poolForRows(m, rows.len);
     m.engine.beginForward();
+    const w = waitsStart(m);
     try dsv.extendState(m.mdl, rows, dsv.SPAN, media, ahead);
     m.engine.finishForward(rows.len);
+    waitsReport(m, w, "state", 1, rows.len);
     try m.ids.appendSlice(gpa, rows);
 }
 
@@ -440,6 +543,42 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
 test {
     _ = config;
     _ = index_nax;
+}
+
+test "sushi_ds41 wavefront: every chunk runs every layer once, in order, one layer behind the chunk before it" {
+    const t = std.testing;
+    for (1..dsv.wave_max + 1) |chunks| for (1..4) |lag| {
+        const layers = 20;
+        var at: [dsv.wave_max][layers]usize = undefined;
+        var seen: [dsv.wave_max][layers]bool = @splat(@splat(false));
+        var it = dsv.WaveSchedule.init(chunks, layers, lag);
+        var i: usize = 0;
+        var last: [dsv.wave_max]?usize = @splat(null);
+        while (it.next()) |u| : (i += 1) {
+            try t.expect(u.chunk < chunks and u.layer < layers and !seen[u.chunk][u.layer]);
+            seen[u.chunk][u.layer] = true;
+            at[u.chunk][u.layer] = i;
+            // A chunk's layers come in order.
+            if (last[u.chunk]) |l| try t.expectEqual(l + 1, u.layer) else try t.expectEqual(@as(usize, 0), u.layer);
+            last[u.chunk] = u.layer;
+        }
+        try t.expectEqual(chunks * layers, i);
+        for (1..chunks) |c| for (0..layers) |l| {
+            // The legality condition: chunk c reaches layer l only after chunk c - 1 finished layers l .. l + lag - 1.
+            try t.expect(at[c - 1][@min(l + lag - 1, layers - 1)] < at[c][l]);
+        };
+    };
+}
+
+test "sushi_ds41 wavefront: SUSHI_DS41_WAVEFRONT parses to chunks in flight, off below two" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 0), waveSetting(null));
+    try t.expectEqual(@as(usize, 0), waveSetting("1"));
+    try t.expectEqual(@as(usize, 0), waveSetting("0"));
+    try t.expectEqual(@as(usize, 0), waveSetting("two"));
+    try t.expectEqual(@as(usize, 2), waveSetting("2"));
+    try t.expectEqual(@as(usize, 4), waveSetting("4"));
+    try t.expectEqual(dsv.wave_max, waveSetting("99"));
 }
 
 // ── prefix cache ──

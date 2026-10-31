@@ -29,6 +29,7 @@ const none = sc_mod.none;
 const dim = sc_mod.dim;
 const ci = sc_mod.ci;
 const evalAll = sc_mod.evalAll;
+pub const Waits = sc_mod.Waits;
 const Config = cfg_mod.Config;
 const prefetch_cand_max = @import("../expert_stream.zig").Prefetcher.cand_max;
 
@@ -2317,7 +2318,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
             try p.mark(.routed, &.{out});
             if (hk.host_ns) |f| p.hostShare(f(hk.ctx) - host0);
         }
-        try if (early) submit(out) else mlx.check(mlx.mlx_array_eval(out));
+        try if (early) submit(out) else sc_mod.waitOne(out);
         return out;
     }
     if (fusedOn(sc, m) and dim(h, 0) > 1 and c.dim % 8 == 0) return moeWide(sc, m, li, h, r, try sharedExpert(sc, m, li, ly, h));
@@ -3454,6 +3455,111 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
         pf.report(ids.len, pass.p0);
     }
     transient_peak.end(.prefill_chunk, ids.len);
+}
+
+/// The most prefill chunks `extendStateWave` keeps in flight.
+pub const wave_max = 8;
+/// The widest chunk a wavefront takes: DeepSeek V4.1 prefill chunks stay at or under 8,192 rows (wider ones hung or
+/// crashed machines through ioGPU), and the wavefront never widens a chunk.
+pub const wave_rows_max = 8192;
+
+/// One unit of a wavefront's work: layer `layer` of chunk `chunk` of the group.
+pub const WaveUnit = struct { chunk: usize, layer: usize };
+
+/// The order a wavefront issues its units in, and the one place that order is decided. At step `s` chunk `c` runs
+/// layer `s - c * lag`, the leading chunk first, so chunk c + 1 reaches layer l only after chunk c finished it: every
+/// piece of state chunk c + 1 reads at layer l (window ring, compressed rows and index keys, the open pooling group)
+/// was written by chunk c at layer l, and nothing chunk c reads at a later layer is written by chunk c + 1 yet.
+/// `lag` >= 1; the legality argument is in local-llm `docs/research/ds41-ane-op-inventory-20261031.md`.
+pub const WaveSchedule = struct {
+    chunks: usize,
+    layers: usize,
+    lag: usize,
+    step: usize = 0,
+    c: usize = 0,
+
+    pub fn init(chunks: usize, layers: usize, lag: usize) WaveSchedule {
+        std.debug.assert(lag >= 1 and chunks >= 1);
+        return .{ .chunks = chunks, .layers = layers, .lag = lag };
+    }
+
+    fn steps(self: *const WaveSchedule) usize {
+        return self.layers + (self.chunks - 1) * self.lag;
+    }
+
+    pub fn next(self: *WaveSchedule) ?WaveUnit {
+        while (self.step < self.steps()) {
+            while (self.c < self.chunks) {
+                const c = self.c;
+                self.c += 1;
+                const back = c * self.lag;
+                if (self.step < back or self.step - back >= self.layers) continue;
+                return .{ .chunk = c, .layer = self.step - back };
+            }
+            self.c = 0;
+            self.step += 1;
+        }
+        return null;
+    }
+};
+
+/// Whether `extendStateWave` may run on this model: it needs the CED split (the chunks leave state only) and none of
+/// the per-pass diagnostics whose state is a singleton (the stage profile, a trace, a calibration tap).
+pub fn waveOk(m: *const Model) bool {
+    return m.ced_split != null and m.profile == null and m.trace == null and m.tap == null;
+}
+
+/// `extendState` over consecutive text chunks `chunks` of one prefill, run as a layer-lagged wavefront: their layers
+/// interleave in `WaveSchedule` order (lag one layer), so up to `chunks.len` passes are in flight. Each chunk does
+/// exactly the work `extendState` does over it, in the same order per layer, so the state it leaves is the same bytes.
+/// The state stands consistent only at the end: `st.n` moves once, after the last chunk, and a failure part-way
+/// leaves layers past `st.n` written (as a failed `extendState` does). `ahead` is the tokens after the group, read
+/// ahead while it runs. Images take `extendState`.
+pub fn extendStateWave(m: *Model, chunks: []const []const u32, span: usize, ahead: []const u32) !void {
+    const split = m.ced_split orelse return error.Dsv41NoCedSplit;
+    if (!waveOk(m) or chunks.len == 0 or chunks.len > wave_max) return error.Dsv41WaveRefused;
+    errdefer m.dropAhead();
+    errdefer m.dropEmbedAhead();
+    const st = try ensureState(m);
+    if (st.verify != null) return error.Dsv41NoCedSplit;
+    for (chunks) |ids| if (ids.len <= m.cfg.window or ids.len > wave_rows_max) return error.Dsv41WaveRefused;
+    transient_peak.begin();
+    var passes: [wave_max]Pass = undefined;
+    var begun: usize = 0;
+    defer for (passes[0..begun]) |*p| p.deinit(m.gpa);
+    // Passes begin in prompt order: each one's Engram rows hash the history the ones before it appended.
+    var p0 = st.n;
+    for (chunks, 0..) |ids, c| {
+        passes[c] = try beginPassWith(m, st, ids, p0, span, null);
+        begun += 1;
+        p0 += ids.len;
+        // Only the last pass reads ahead: `aheadEngram` hashes the history as it stands, which ends after the last.
+        if (c + 1 == chunks.len) passes[c].ahead = ahead;
+        try prefetchEngram(m, &passes[c]);
+    }
+    aheadEmbed(m, ahead);
+    var it = WaveSchedule.init(chunks.len, split, 1);
+    while (it.next()) |u| {
+        const p = &passes[u.chunk];
+        try passLayer(m, p, u.layer);
+        if (u.layer + 1 == split) try waveSplit(m, p, split);
+    }
+    reportEngramWait(m, p0 - st.n);
+    st.n = p0;
+    m.state_only_used += chunks.len;
+    transient_peak.end(.prefill_chunk, chunks[0].len);
+}
+
+/// The end of one wavefront chunk, as `extendState` ends a chunk: the split layer's compressor over its rows.
+fn waveSplit(m: *Model, p: *Pass, split: usize) !void {
+    _ = try settleLast(m, p);
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    try cedCompress(&sc, m, p, split);
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(m.gpa);
+    try appendStateArrays(m.gpa, &ev, &p.st.layers[split]);
+    try evalAll(ev.items);
 }
 
 /// The CED decoder's first layer `li` over every row of the pass: only its compressor, whose ratio-1 rows (and index
