@@ -646,6 +646,29 @@ fn prof(m: *const Model, rows: usize) ?*Profile {
     return if (rows > NARROW_ROWS or p.narrow) p else null;
 }
 
+/// A confidence head retrained on the STQ verifier's accepts: the logit of draft k is `feat . w + bias[k]` plus, when
+/// `stats`, `extra[k] . (p1, margin, entropy)` of draft k's Markov-biased row.
+pub const ConfHead = struct {
+    /// f32 `[1, dim + rank]`.
+    w: A,
+    bias: [cfg_mod.max_block]f32 = @splat(0),
+    extra: [cfg_mod.max_block][3]f32 = @splat(@splat(0)),
+    stats: bool = false,
+};
+
+/// The row-stat term of a retrained confidence head for one draft row `[1, vocab]` f32: `wx . (p1, margin, entropy)`,
+/// `[1, 1]`, all on the GPU.
+fn confStats(sc: *Scope, row: A, wx: [3]f32) !A {
+    const m1 = try sc.max(row, -1, true);
+    const p = try sc.softmax(row, -1);
+    const p1 = try sc.max(p, -1, true);
+    const m2 = try sc.max(try sc.where(try sc.ge(row, m1), try sc.f(-std.math.inf(f32)), row), -1, true);
+    const ent = try sc.sub(try sc.sub(m1, try sc.op1(mlx.mlx_log, p1)), try sc.sum(try sc.mul(p, row), -1, true));
+    var t = try sc.mul(p1, try sc.f(wx[0]));
+    t = try sc.add(t, try sc.mul(try sc.sub(m1, m2), try sc.f(wx[1])));
+    return sc.add(t, try sc.mul(ent, try sc.f(wx[2])));
+}
+
 pub const Model = struct {
     gpa: std.mem.Allocator,
     s: S,
@@ -664,6 +687,9 @@ pub const Model = struct {
     rope_plain: Rope,
     rope_yarn: Rope,
     dspark: ?DsparkW = null,
+    /// Experiment only: a retrained confidence head in place of the checkpoint's (`SUSHI_DS41_CONF_HEAD`); the caller
+    /// owns `w`.
+    conf_head: ?ConfHead = null,
     /// Set while the backbone layers load (`Opts.drop`).
     drop: ?*const expert_usage.Drop = null,
     /// Arrays made at load (casts, views, stacks); freed in `deinit`.
@@ -3610,7 +3636,14 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
         const me = try sc.astype(try sc.take(ds.markov_embed, cur, 0), .float32); // [1, rank]
         const row = try sc.add(try sc.slice(logits, 0, k, k + 1), try sc.matmul(me, try sc.t2(ds.markov_head)));
         rows[k] = row;
-        if (with_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.slice(try sc.astype(hout, .float32), 0, k, k + 1), me }, -1), try sc.t2(ds.conf));
+        if (with_conf) {
+            const feat = try sc.concat(&.{ try sc.slice(try sc.astype(hout, .float32), 0, k, k + 1), me }, -1);
+            if (m.conf_head) |h| {
+                var cl = try sc.add(try sc.matmul(feat, try sc.t2(h.w)), try sc.f(h.bias[k]));
+                if (h.stats) cl = try sc.add(cl, try confStats(&sc, row, h.extra[k]));
+                confs[k] = cl;
+            } else confs[k] = try sc.matmul(feat, try sc.t2(ds.conf));
+        }
         var am = mlx.mlx_array_new();
         cur = try sc.astype(try sc.reshape(try sc.res(mlx.mlx_argmax_axis(&am, row, -1, false, sc.s), &am), &.{1}), .int32);
         picks[k] = cur;

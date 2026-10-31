@@ -27,6 +27,7 @@ const vision_common = @import("src/sushi/vision_common.zig");
 const index_nax = @import("src/index_nax.zig");
 const vision_key = @import("src/vision_key.zig");
 const copy_lookup = @import("src/copy_lookup.zig");
+const conf_head = @import("src/conf_head.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.1.0";
@@ -201,6 +202,10 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     m.engine.warmCache() catch |e| log.warn("[sushi_ds41] expert cache warm failed: {s}\n", .{@errorName(e)});
     m.mdl = try dsv.init(gpa, m.cfg, &m.weights, dir, s, .{ .experts = false, .dspark = priv.dspark });
     errdefer m.mdl.deinit();
+    if (std.c.getenv("SUSHI_DS41_CONF_HEAD")) |path| try loadConfHead(m, io, std.mem.span(path));
+    errdefer if (m.mdl.conf_head) |h| {
+        _ = mlx.mlx_array_free(h.w);
+    };
     dsv.setAttnNax(m.mdl, kernels.attn_nax_bar);
     const idx_nax = index_nax.fits(c.index_heads, c.index_head_dim, .bfloat16);
     log.info("[sushi_ds41] prefill index scores: {s}\n", .{if (idx_nax) "matmul2d (the M5's matrix units)" else "indexScoresTile (simdgroup matrices)"});
@@ -283,6 +288,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     }
     if (m.snap) |sn| freeSnap(sn);
     if (m.tower) |*t| t.deinit();
+    if (m.mdl.conf_head) |h| _ = mlx.mlx_array_free(h.w);
     m.mdl.deinit();
     m.engine.deinit();
     gpa.destroy(m.engine);
@@ -438,6 +444,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
 test {
     _ = config;
     _ = index_nax;
+    _ = conf_head;
 }
 
 // ── prefix cache ──
@@ -896,4 +903,24 @@ fn argmaxRows(m: *Model, logits: mlx.mlx_array, suppress: ?mlx.mlx_array, rows: 
     const data = mlx.mlx_array_data_uint32(flat) orelse return error.InvalidInput;
     if (mlx.mlx_array_size(flat) != rows) return error.InvalidInput;
     return gpa.dupe(u32, data[0..rows]);
+}
+
+// ── retrained confidence head (experiment only) ──
+
+/// Reads `SUSHI_DS41_CONF_HEAD` (`conf_head.zig` layout) into the model; a file that does not fit the model fails the load.
+fn loadConfHead(m: *Model, io: std.Io, path: []const u8) !void {
+    const c = &m.cfg;
+    if (c.dspark.block == 0) return error.Dsv41NoDspark;
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 20));
+    defer gpa.free(raw);
+    const width = c.dim + c.dspark.rank;
+    var h = try conf_head.parse(gpa, raw, width, c.dspark.block);
+    defer h.deinit(gpa);
+    var ch: dsv.ConfHead = .{ .w = mlx.mlx_array_new_data(h.w.ptr, &[_]c_int{ 1, @intCast(width) }, 2, .float32), .stats = h.extra.len > 0 };
+    for (0..h.block) |k| {
+        ch.bias[k] = h.bias[k];
+        if (ch.stats) ch.extra[k] = h.extra[k * conf_head.n_stats ..][0..conf_head.n_stats].*;
+    }
+    m.mdl.conf_head = ch;
+    log.info("[sushi_ds41] conf head from {s}: width {d}, block {d}, row stats {s}\n", .{ path, width, h.block, if (ch.stats) "on" else "off" });
 }
