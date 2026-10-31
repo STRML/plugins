@@ -82,6 +82,9 @@ const Model = struct {
     pool_now: u64 = pool_bytes,
     /// Positions the expert cache was sized to leave room for (a request's state and one prefill chunk's working set).
     billed_context: u64 = default_context,
+    /// The prefill chunk this load runs (`SUSHI_DS41_PREFILL_CHUNK`, else `sc.prefill_width`) and the pool cap it parks.
+    width: u32 = sc.prefill_width,
+    prefill_pool: u64 = prefill_pool_bytes,
 };
 
 // ── bill ──
@@ -186,7 +189,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     // The stages' storage is built after the room is read (the model builds it from tensors already loaded).
     const stages = if (priv.dspark) try source.dsparkBytes(io, gpa, dir) else 0;
     m.billed_context = ctxSetting(ctx.settings_json.slice()) orelse default_context;
-    const room = try expertRoom(ctx, c, m.billed_context) -| stages;
+    setWidth(m, std.c.getenv("SUSHI_DS41_PREFILL_CHUNK"));
+    const room = try expertRoom(ctx, c, m.billed_context, m.prefill_pool) -| stages;
     const ledger = try stream.budgetLedger(room, engram.cacheBytes(c.engram), 0, 0, geo.layers, geo.experts, @intCast(c.top_k), per.expert_bytes, stream.BOUNCE_BYTES, geo.shape);
     const plan = try stream.cachePlanBytesForGeometry(ledger.cache_bytes, geo, per.expert_bytes);
     log.info("[sushi_ds41] expert cache {d:.2} GB ({d} slots a layer) in {d:.2} GB of room\n", .{ gb(plan.cache_bytes), ledger.slots_per_layer, gb(room) });
@@ -258,11 +262,30 @@ fn gb(b: u64) f64 {
 
 /// The GPU bytes left for the experts once the residents are loaded: the host's ceiling less its wired margin, the
 /// process overhead and one request of `context` positions (its state and one prefill chunk's working set).
-fn expertRoom(ctx: *const abi.LoadCtx, c: *const sc.Config, context: u64) !u64 {
+fn expertRoom(ctx: *const abi.LoadCtx, c: *const sc.Config, context: u64, prefill_pool: u64) !u64 {
     const ceiling = if (kit.host.Host.of(ctx.host)) |h| h.memoryCeiling() else |_| mlx.maxRecommendedWorkingSet();
     const request = c.chunkCap(host_chunk, context) +| (context +| generation_rows) *| c.stateBytesPerToken() +| c.stateFixedBytes(false) +|
-        (prefill_pool_bytes - pool_bytes);
+        (prefill_pool - pool_bytes);
     return ceiling -| ctx.wired_margin_bytes -| host_bytes -| request;
+}
+
+/// The widest pass any prefill may run: ddalcu's 12,288-row chunks hung his machine, so a chunk plus the tail the last one
+/// merges stays at or under 8,192 rows.
+const max_pass_rows: u64 = 8192;
+
+/// Reads the prefill chunk once at load. The pool cap scales with it (at 2,048 rows `prefill_pool_bytes`), so a wider chunk
+/// parks its own buffers instead of remaking them op after op; the expert room bills the larger pool. `host_chunk` already
+/// bills an 8,192-row chunk plus its merged tail, wider than any chunk taken here.
+fn setWidth(m: *Model, env: ?[*:0]const u8) void {
+    if (env) |e| {
+        const text = std.mem.span(e);
+        const w = std.fmt.parseInt(u32, text, 10) catch 0;
+        if (w > sc.verify_rows and w + sc.tail_merge_rows <= max_pass_rows) {
+            m.width = w;
+            m.prefill_pool = prefill_pool_bytes / sc.prefill_width * w;
+        } else log.warn("[sushi_ds41] SUSHI_DS41_PREFILL_CHUNK={s} refused (a chunk plus its {d}-row merged tail must fit {d} rows); using {d}\n", .{ text, sc.tail_merge_rows, max_pass_rows, sc.prefill_width });
+    }
+    log.info("[sushi_ds41] prefill chunk {d} rows (widest pass {d}), pool cap {d:.2} GB\n", .{ m.width, m.width + sc.tail_merge_rows, gb(m.prefill_pool) });
 }
 
 /// The per-model `ctx_size` setting.
@@ -365,10 +388,17 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
     var rows = media;
     const prefix = if (want == .last and ids.len > 1) ids.len - 1 else 0;
     var at: usize = 0;
+    var passes: usize = 0;
+    var widest: usize = 0;
+    var last: usize = 0;
+    if (prefix > 0) _ = mlx.mlx_reset_peak_memory();
     while (at < prefix) {
-        var end = @min(at + sc.prefill_width, prefix);
+        var end = @min(at + m.width, prefix);
         if (end < prefix and prefix - end < sc.tail_merge_rows) end = prefix;
-        const next = if (end < prefix) @min(end + sc.prefill_width, prefix) else ids.len;
+        const next = if (end < prefix) @min(end + m.width, prefix) else ids.len;
+        passes += 1;
+        widest = @max(widest, end - at);
+        last = end - at;
         // Another chunk of the prefix follows and is wider than the window (the merge keeps tails of `tail_merge_rows`
         // rows), so its CED tail overwrites this chunk's decoder rows before anything reads them: run this one without
         // its decoder (`extendState`).
@@ -376,6 +406,11 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
         if (rows) |*r| r.offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
         at = end;
         if (progress) |p| @atomicStore(u64, p, at, .monotonic);
+    }
+    if (passes > 0) {
+        var peak: usize = 0;
+        _ = mlx.mlx_get_peak_memory(&peak);
+        log.info("[sushi_ds41] prefill passes={d} widest={d} last={d} rows={d} chunk={d} peak={d:.2}GB\n", .{ passes, widest, last, prefix, m.width, gb(peak) });
     }
     try capture(m);
     const logits = try forwardRows(m, ids[prefix..], want, &.{}, rows);
@@ -409,7 +444,7 @@ fn stateRows(m: *Model, rows: []const u32, ahead: []const u32, media: ?dsv.Visio
 /// (`dsv41_borrow.enterForward`): the decode cap up to a verify block, the prefill cap above it. A lower cap trims
 /// lazily, so the clear makes the parked pool what the expert room billed.
 fn poolForRows(m: *Model, rows: usize) void {
-    const want = borrow.poolCap(rows, pool_bytes, prefill_pool_bytes);
+    const want = borrow.poolCap(rows, pool_bytes, m.prefill_pool);
     if (want == m.pool_now) return;
     var prev: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev, @intCast(want));
