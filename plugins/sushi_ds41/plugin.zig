@@ -80,6 +80,8 @@ const Model = struct {
     copy: CopyStats = .{},
     /// Whether this request still takes copies (`copy_lookup.Backoff`).
     copy_backoff: copy_lookup.Backoff = .{},
+    /// Experiment only: the rows policy reads the confidence head without its online calibration (`SUSHI_DS41_CONF_DIRECT`).
+    conf_direct: bool = false,
     prev_cache_limit: ?usize = null,
     /// The MLX buffer-pool cap in force (`borrow.poolCap` of the last pass's rows): `pool_bytes` at decode widths.
     pool_now: u64 = pool_bytes,
@@ -203,6 +205,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     m.mdl = try dsv.init(gpa, m.cfg, &m.weights, dir, s, .{ .experts = false, .dspark = priv.dspark });
     errdefer m.mdl.deinit();
     if (std.c.getenv("SUSHI_DS41_CONF_HEAD")) |path| try loadConfHead(m, io, std.mem.span(path));
+    m.conf_direct = std.c.getenv("SUSHI_DS41_CONF_DIRECT") != null;
+    if (m.conf_direct) log.info("[sushi_ds41] conf direct: the rows policy skips its calibration\n", .{});
     errdefer if (m.mdl.conf_head) |h| {
         _ = mlx.mlx_array_free(h.w);
     };
@@ -370,6 +374,7 @@ fn reset(m: *Model) void {
     m.open = null;
     clearIds(m);
     m.policy = rows_policy.Policy.init(depth_bounds.active, m.cfg.dspark.block);
+    m.policy.direct = m.conf_direct;
 }
 
 /// A prompt as sushi runs it: all but its last token in chunks (`prefill_width`, a short tail merged into the last), each

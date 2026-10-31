@@ -94,6 +94,9 @@ pub const Policy = struct {
     /// Decayed ms a drafted round saved against the plain steps for its tokens; negative while drafts lose.
     edge: f32 = edge_start,
     range: Range = .{ .max_rows = default_block + 1 },
+    /// Experiment only (`SUSHI_DS41_CONF_DIRECT`): the rows read sigmoid(conf) as the acceptance probability, without
+    /// the online calibration (a head retrained on the verifier's accepts is calibrated already).
+    direct: bool = false,
 
     const max_period: u32 = 16;
     const edge_start: f32 = 10;
@@ -123,7 +126,7 @@ pub const Policy = struct {
     pub fn rows(self: *const Policy, conf: []const f32) u32 {
         var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
         const n = @min(conf.len, p.len);
-        for (conf[0..n], p[0..n]) |c, *o| o.* = self.calib.probability(sigmoid(c));
+        for (conf[0..n], p[0..n]) |c, *o| o.* = if (self.direct) sigmoid(c) else self.calib.probability(sigmoid(c));
         const costs = self.cost.costs();
         const chosen = dflash_policy.chooseRows(p[0..@min(n, self.range.max_rows - 1)], &costs).rows;
         return std.math.clamp(chosen, self.range.min_rows, self.range.max_rows);
