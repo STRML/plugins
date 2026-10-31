@@ -231,7 +231,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         tap.* = try dsv.StreamTap.init(gpa, c.layers, tap_rows);
         m.mdl.stream_tap = tap;
         m.tap_dir = std.mem.span(d);
-        log.info("[sushi_ds41] calibration tap: the last {d} rows of each pass, every layer, to {s}\n", .{ tap_rows, m.tap_dir.? });
+        log.warn("[sushi_ds41] calibration tap ON: every prompt's per-layer activations and last ids are written to {s} (owner-only files); unset SUSHI_DS41_TAP_DIR to stop\n", .{m.tap_dir.?});
     }
     // The tower borrows its tensors from `m.weights`, which the model left them in.
     if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
@@ -419,10 +419,8 @@ fn reset(m: *Model) void {
 /// Logits `[rows, vocab]`. `progress` gets the rows forwarded after each chunk (`Forward.progress`).
 fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, progress: ?*u64) !mlx.mlx_array {
     errdefer dsv.pipeDrain(m.mdl) catch {};
-    if (m.mdl.stream_tap) |t| {
-        t.clear();
-        t.on = true;
-    }
+    // The tap records the prefix's last chunk and the last token's pass: every layer runs both.
+    if (m.mdl.stream_tap) |t| t.clear();
     defer if (m.mdl.stream_tap) |t| {
         t.on = false;
     };
@@ -436,6 +434,7 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
         // Another chunk of the prefix follows and is wider than the window (the merge keeps tails of `tail_merge_rows`
         // rows), so its CED tail overwrites this chunk's decoder rows before anything reads them: run this one without
         // its decoder (`extendState`).
+        if (m.mdl.stream_tap) |t| t.on = end == prefix;
         if (end < prefix and end - at > m.mdl.cfg.window and prefix - end > m.mdl.cfg.window and m.mdl.ced_split != null) try stateRows(m, ids[at..end], ids[end..next], rows) else _ = mlx.mlx_array_free(try forwardRows(m, ids[at..end], .last, ids[end..next], rows));
         if (rows) |*r| r.offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
         at = end;
@@ -445,6 +444,7 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
     // Progress above counts rows submitted; this is where they are done.
     try dsv.pipeDrain(m.mdl);
     try capture(m);
+    if (m.mdl.stream_tap) |t| t.on = true;
     const logits = try forwardRows(m, ids[prefix..], want, &.{}, rows);
     defer _ = mlx.mlx_array_free(logits);
     if (m.mdl.stream_tap) |t| {

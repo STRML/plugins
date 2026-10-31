@@ -23,8 +23,9 @@ pub fn of(f: *const abi.Forward) Refusal!?*const abi.Ablation {
 /// Arms `a` on the model for one call: `r` `[dim]`, `col` `[dim, 1]` and `s`, owned here until `disarm`.
 pub fn arm(mdl: *dsv.Model, a: *const abi.Ablation, dim: usize, s: mlx.mlx_stream) (error{AblationShape} || anyerror)!void {
     const d: mlx.mlx_array = .{ .ctx = a.directions.ctx };
+    if (d.ctx == null) return error.AblationShape;
     const sh = mlx.getShape(d);
-    if (d.ctx == null or sh.len != 2 or sh[0] != 1 or sh[1] != dim or mlx.mlx_array_dtype(d) != .float32) return error.AblationShape;
+    if (sh.len != 2 or sh[0] != 1 or sh[1] != dim or mlx.mlx_array_dtype(d) != .float32) return error.AblationShape;
     var r = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(r);
     try mlx.check(mlx.mlx_reshape(&r, d, &[_]c_int{@intCast(dim)}, 1, s));
@@ -72,6 +73,10 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *dsv.StreamTap, dir: []const u8, seq
     const io = std.Io.Threaded.global_single_threaded.io();
     var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
     defer d.close(io);
+    // Prompt activations and ids: the owner's only.
+    const dir_z = try gpa.dupeSentinel(u8, dir, 0);
+    defer gpa.free(dir_z);
+    _ = std.c.chmod(dir_z, 0o700);
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "tap-{d:0>6}.npy", .{seq});
     var header_buf: [256]u8 = undefined;
@@ -81,7 +86,7 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *dsv.StreamTap, dir: []const u8, seq
     defer gpa.free(file_bytes);
     @memcpy(file_bytes[0..npy.len], npy);
     @memcpy(file_bytes[npy.len..], body);
-    try d.writeFile(io, .{ .sub_path = name, .data = file_bytes });
+    try d.writeFile(io, .{ .sub_path = name, .data = file_bytes, .flags = .{ .permissions = .fromMode(0o600) } });
 
     var line: std.Io.Writer.Allocating = .init(gpa);
     defer line.deinit();
@@ -90,7 +95,7 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *dsv.StreamTap, dir: []const u8, seq
     for (tail, 0..) |t, i| try line.writer.print("{s}{d}", .{ if (i == 0) "" else ",", t });
     try line.writer.writeAll("]}\n");
     var idx = d.openFile(io, "index.jsonl", .{ .mode = .write_only }) catch |e| switch (e) {
-        error.FileNotFound => try d.createFile(io, "index.jsonl", .{}),
+        error.FileNotFound => try d.createFile(io, "index.jsonl", .{ .permissions = .fromMode(0o600) }),
         else => return e,
     };
     defer idx.close(io);
