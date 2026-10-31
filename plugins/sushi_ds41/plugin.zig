@@ -202,6 +202,11 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     m.mdl = try dsv.init(gpa, m.cfg, &m.weights, dir, s, .{ .experts = false, .dspark = priv.dspark });
     errdefer m.mdl.deinit();
     dsv.setAttnNax(m.mdl, kernels.attn_nax_bar);
+    // Diagnostics: blocking reads by site (`SUSHI_DSV41_READ_DIAG`, debug level) and the decode host clock
+    // (`SUSHI_DS41_DECODE_DIAG`, info level).
+    dsv.setReadDiag(std.c.getenv("SUSHI_DSV41_READ_DIAG") != null);
+    dsv.setDecodeDiag(std.c.getenv("SUSHI_DS41_DECODE_DIAG") != null);
+    if (std.c.getenv("SUSHI_DS41_DECODE_DIAG") != null) log.info("[sushi_ds41] decode diag on\n", .{});
     const idx_nax = index_nax.fits(c.index_heads, c.index_head_dim, .bfloat16);
     log.info("[sushi_ds41] prefill index scores: {s}\n", .{if (idx_nax) "matmul2d (the M5's matrix units)" else "indexScoresTile (simdgroup matrices)"});
     // As sushi's server does: a synced per-stage `[dsv41-prof]` line per wide chunk, and with the verify profile per

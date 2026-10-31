@@ -2825,6 +2825,8 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
 
     var rows: []u32 = &.{};
     errdefer gpa.free(rows);
+    const dd = &decode_diag;
+    const hash_t0 = dd.start();
     if (m.hash) |*hs| {
         const comp = try gpa.alloc(u32, L);
         defer gpa.free(comp);
@@ -2833,6 +2835,7 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
         hs.rows(st.hist.items, comp, rows);
         try st.hist.appendSlice(gpa, comp);
     }
+    dd.add("hash", hash_t0);
 
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
@@ -2846,7 +2849,9 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
         read_ahead = ah.take(ids);
         m.dropEmbedAhead();
     }
+    const embed_t0 = dd.start();
     var emb = try m.embed.rows(&sc, id_arr, ids, read_ahead, m.act); // [L, dim]
+    dd.add("embed", embed_t0);
     var img: A = none;
     errdefer if (img.ctx != null) {
         _ = mlx.mlx_array_free(img);
@@ -2920,6 +2925,146 @@ fn reportReads(L: usize) void {
     read_n = @splat(0);
     read_ns = @splat(0);
     read_forwards = 0;
+}
+
+/// Diagnostic (`SUSHI_DS41_DECODE_DIAG`): a host clock over decode-width forwards (16 rows or fewer), logged at info as
+/// the mean of every 256 forwards by kind (plain = 1 row, verify = 2-16 rows), plus the DSpark draft's embedding read.
+/// `prelude` runs from the forward's entry to layer 0's submit (the GPU idles through it after a host read); `take` is
+/// the host spinning on the Engram reader for a table's rows (layer 1, layer 14), `stall` the share of takes that found
+/// them still unread; `build` is the host's time in `buildLayer` outside `mlx_async_eval`, `submit` inside it (MLX's
+/// 10-buffer throttle); `uncached` the Engram rows read from the shard (row-cache misses), `rd_spawns` the threads
+/// `Table.readInto` spawned. Costs one branch a phase when off.
+pub const DecodeDiag = struct {
+    pub const Kind = enum { plain, verify };
+    const K = struct {
+        n: u64 = 0,
+        rows: u64 = 0,
+        prelude: u64 = 0,
+        hash: u64 = 0,
+        embed: u64 = 0,
+        pf_start: u64 = 0,
+        take: [cfg_mod.max_engram]u64 = @splat(0),
+        stalls: [cfg_mod.max_engram]u64 = @splat(0),
+        l0: u64 = 0,
+        build: u64 = 0,
+        build_max: u64 = 0,
+        submit: u64 = 0,
+        pass: u64 = 0,
+        uncached: u64 = 0,
+        rd_spawns: u64 = 0,
+        rd_spawn: u64 = 0,
+    };
+    on: bool = false,
+    /// The forward being clocked (null: none, or wider than decode).
+    cur: ?Kind = null,
+    t0: u64 = 0,
+    rows0: u64 = 0,
+    spawns0: u64 = 0,
+    spawn_ns0: u64 = 0,
+    layer_max: u64 = 0,
+    k: [2]K = .{ .{}, .{} },
+    draft_n: u64 = 0,
+    draft_embed: u64 = 0,
+    forwards: u64 = 0,
+
+    pub fn now() u64 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        return @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+    }
+
+    fn acc(self: *DecodeDiag) ?*K {
+        const kind = self.cur orelse return null;
+        return &self.k[@intFromEnum(kind)];
+    }
+
+    /// The clock start of a phase, 0 when the forward is not clocked.
+    fn start(self: *const DecodeDiag) u64 {
+        return if (self.cur != null) now() else 0;
+    }
+
+    fn add(self: *DecodeDiag, comptime field: []const u8, t0: u64) void {
+        const a = self.acc() orelse return;
+        @field(a, field) += now() -| t0;
+    }
+
+    fn take(self: *DecodeDiag, ei: usize, t0: u64, stalled: bool) void {
+        const a = self.acc() orelse return;
+        a.take[ei] += now() -| t0;
+        a.stalls[ei] += @intFromBool(stalled);
+    }
+
+    fn begin(self: *DecodeDiag, m: *const Model, L: usize) void {
+        if (!self.on or L > exl3.kernels.DECODE_ROWS_MAX) return;
+        self.cur = if (L == 1) .plain else .verify;
+        self.t0 = now();
+        self.rows0 = engramRowsRead(m);
+        self.spawns0 = engram.diag_spawns.load(.monotonic);
+        self.spawn_ns0 = engram.diag_spawn_ns.load(.monotonic);
+        self.layer_max = 0;
+    }
+
+    fn layer(self: *DecodeDiag, li: usize, build_ns: u64, submit_ns: u64) void {
+        const a = self.acc() orelse return;
+        a.build += build_ns;
+        a.submit += submit_ns;
+        self.layer_max = @max(self.layer_max, build_ns);
+        if (li == 0) {
+            a.l0 += build_ns + submit_ns;
+            a.prelude += now() -| self.t0;
+        }
+    }
+
+    fn end(self: *DecodeDiag, m: *const Model, L: usize) void {
+        const a = self.acc() orelse return;
+        self.cur = null;
+        a.n += 1;
+        a.rows += L;
+        a.pass += now() -| self.t0;
+        a.build_max += self.layer_max;
+        a.uncached += engramRowsRead(m) -| self.rows0;
+        a.rd_spawns += engram.diag_spawns.load(.monotonic) -| self.spawns0;
+        a.rd_spawn += engram.diag_spawn_ns.load(.monotonic) -| self.spawn_ns0;
+        self.forwards += 1;
+        if (self.forwards >= 256) self.report();
+    }
+
+    fn msPer(v: u64, n: u64) f64 {
+        return @as(f64, @floatFromInt(v)) / 1e6 / @as(f64, @floatFromInt(@max(n, 1)));
+    }
+
+    fn per(v: u64, n: u64) f64 {
+        return @as(f64, @floatFromInt(v)) / @as(f64, @floatFromInt(@max(n, 1)));
+    }
+
+    fn report(self: *DecodeDiag) void {
+        inline for (comptime std.meta.tags(Kind)) |kind| {
+            const a = &self.k[@intFromEnum(kind)];
+            const n = a.n;
+            if (n > 0) log.info("[sushi_ds41] decode-diag {s} n={d} rows={d:.2} prelude={d:.3} hash={d:.3} embed={d:.3} pf_start={d:.3} take1={d:.3} stall1={d:.2} take14={d:.3} stall14={d:.2} l0={d:.3} build={d:.3} build_max={d:.3} submit={d:.3} pass={d:.3} uncached={d:.1} rd_spawns={d:.2} rd_spawn={d:.3} (ms a forward)\n", .{
+                @tagName(kind),        n,                       per(a.rows, n),        msPer(a.prelude, n),     msPer(a.hash, n),
+                msPer(a.embed, n),     msPer(a.pf_start, n),    msPer(a.take[0], n),   per(a.stalls[0], n),     msPer(a.take[1], n),
+                per(a.stalls[1], n),   msPer(a.l0, n),          msPer(a.build, n),     msPer(a.build_max, n),   msPer(a.submit, n),
+                msPer(a.pass, n),      per(a.uncached, n),      per(a.rd_spawns, n),   msPer(a.rd_spawn, n),
+            });
+            a.* = .{};
+        }
+        if (self.draft_n > 0) log.info("[sushi_ds41] decode-diag draft n={d} embed={d:.3} (ms a draft)\n", .{ self.draft_n, msPer(self.draft_embed, self.draft_n) });
+        self.draft_n = 0;
+        self.draft_embed = 0;
+        self.forwards = 0;
+    }
+};
+pub var decode_diag: DecodeDiag = .{};
+
+pub fn setDecodeDiag(on: bool) void {
+    decode_diag.on = on;
+    engram.diag = on;
+}
+
+fn engramRowsRead(m: *const Model) u64 {
+    var n: u64 = 0;
+    for (m.engrams) |*e| n += e.table.rows_read.load(.monotonic);
+    return n;
 }
 
 /// A decode-width layer whose routed chain was queued from the stream's cache map before the host read its picks. The
@@ -3139,6 +3284,7 @@ pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
 
 fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     const gpa = m.gpa;
+    const layer_t0 = decode_diag.start();
     if (p.tail) |t| if (li == m.ced_split.?) {
         try cedReplay(m, p, li, t);
         p.tail = null;
@@ -3164,7 +3310,10 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
             const rt = readStart();
             defer readDone(.engram, rt);
             p.engram_rows[ei] = if (p.engram_pf) |pf| blk: {
+                const take_t0 = decode_diag.start();
+                const stalled = decode_diag.cur != null and !pf.ready(p.p0, ei, 0);
                 const raw = try pf.take(p.p0, ei, 0);
+                decode_diag.take(ei, take_t0, stalled);
                 defer raw.deinit(gpa);
                 break :blk sc.out(try sc.keep(try e.table.dequant(raw, mine.len, m.s)));
             } else sc.out(try sc.keep(try e.table.gather(gpa, mine, m.s))); // [L * cols, head_dim]
@@ -3207,7 +3356,9 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     if (wait) return evalAll(ev.items);
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
+    const submit_t0 = decode_diag.start();
     try mlx.check(mlx.mlx_async_eval(vec));
+    if (decode_diag.cur != null) decode_diag.layer(li, submit_t0 -| layer_t0, DecodeDiag.now() -| submit_t0);
 }
 
 /// The pass's logits (f32; `[1, vocab]` for the last position or `[L, vocab]` for every one; the caller frees);
@@ -3298,6 +3449,8 @@ pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision:
     errdefer m.dropEmbedAhead();
     const st = try ensureState(m);
     transient_peak.begin();
+    decode_diag.begin(m, ids.len);
+    errdefer decode_diag.cur = null;
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
     pass.ahead = ahead;
@@ -3306,6 +3459,7 @@ pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision:
     try prefetchEngram(m, &pass);
     for (0..m.cfg.layers) |li| try passLayer(m, &pass, li);
     const logits = try finishPass(m, &pass, want);
+    decode_diag.end(m, ids.len);
     transient_peak.end(if (st.verify != null) .dspark_verify else if (ids.len > NARROW_ROWS) .prefill_chunk else .decode, ids.len);
     return logits;
 }
@@ -3351,7 +3505,9 @@ fn prefetchEngram(m: *Model, p: *Pass) !void {
     if (p.engram_pf == null) {
         var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
         for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
+        const t0 = decode_diag.start();
         p.engram_pf = try engram.Prefetch.start(m.gpa, tables[0..m.engrams.len], &.{.{ .at = p.p0, .len = p.ids.len, .ids = p.rows }}, hs.cols(), p.ids.len);
+        decode_diag.add("pf_start", t0);
     }
     if (p.engram_pf.?.finished()) aheadEngram(m, p) catch {};
 }
@@ -3598,7 +3754,12 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     for (in[0..B], 0..) |*v, k| v.* = @intCast(if (k == 0) t1 else c.dspark.noise_id);
     var in_ids: [cfg_mod.max_block]u32 = undefined;
     for (in_ids[0..B], in[0..B]) |*o, v| o.* = @intCast(v);
+    const embed_t0 = if (decode_diag.on) DecodeDiag.now() else 0;
     const emb = try m.embed.rows(&sc, try sc.ints(in[0..B], &.{ci(B)}), in_ids[0..B], null, m.act);
+    if (decode_diag.on) {
+        decode_diag.draft_n += 1;
+        decode_diag.draft_embed += DecodeDiag.now() -| embed_t0;
+    }
     var x = try sc.contiguous(try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(c.dim) }));
     var pre = try sc.broadcast(try sc.astype(try sc.op2(mlx.mlx_equal, try sc.arange(0, hc), try sc.i(0)), .float32), &.{ ci(B), ci(hc) });
     var dummy = try Shared.init(gpa, 1);

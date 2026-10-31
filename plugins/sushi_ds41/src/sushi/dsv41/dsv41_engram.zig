@@ -377,7 +377,12 @@ pub const Table = struct {
         const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, PAR_THREADS);
         if (parts > 1) {
             var threads: [PAR_THREADS]?std.Thread = @splat(null);
+            const t0 = if (diag) diagNow() else 0;
             for (threads[1..parts], 1..) |*t, k| t.* = std.Thread.spawn(.{}, Job.runVoid, .{ &job, k, parts }) catch null;
+            if (diag) {
+                _ = diag_spawns.fetchAdd(parts - 1, .monotonic);
+                _ = diag_spawn_ns.fetchAdd(diagNow() -| t0, .monotonic);
+            }
             var failed = !job.run(0, parts);
             for (threads[1..parts], 1..) |t, k| {
                 if (t) |th| th.join() else failed = !job.run(k, parts) or failed;
@@ -706,6 +711,12 @@ pub const Prefetch = struct {
         return self.ended.load(.acquire);
     }
 
+    /// Diagnostic: are `layer`'s span `k` rows of the grid at `at` read (or failed) already?
+    pub fn ready(self: *const Prefetch, at: usize, layer: usize, k: usize) bool {
+        for (self.grids) |*g| if (g.at == at) return g.items[layer * (g.items.len / self.tables.len) + k].state.load(.acquire) != pending;
+        return true;
+    }
+
     /// The rows of `layer`'s span `k` of the grid at `at`, once read (the caller frees them).
     pub fn take(self: *Prefetch, at: usize, layer: usize, k: usize) !Table.Raw {
         for (self.grids) |*g| if (g.at == at) {
@@ -731,6 +742,17 @@ pub const Prefetch = struct {
 
 const PAR_ROWS_PER_THREAD = 16;
 const PAR_THREADS = 16;
+
+/// Diagnostic (`SUSHI_DS41_DECODE_DIAG`, set by the model): threads `Table.readInto` spawned and the host time spent
+/// spawning them, on whichever thread read.
+pub var diag = false;
+pub var diag_spawns: std.atomic.Value(u64) = .init(0);
+pub var diag_spawn_ns: std.atomic.Value(u64) = .init(0);
+
+fn diagNow() u64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+}
 
 fn preadAll(fd: c_int, dst: []u8, off: u64) bool {
     expert_io.readExact(fd, dst, off) catch return false;
