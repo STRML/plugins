@@ -27,6 +27,7 @@ const vision_common = @import("src/sushi/vision_common.zig");
 const index_nax = @import("src/index_nax.zig");
 const vision_key = @import("src/vision_key.zig");
 const copy_lookup = @import("src/copy_lookup.zig");
+const conf_dump = @import("src/conf_dump.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.1.0";
@@ -79,6 +80,10 @@ const Model = struct {
     copy: CopyStats = .{},
     /// Whether this request still takes copies (`copy_lookup.Backoff`).
     copy_backoff: copy_lookup.Backoff = .{},
+    /// Experiment only: the conf-dump directory (`SUSHI_DS41_CONF_DUMP`, read at load); null leaves the rounds untouched.
+    conf_dump: ?[*:0]const u8 = null,
+    /// The open round's drafted block with the confidence head's inputs (conf dump only), until the round is logged.
+    dump_draft: ?dsv.Draft = null,
     prev_cache_limit: ?usize = null,
     /// The MLX buffer-pool cap in force (`borrow.poolCap` of the last pass's rows): `pool_bytes` at decode widths.
     pool_now: u64 = pool_bytes,
@@ -171,6 +176,11 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     errdefer gpa.destroy(m);
     m.* = .{ .cfg = priv.cfg, .weights = undefined, .mdl = undefined, .engine = undefined, .experts = undefined, .s = s };
     const c = &m.cfg;
+    if (std.c.getenv("SUSHI_DS41_CONF_DUMP")) |dump_dir| {
+        m.conf_dump = dump_dir;
+        dumpManifest(dump_dir, c.dim, c.dspark.rank, c.dspark.block);
+        log.info("[sushi_ds41] conf dump on: records to {s}/records.bin\n", .{std.mem.span(dump_dir)});
+    }
 
     var geo: stream.Geometry = .{
         .layers = @intCast(c.layers),
@@ -290,6 +300,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     m.weights.deinit();
     m.ids.deinit(gpa);
     m.lookup.deinit(gpa);
+    if (m.dump_draft) |*d| d.deinit();
     gpa.destroy(m);
 }
 
@@ -438,6 +449,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
 test {
     _ = config;
     _ = index_nax;
+    _ = conf_dump;
 }
 
 // ── prefix cache ──
@@ -754,6 +766,7 @@ fn nativeStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callc
     defer gpa.free(best);
     var accepted: usize = 0;
     while (accepted + 1 < open.rows and best[accepted] == open.ids[1 + accepted]) accepted += 1;
+    dumpRound(m, &open, best, accepted);
     closeRound(m, &open, accepted, &out.round) catch |e| return roundFailed(e);
     out.round.next_token = best[accepted];
     return .ok;
@@ -809,17 +822,24 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
         o.draft_ms = nanosSince(draft_start);
         return verifyOpen(m, o);
     }
-    const plain = m.policy.next() == .plain;
+    // The conf dump drafts and verifies every round's whole block.
+    const dumping = m.conf_dump != null;
+    const plain = !dumping and m.policy.next() == .plain;
     o.drafted = !plain;
     if (!plain) {
-        var block = try dsv.draftHeads(m.mdl, t1, .conf);
+        var block = try dsv.draftHeads(m.mdl, t1, if (dumping) .dump else .conf);
         defer block.deinit();
         o.block_len = @min(block.ids.len, max_drafts + 1);
         @memcpy(o.ids[0..o.block_len], block.ids[0..o.block_len]);
         @memcpy(o.conf[0 .. o.block_len - 1], block.conf[0 .. o.block_len - 1]);
+        if (dumping) {
+            if (m.dump_draft) |*d| d.deinit();
+            m.dump_draft = block;
+            block = .{ .gpa = gpa, .ids = &.{}, .logits = &.{}, .conf = &.{} };
+        }
     }
     o.draft_ms = nanosSince(draft_start);
-    const wanted: usize = if (plain) 1 else m.policy.rows(o.conf[0 .. o.block_len - 1]);
+    const wanted: usize = if (plain) 1 else if (dumping) o.block_len else m.policy.rows(o.conf[0 .. o.block_len - 1]);
     const rows = std.math.clamp(wanted, 1, @min(@as(usize, cap) + 1, max_verify_rows));
     o.rows = @min(rows, o.block_len);
     return verifyOpen(m, o);
@@ -828,6 +848,7 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
 /// The copy arm: writes the context's continuation after `t1` to `drafts` and returns its length, or null for a stage
 /// round.
 fn copyDrafts(m: *Model, t1: u32, cap: u32, drafts: []u32) !?usize {
+    if (m.conf_dump != null) return null; // the conf dump measures stage blocks only
     try m.lookup.sync(gpa, m.ids.items);
     const room = m.copy_backoff.width(@min(@as(usize, cap), max_verify_rows - 1, drafts.len));
     const found = m.lookup.matchBest(t1, @intCast(room));
@@ -896,4 +917,53 @@ fn argmaxRows(m: *Model, logits: mlx.mlx_array, suppress: ?mlx.mlx_array, rows: 
     const data = mlx.mlx_array_data_uint32(flat) orelse return error.InvalidInput;
     if (mlx.mlx_array_size(flat) != rows) return error.InvalidInput;
     return gpa.dupe(u32, data[0..rows]);
+}
+
+// ── conf dump (experiment only) ──
+
+fn dumpManifest(dir: [*:0]const u8, dim: usize, rank: usize, block: usize) void {
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    conf_dump.writeManifest(&buf.writer, dim, rank, block) catch return;
+    dumpWrite(dir, "manifest.json", "w", buf.written());
+}
+
+fn dumpWrite(dir: [*:0]const u8, name: []const u8, mode: [*:0]const u8, bytes: []const u8) void {
+    var pb: [2048]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&pb, "{s}/{s}", .{ std.mem.span(dir), name }, 0) catch return;
+    // Opened per write: the driver moves `records.bin` between requests.
+    const f = std.c.fopen(path.ptr, mode) orelse {
+        log.warn("[sushi_ds41] conf dump: cannot open {s}\n", .{path});
+        return;
+    };
+    _ = std.c.fwrite(bytes.ptr, 1, bytes.len, f);
+    _ = std.c.fclose(f);
+}
+
+/// Appends the round's records (before `closeRound` commits it): one per verified draft, labelled against STQ's argmax.
+fn dumpRound(m: *Model, o: *const Open, stq: []const u32, accepted: usize) void {
+    const dir = m.conf_dump orelse return;
+    var d = m.dump_draft orelse return;
+    m.dump_draft = null;
+    defer d.deinit();
+    if (o.copied or !o.drafted or d.ids.len < 2 or d.feats.len == 0) return;
+    const B = d.ids.len - 1;
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    conf_dump.writeRound(&buf.writer, .{
+        .pos = m.ids.items.len,
+        .rows = @min(o.rows, stq.len),
+        .drafts = d.ids[1..],
+        .stq = stq,
+        .accepted = accepted,
+        .conf = d.conf,
+        .logits = d.logits,
+        .vocab = m.cfg.vocab,
+        .feats = d.feats,
+        .width = d.feats.len / B,
+    }) catch |e| {
+        log.warn("[sushi_ds41] conf dump record: {s}\n", .{@errorName(e)});
+        return;
+    };
+    dumpWrite(dir, "records.bin", "a", buf.written());
 }

@@ -3544,16 +3544,20 @@ pub const Draft = struct {
     ids: []u32,
     logits: []f32,
     conf: []f32,
+    /// `.dump` only: the confidence head's input per pick, `concat(hout[k], markov_embed[prev pick])` `[block, dim + rank]`.
+    feats: []f32 = &.{},
 
     pub fn deinit(self: *Draft) void {
         self.gpa.free(self.ids);
         self.gpa.free(self.logits);
         self.gpa.free(self.conf);
+        self.gpa.free(self.feats);
     }
 };
 
-/// What `draft` hands back besides the picks: the confidence logits only (serving), or also the biased scores (tests).
-pub const Heads = enum { none, conf, full };
+/// What `draft` hands back besides the picks: the confidence logits only (serving), or also the biased scores (tests),
+/// or those and the confidence head's inputs (`dump`, the conf-dump experiment).
+pub const Heads = enum { none, conf, full, dump };
 
 pub fn draft(m: *Model, t1: u32, with_heads: bool) !Draft {
     return draftHeads(m, t1, if (with_heads) .full else .none);
@@ -3575,7 +3579,8 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     m.profile = null;
     defer m.profile = saved_profile;
     const with_conf = heads_wanted != .none;
-    const with_heads = heads_wanted == .full;
+    const with_heads = heads_wanted == .full or heads_wanted == .dump;
+    const with_feats = heads_wanted == .dump;
     const c = &m.cfg;
     const st = try ensureState(m);
     const ds = &(m.dspark orelse return error.Dsv41NoDspark);
@@ -3606,11 +3611,14 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     var picks: [cfg_mod.max_block]A = undefined;
     var rows: [cfg_mod.max_block]A = undefined;
     var confs: [cfg_mod.max_block]A = undefined;
+    var feats: [cfg_mod.max_block]A = undefined;
     for (0..B) |k| {
         const me = try sc.astype(try sc.take(ds.markov_embed, cur, 0), .float32); // [1, rank]
         const row = try sc.add(try sc.slice(logits, 0, k, k + 1), try sc.matmul(me, try sc.t2(ds.markov_head)));
         rows[k] = row;
-        if (with_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.slice(try sc.astype(hout, .float32), 0, k, k + 1), me }, -1), try sc.t2(ds.conf));
+        const feat = try sc.concat(&.{ try sc.slice(try sc.astype(hout, .float32), 0, k, k + 1), me }, -1);
+        feats[k] = feat;
+        if (with_conf) confs[k] = try sc.matmul(feat, try sc.t2(ds.conf));
         var am = mlx.mlx_array_new();
         cur = try sc.astype(try sc.reshape(try sc.res(mlx.mlx_argmax_axis(&am, row, -1, false, sc.s), &am), &.{1}), .int32);
         picks[k] = cur;
@@ -3618,7 +3626,8 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     const all = try sc.concat(picks[0..B], 0);
     const heads = if (with_heads) try sc.concat(rows[0..B], 0) else all;
     const conf = if (with_conf) try sc.reshape(try sc.concat(confs[0..B], 0), &.{ci(B)}) else all;
-    try evalAll(&.{ all, heads, conf });
+    const feat_all = if (with_feats) try sc.concat(feats[0..B], 0) else all;
+    try evalAll(&.{ all, heads, conf, feat_all });
     var out: Draft = .{ .gpa = gpa, .ids = &.{}, .logits = &.{}, .conf = &.{} };
     errdefer out.deinit();
     out.ids = try gpa.alloc(u32, B + 1);
@@ -3628,6 +3637,7 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     out.conf = try gpa.alloc(f32, if (with_conf) B else 0);
     if (with_heads) @memcpy(out.logits, try sc_mod.hostF32(heads));
     if (with_conf) @memcpy(out.conf, try sc_mod.hostF32(conf));
+    if (with_feats) out.feats = try gpa.dupe(f32, try sc_mod.hostF32(feat_all));
     return out;
 }
 
