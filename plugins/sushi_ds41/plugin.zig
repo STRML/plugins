@@ -554,7 +554,18 @@ test "sushi_ds41 wavefront: every chunk runs every layer once, in order, one lay
         var it = dsv.WaveSchedule.init(chunks, layers, lag);
         var i: usize = 0;
         var last: [dsv.wave_max]?usize = @splat(null);
-        while (it.next()) |u| : (i += 1) {
+        var splits: usize = 0;
+        while (it.next()) |u| {
+            if (u.stage == .split) {
+                // A chunk's end comes right after its last layer.
+                try t.expectEqual(layers, u.layer);
+                try t.expectEqual(@as(?usize, layers - 1), last[u.chunk]);
+                try t.expectEqual(i, at[u.chunk][layers - 1] + 1);
+                splits += 1;
+                i += 1;
+                continue;
+            }
+            defer i += 1;
             try t.expect(u.chunk < chunks and u.layer < layers and !seen[u.chunk][u.layer]);
             seen[u.chunk][u.layer] = true;
             at[u.chunk][u.layer] = i;
@@ -562,7 +573,8 @@ test "sushi_ds41 wavefront: every chunk runs every layer once, in order, one lay
             if (last[u.chunk]) |l| try t.expectEqual(l + 1, u.layer) else try t.expectEqual(@as(usize, 0), u.layer);
             last[u.chunk] = u.layer;
         }
-        try t.expectEqual(chunks * layers, i);
+        try t.expectEqual(chunks, splits);
+        try t.expectEqual(chunks * (layers + 1), i);
         for (1..chunks) |c| for (0..layers) |l| {
             // The legality condition: chunk c reaches layer l only after chunk c - 1 finished layers l .. l + lag - 1.
             try t.expect(at[c - 1][@min(l + lag - 1, layers - 1)] < at[c][l]);

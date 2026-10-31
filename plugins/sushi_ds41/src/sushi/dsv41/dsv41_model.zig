@@ -3463,20 +3463,30 @@ pub const wave_max = 8;
 /// crashed machines through ioGPU), and the wavefront never widens a chunk.
 pub const wave_rows_max = 8192;
 
-/// One unit of a wavefront's work: layer `layer` of chunk `chunk` of the group.
-pub const WaveUnit = struct { chunk: usize, layer: usize };
+/// What a wavefront unit runs. `layer` is a whole layer (`passLayer`); `split` is the chunk's end, the split layer's
+/// compressor (`waveSplit`). The ANE step splits `layer` into stages (pre-attention trunk, attention, FFN) here, so the
+/// schedule can put one chunk's trunk stage beside another's attention; a stage's input and output then need to be
+/// arrays the caller can provide (an IOSurface-backed `mlx_array_new_data_managed` wrap), not only MLX temporaries.
+pub const WaveStage = enum { layer, split };
+
+/// One unit of a wavefront's work: `stage` of layer `layer` of chunk `chunk` of the group.
+pub const WaveUnit = struct { chunk: usize, layer: usize, stage: WaveStage = .layer };
 
 /// The order a wavefront issues its units in, and the one place that order is decided. At step `s` chunk `c` runs
 /// layer `s - c * lag`, the leading chunk first, so chunk c + 1 reaches layer l only after chunk c finished it: every
 /// piece of state chunk c + 1 reads at layer l (window ring, compressed rows and index keys, the open pooling group)
-/// was written by chunk c at layer l, and nothing chunk c reads at a later layer is written by chunk c + 1 yet.
-/// `lag` >= 1; the legality argument is in local-llm `docs/research/ds41-ane-op-inventory-20261031.md`.
+/// was written by chunk c at layer l. A layer that reads an earlier layer's compressed rows or index keys (3-7 read 2,
+/// 9-13 read 8, 15-19 read 14) bounds the read by its own positions, which rows chunk c + 1 appends never reach. A
+/// chunk's `split` unit follows its last layer. `lag` >= 1; the legality argument is in local-llm
+/// `docs/research/ds41-ane-op-inventory-20261031.md`.
 pub const WaveSchedule = struct {
     chunks: usize,
     layers: usize,
     lag: usize,
     step: usize = 0,
     c: usize = 0,
+    /// The chunk whose `split` unit comes next, after its last layer.
+    split_next: ?usize = null,
 
     pub fn init(chunks: usize, layers: usize, lag: usize) WaveSchedule {
         std.debug.assert(lag >= 1 and chunks >= 1);
@@ -3488,13 +3498,19 @@ pub const WaveSchedule = struct {
     }
 
     pub fn next(self: *WaveSchedule) ?WaveUnit {
+        if (self.split_next) |c| {
+            self.split_next = null;
+            return .{ .chunk = c, .layer = self.layers, .stage = .split };
+        }
         while (self.step < self.steps()) {
             while (self.c < self.chunks) {
                 const c = self.c;
                 self.c += 1;
                 const back = c * self.lag;
                 if (self.step < back or self.step - back >= self.layers) continue;
-                return .{ .chunk = c, .layer = self.step - back };
+                const li = self.step - back;
+                if (li + 1 == self.layers) self.split_next = c;
+                return .{ .chunk = c, .layer = li };
             }
             self.c = 0;
             self.step += 1;
@@ -3539,15 +3555,19 @@ pub fn extendStateWave(m: *Model, chunks: []const []const u32, span: usize, ahea
     }
     aheadEmbed(m, ahead);
     var it = WaveSchedule.init(chunks.len, split, 1);
-    while (it.next()) |u| {
-        const p = &passes[u.chunk];
-        try passLayer(m, p, u.layer);
-        if (u.layer + 1 == split) try waveSplit(m, p, split);
-    }
+    while (it.next()) |u| try waveUnit(m, &passes[u.chunk], u);
     reportEngramWait(m, p0 - st.n);
     st.n = p0;
     m.state_only_used += chunks.len;
     transient_peak.end(.prefill_chunk, chunks[0].len);
+}
+
+/// Runs one wavefront unit on its chunk's pass.
+fn waveUnit(m: *Model, p: *Pass, u: WaveUnit) !void {
+    switch (u.stage) {
+        .layer => try passLayer(m, p, u.layer),
+        .split => try waveSplit(m, p, u.layer),
+    }
 }
 
 /// The end of one wavefront chunk, as `extendState` ends a chunk: the split layer's compressor over its rows.
