@@ -224,6 +224,10 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     }
     if (m.wave > 0) log.info("[sushi_ds41] wavefront prefill: {d} state-only chunks in flight, one layer apart\n", .{m.wave});
     m.prefill_log = std.c.getenv("SUSHI_DS41_PREFILL_LOG") != null;
+    m.mdl.pipe_depth = depthSetting(std.c.getenv("SUSHI_DS41_PREFILL_PIPELINE"), dsv.pipe_max);
+    m.mdl.wave_cold_lag = depthSetting(std.c.getenv("SUSHI_DS41_WAVE_COLD_LAG"), m.cfg.layers);
+    if (m.mdl.pipe_depth > 0) log.info("[sushi_ds41] prefill pipeline: up to {d} state-only layers in flight\n", .{m.mdl.pipe_depth});
+    if (m.mdl.wave_cold_lag > 0) log.info("[sushi_ds41] wavefront cold-group lag: {d} layers\n", .{m.mdl.wave_cold_lag});
     // The tower borrows its tensors from `m.weights`, which the model left them in.
     if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
     errdefer if (m.tower) |*t| t.deinit();
@@ -384,6 +388,7 @@ fn reset(m: *Model) void {
 /// told what follows it so the next chunk's Engram rows read while it runs, then the last token alone for the logits.
 /// Logits `[rows, vocab]`. `progress` gets the rows forwarded after each chunk (`Forward.progress`).
 fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, progress: ?*u64) !mlx.mlx_array {
+    errdefer dsv.pipeDrain(m.mdl) catch {};
     var rows = media;
     const prefix = if (want == .last and ids.len > 1) ids.len - 1 else 0;
     var at: usize = 0;
@@ -404,9 +409,13 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
         at = ch.end;
         if (progress) |p| @atomicStore(u64, p, at, .monotonic);
     }
+    // Pipelined state-only layers finish before the restore point and the last chunk (no-op when off).
+    try dsv.pipeDrain(m.mdl);
     try capture(m);
     const logits = try forwardRows(m, ids[prefix..], want, &.{}, rows);
     defer _ = mlx.mlx_array_free(logits);
+    // The last chunk's own pipelined layers: its logits already waited for them; this forgets their handles.
+    try dsv.pipeDrain(m.mdl);
     var o = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(o);
     try mlx.check(mlx.mlx_reshape(&o, logits, &[_]c_int{ -1, @intCast(m.cfg.vocab) }, 2, m.s));
@@ -428,6 +437,13 @@ fn chunkAt(m: *const Model, at: usize, prefix: usize) Chunk {
 /// Where the tokens told to a chunk ending at `end` stop: one chunk width on, or the whole request after the prefix.
 fn aheadEnd(end: usize, prefix: usize, n: usize) usize {
     return if (end < prefix) @min(end + sc.prefill_width, prefix) else n;
+}
+
+/// A positive count setting capped at `max`; 0 (off) when unset, unparsable or 0.
+fn depthSetting(raw: ?[*:0]const u8, max: usize) usize {
+    const z = raw orelse return 0;
+    const n = std.fmt.parseInt(usize, std.mem.span(z), 10) catch return 0;
+    return @min(n, max);
 }
 
 /// The `SUSHI_DS41_WAVEFRONT` value: chunks in flight, 0 (off) when unset, unparsable or below 2, capped at
@@ -479,12 +495,19 @@ fn sumLen(chunks: []const []const u32) usize {
     return n;
 }
 
-const WaitMark = struct { t0: u64, n: u64, ns: u64, begin_ns: u64, engram_ns: u64 };
+fn memGb(f: *const fn (*usize) callconv(.c) c_int) f64 {
+    var v: usize = 0;
+    _ = f(&v);
+    return @as(f64, @floatFromInt(v)) / 1e9;
+}
+
+const WaitMark = struct { t0: u64, n: u64, ns: u64, begin_ns: u64, engram_ns: u64, pipe_waits: u64 };
 
 fn waitsStart(m: *const Model) WaitMark {
     const W = dsv.Waits;
     W.on = m.prefill_log;
-    return .{ .t0 = W.start(), .n = W.n, .ns = W.ns, .begin_ns = W.begin_ns, .engram_ns = m.mdl.engram_wait_ns };
+    if (m.prefill_log) _ = mlx.mlx_reset_peak_memory();
+    return .{ .t0 = W.start(), .n = W.n, .ns = W.ns, .begin_ns = W.begin_ns, .engram_ns = m.mdl.engram_wait_ns, .pipe_waits = 0 };
 }
 
 /// `SUSHI_DS41_PREFILL_LOG`: the chunk's (or group's) wall time, the model's blocking host waits in it, and the expert
@@ -496,7 +519,7 @@ fn waitsReport(m: *const Model, w: WaitMark, kind: []const u8, chunks: usize, ro
     const n = W.n - w.n;
     const b = m.engine.breakdown();
     const layers = chunks * (m.mdl.ced_split orelse m.cfg.layers);
-    log.info("[sushi_ds41] prefill {s} chunks={d} rows={d} wall_ms={d:.1} ms_per_chunk={d:.1} waits={d} waits_per_layer={d:.2} wait_ms={d:.1} begin_ms={d:.1} engram_ms={d:.1} hook_layers={d} hook_xwait_ms={d:.1} hook_idswait_ms={d:.1}\n", .{
+    log.info("[sushi_ds41] prefill {s} chunks={d} rows={d} wall_ms={d:.1} ms_per_chunk={d:.1} waits={d} waits_per_layer={d:.2} wait_ms={d:.1} begin_ms={d:.1} engram_ms={d:.1} lag={d} pipe={d} peak_gb={d:.2} active_gb={d:.2} cache_gb={d:.2} hook_layers={d} hook_xwait_ms={d:.1} hook_idswait_ms={d:.1}\n", .{
         kind,
         chunks,
         rows,
@@ -507,6 +530,11 @@ fn waitsReport(m: *const Model, w: WaitMark, kind: []const u8, chunks: usize, ro
         @as(f64, @floatFromInt(W.ns - w.ns)) / 1e6,
         @as(f64, @floatFromInt(W.begin_ns - w.begin_ns)) / 1e6,
         @as(f64, @floatFromInt(m.mdl.engram_wait_ns -% w.engram_ns)) / 1e6,
+        if (chunks > 1) m.mdl.wave_last_lag else 0,
+        m.mdl.pipe_depth,
+        memGb(mlx.mlx_get_peak_memory),
+        memGb(mlx.mlx_get_active_memory),
+        memGb(mlx.mlx_get_cache_memory),
         b.route_full.layers + b.route_linear.layers,
         @as(f64, @floatFromInt(b.route_full.x_wait_ns + b.route_linear.x_wait_ns)) / 1e6,
         @as(f64, @floatFromInt(b.route_full.ids_wait_ns + b.route_linear.ids_wait_ns)) / 1e6,

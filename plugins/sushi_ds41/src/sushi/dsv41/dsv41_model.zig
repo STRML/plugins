@@ -716,6 +716,17 @@ pub const Model = struct {
     pack_kv: bool = true,
     /// Tests: each layer completes on the GPU before the next is built, the decode schedule's reference.
     sync_layers: bool = false,
+    /// `SUSHI_DS41_PREFILL_PIPELINE=<depth>`: a prefill-width layer of a state-only chunk is submitted, not waited on,
+    /// and the host waits only on the oldest of more than `pipe_depth` layers in flight (0: every layer waits).
+    pipe_depth: usize = 0,
+    /// The in-flight layers' output streams, oldest at `pipe_head` (`pipeSubmit`).
+    pipe_q: [pipe_max]A = @splat(none),
+    pipe_head: usize = 0,
+    pipe_n: usize = 0,
+    /// The lag of a wavefront group whose later chunks found no read-ahead of their Engram rows
+    /// (`SUSHI_DS41_WAVE_COLD_LAG`; 0 keeps lag 1), and the lag the last group ran with.
+    wave_cold_lag: usize = 0,
+    wave_last_lag: usize = 0,
     /// False: a decode-width pass submits its logits and returns them unevaluated, so the caller's first read of
     /// them (an argmax, the engine's sampling) is the pass's one wait. A DSpark round turns it off around its verify.
     head_wait: bool = true,
@@ -2239,6 +2250,54 @@ pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const e
     return sc.add(y, try sc.astype(sy, .float32));
 }
 
+/// The most prefill layers `pipe_depth` keeps in flight.
+pub const pipe_max = 8;
+
+/// Whether a pass of `rows` pipelines its layers (`pipe_depth`): prefill widths only, and none of the diagnostics that
+/// time or read a layer when it ends.
+fn pipeOn(m: *const Model, rows: usize) bool {
+    return m.pipe_depth > 0 and rows > exl3.kernels.DECODE_ROWS_MAX and !m.sync_layers and m.profile == null and m.trace == null and m.tap == null;
+}
+
+/// Queues a layer's arrays `ev` and tracks its output stream `x`; past `pipe_depth` layers in flight, waits for the
+/// oldest. Same graphs and kernels as an evaluation in place, so the same bytes: only when the host waits changes.
+fn pipeSubmit(m: *Model, ev: []const A, x: A) !void {
+    const vec = mlx.mlx_vector_array_new_data(ev.ptr, ev.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_async_eval(vec));
+    if (m.pipe_n == pipe_max) try pipeWaitOldest(m);
+    m.pipe_q[(m.pipe_head + m.pipe_n) % pipe_max] = handle(x);
+    m.pipe_n += 1;
+    while (m.pipe_n > m.pipe_depth) try pipeWaitOldest(m);
+}
+
+fn pipeWaitOldest(m: *Model) !void {
+    const slot = &m.pipe_q[m.pipe_head];
+    const x = slot.*;
+    slot.* = none;
+    m.pipe_head = (m.pipe_head + 1) % pipe_max;
+    m.pipe_n -= 1;
+    defer _ = mlx.mlx_array_free(x);
+    try sc_mod.waitOne(x);
+}
+
+/// Waits for every pipelined layer and forgets them; the GPU then holds no queued prefill layer. A failed wait still
+/// empties the queue.
+pub fn pipeDrain(m: *Model) !void {
+    var first: ?anyerror = null;
+    while (m.pipe_n > 0) pipeWaitOldest(m) catch |e| {
+        if (first == null) first = e;
+    };
+    if (first) |e| return e;
+}
+
+/// Queues `xs` on the GPU without waiting for them.
+fn submitAll(xs: []const A) !void {
+    const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_async_eval(v));
+}
+
 /// Queues `x` on the GPU without waiting for it.
 fn submit(x: A) !void {
     const v = mlx.mlx_vector_array_new_data(&[_]A{x}, 1);
@@ -2324,7 +2383,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
             try p.mark(.routed, &.{out});
             if (hk.host_ns) |f| p.hostShare(f(hk.ctx) - host0);
         }
-        try if (early) submit(out) else sc_mod.waitOne(out);
+        try if (early or pipeOn(m, dim(h, 0))) submit(out) else sc_mod.waitOne(out);
         return out;
     }
     if (fusedOn(sc, m) and dim(h, 0) > 1 and c.dim % 8 == 0) return moeWide(sc, m, li, h, r, try sharedExpert(sc, m, li, ly, h));
@@ -2886,7 +2945,8 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
     const cpre = sc.out(try sc.broadcast(try sc.astype(first, .float32), &.{ ci(L), ci(hc) }));
     errdefer _ = mlx.mlx_array_free(cpre);
     // A decode-width pass builds layer 0 on these lazily: the embedding is a few microseconds of GPU work.
-    if (L > exl3.kernels.DECODE_ROWS_MAX) try evalAll(if (img.ctx != null) &.{ x, cpre, img } else &.{ x, cpre });
+    const made: []const A = if (img.ctx != null) &.{ x, cpre, img } else &.{ x, cpre };
+    if (pipeOn(m, L)) try submitAll(made) else if (L > exl3.kernels.DECODE_ROWS_MAX) try evalAll(made);
     return .{ .st = st, .ids = ids, .p0 = p0, .span = span, .rows = rows, .x = x, .cpre = cpre, .sh = try Shared.init(gpa, (L + span - 1) / span), .img = img };
 }
 
@@ -3193,7 +3253,8 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     if (m.cfg.engram.layerAt(li)) |ei| if (ei + 1 == m.engrams.len) aheadEngram(m, p) catch {};
     const c = &m.cfg;
     // At decode widths a layer is submitted, not waited on: the next layer's router picks are the one host read.
-    const wait = m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX;
+    const piped = pipeOn(m, L);
+    const wait = (m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX) and !piped;
     if (p.st.ds.len > 0) for (c.dspark.targets[0..c.dspark.n_targets], 0..) |tl, t| if (tl == li) {
         if (p.targets[t].ctx != null) _ = mlx.mlx_array_free(p.targets[t]);
         p.targets[t] = sc.out(try sc.astype(try sc.mean(try sc.astype(p.x, .float32), 1, false), m.act));
@@ -3215,6 +3276,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     try appendVerifyArrays(gpa, &ev, p.st, li);
     if (m.trace) |t| try t.put("stream_{d}", .{li}, p.x);
     if (prof(m, L)) |pf| return pf.mark(.expand, ev.items);
+    if (piped) return pipeSubmit(m, ev.items, p.x);
     if (wait) return evalAll(ev.items);
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
@@ -3489,7 +3551,7 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(m.gpa);
     try appendStateArrays(m.gpa, &ev, &st.layers[split]);
-    try evalAll(ev.items);
+    try if (pipeOn(m, ids.len)) submitAll(ev.items) else evalAll(ev.items);
     reportEngramWait(m, ids.len);
     st.n = pass.p0 + ids.len;
     m.state_only_used += 1;
@@ -3588,6 +3650,7 @@ pub fn extendStateWave(m: *Model, chunks: []const []const u32, span: usize, ahea
     defer for (passes[0..begun]) |*p| p.deinit(m.gpa);
     // Passes begin in prompt order: each one's Engram rows hash the history the ones before it appended.
     var p0 = st.n;
+    var cold = false;
     for (chunks, 0..) |ids, c| {
         passes[c] = try beginPassWith(m, st, ids, p0, span, null);
         begun += 1;
@@ -3603,10 +3666,14 @@ pub fn extendStateWave(m: *Model, chunks: []const []const u32, span: usize, ahea
             if (m.engram_ahead) |old| old.finish();
             m.engram_ahead = pf;
         }
+        const used = m.engram_ahead_used;
         try prefetchEngram(m, &passes[c]);
+        // A later chunk whose rows nobody read ahead: its first Engram layer would wait on the SSD.
+        if (c > 0 and passes[c].engram_pf != null and m.engram_ahead_used == used) cold = true;
     }
     aheadEmbed(m, ahead);
-    var it = WaveSchedule.init(chunks.len, split, 1);
+    m.wave_last_lag = if (cold and m.wave_cold_lag > 0) @min(m.wave_cold_lag, split) else 1;
+    var it = WaveSchedule.init(chunks.len, split, m.wave_last_lag);
     while (it.next()) |u| try waveUnit(m, &passes[u.chunk], u);
     reportEngramWait(m, p0 - st.n);
     st.n = p0;
@@ -3631,7 +3698,7 @@ fn waveSplit(m: *Model, p: *Pass, split: usize) !void {
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(m.gpa);
     try appendStateArrays(m.gpa, &ev, &p.st.layers[split]);
-    try evalAll(ev.items);
+    try if (pipeOn(m, p.ids.len)) submitAll(ev.items) else evalAll(ev.items);
 }
 
 /// The CED decoder's first layer `li` over every row of the pass: only its compressor, whose ratio-1 rows (and index
