@@ -119,7 +119,9 @@ const ane_op_count = @typeInfo(AneOp).@"enum".fields.len;
 /// dequantized to fp16, an fp16 matmul (MLX: fp32 accumulate, fp16 out), the output cast back. The shared expert runs
 /// its clamped SwiGLU in fp16 between. `SUSHI_DS41_ANE_EMU_PRESCALE=1` divides each row of x by its absmax before the
 /// cast and multiplies the output back after, in f32. Every 256 calls an op logs how many fp16 values were non-finite.
-const AneCfg = struct { mask: u32 = 0, min_rows: usize = 256, prescale: bool = false };
+/// `SUSHI_DS41_ANE_EMU_KCHUNK=<k>` splits the contraction into k-wide chunks, each an fp16 matmul with fp16 output,
+/// summed in fp16 in order (lib/ane's in-graph K chunking); 0 (default) is one fp16 matmul (fp32 accumulate).
+const AneCfg = struct { mask: u32 = 0, min_rows: usize = 256, prescale: bool = false, kchunk: usize = 0 };
 var ane_cfg: ?AneCfg = null;
 
 fn aneConfig() AneCfg {
@@ -139,6 +141,7 @@ fn aneConfig() AneCfg {
     }
     if (std.c.getenv("SUSHI_DS41_ANE_EMU_MIN_ROWS")) |e| c.min_rows = std.fmt.parseInt(usize, std.mem.span(e), 10) catch c.min_rows;
     if (std.c.getenv("SUSHI_DS41_ANE_EMU_PRESCALE")) |e| c.prescale = std.mem.eql(u8, std.mem.span(e), "1");
+    if (std.c.getenv("SUSHI_DS41_ANE_EMU_KCHUNK")) |e| c.kchunk = std.fmt.parseInt(usize, std.mem.span(e), 10) catch 0;
     if (c.mask != 0) {
         var buf: [256]u8 = undefined;
         var n: usize = 0;
@@ -146,7 +149,7 @@ fn aneConfig() AneCfg {
             const w = std.fmt.bufPrint(buf[n..], "{s} ", .{f.name}) catch "";
             n += w.len;
         };
-        log.warn("[sushi_ds41] ane-emu: ops {s}min_rows {d} prescale {}\n", .{ buf[0..n], c.min_rows, c.prescale });
+        log.warn("[sushi_ds41] ane-emu: ops {s}min_rows {d} prescale {} kchunk {d}\n", .{ buf[0..n], c.min_rows, c.prescale, c.kchunk });
     }
     ane_cfg = c;
     return c;
@@ -262,7 +265,7 @@ fn aneLinear(sc: *Scope, l: *const Lin, x: A, out_dt: mlx.mlx_dtype) !A {
     const pre = aneConfig().prescale;
     const amax = if (pre) try sc.maximum(try sc.max(try sc.op1(mlx.mlx_abs, xf), -1, true), try sc.f(1e-30)) else none;
     const x16 = try sc.astype(if (pre) try sc.div(xf, amax) else xf, .float16);
-    const y16 = try sc.matmul(x16, w);
+    const y16 = try aneMatmul(sc, x16, w);
     try aneRecord(sc, l.op, x3, x16, y16);
     const y = if (pre) try sc.astype(try sc.mul(try sc.astype(y16, .float32), amax), out_dt) else try sc.astype(y16, out_dt);
     if (g > 1) return y;
@@ -270,6 +273,21 @@ fn aneLinear(sc: *Scope, l: *const Lin, x: A, out_dt: mlx.mlx_dtype) !A {
     @memcpy(shape[0..sh.len], sh);
     shape[sh.len - 1] = ci(dim(w, 2));
     return sc.reshape(y, shape[0..sh.len]);
+}
+
+/// `x16` `[G, rows, in]` @ `w` `[G, in, out]` in fp16, K-chunked when `SUSHI_DS41_ANE_EMU_KCHUNK` asks.
+fn aneMatmul(sc: *Scope, x16: A, w: A) !A {
+    const k = aneConfig().kchunk;
+    const in = dim(w, 1);
+    if (k == 0 or in <= k) return sc.matmul(x16, w);
+    var acc: A = none;
+    var lo: usize = 0;
+    while (lo < in) : (lo += k) {
+        const hi = @min(lo + k, in);
+        const part = try sc.matmul(try sc.slice(x16, -1, lo, hi), try sc.slice(w, 1, lo, hi));
+        acc = if (acc.ctx == null) part else try sc.add(acc, part);
+    }
+    return acc;
 }
 
 /// The shared expert as one ANE SwiGLU procedure: three emulated linears with the clamped SwiGLU in fp16 between.
