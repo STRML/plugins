@@ -441,28 +441,42 @@ fn waveSetting(raw: ?[*:0]const u8) usize {
 /// Runs the state-only text chunks from `at` on, up to `m.wave` of them, as one wavefront group and returns where the
 /// group ended; `at` when fewer than two such chunks follow (the caller runs that one alone).
 fn waveRows(m: *Model, ids: []const u32, at: usize, prefix: usize) !usize {
-    var bounds: [dsv.wave_max + 1]usize = undefined;
-    bounds[0] = at;
-    var k: usize = 0;
-    while (k < m.wave) {
-        const ch = chunkAt(m, bounds[k], prefix);
-        if (!ch.state_only or ch.end - bounds[k] > dsv.wave_rows_max) break;
-        k += 1;
-        bounds[k] = ch.end;
-    }
-    if (k < 2) return at;
     var chunks: [dsv.wave_max][]const u32 = undefined;
-    for (0..k) |c| chunks[c] = ids[bounds[c]..bounds[c + 1]];
-    const end = bounds[k];
+    const k = waveGroup(m, ids, at, prefix, &chunks);
+    if (k < 2) return at;
+    const end = at + sumLen(chunks[0..k]);
     const ahead = ids[end..aheadEnd(end, prefix, ids.len)];
+    // A group follows: all its chunks' Engram rows read while this one runs.
+    var next: [dsv.wave_max][]const u32 = undefined;
+    const nk = waveGroup(m, ids, end, prefix, &next);
     poolForRows(m, chunks[0].len);
     m.engine.beginForward();
     const w = waitsStart(m);
-    try dsv.extendStateWave(m.mdl, chunks[0..k], dsv.SPAN, ahead);
+    try dsv.extendStateWave(m.mdl, chunks[0..k], dsv.SPAN, ahead, if (nk >= 2) next[0..nk] else &.{});
     m.engine.finishForward(end - at);
     waitsReport(m, w, "wave", k, end - at);
     try m.ids.appendSlice(gpa, ids[at..end]);
     return end;
+}
+
+/// The state-only text chunks from `at` on, up to `m.wave` of them, that one wavefront group would take: their count.
+fn waveGroup(m: *const Model, ids: []const u32, at: usize, prefix: usize, out: *[dsv.wave_max][]const u32) usize {
+    var k: usize = 0;
+    var from = at;
+    while (k < m.wave) {
+        const ch = chunkAt(m, from, prefix);
+        if (!ch.state_only or ch.end - from > dsv.wave_rows_max) break;
+        out[k] = ids[from..ch.end];
+        k += 1;
+        from = ch.end;
+    }
+    return k;
+}
+
+fn sumLen(chunks: []const []const u32) usize {
+    var n: usize = 0;
+    for (chunks) |c| n += c.len;
+    return n;
 }
 
 const WaitMark = struct { t0: u64, n: u64, ns: u64, begin_ns: u64, engram_ns: u64 };

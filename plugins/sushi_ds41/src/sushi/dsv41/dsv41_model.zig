@@ -700,6 +700,8 @@ pub const Model = struct {
     dspark_exact: bool = true,
     /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
     engram_ahead: ?*engram.Prefetch = null,
+    /// A wavefront group's read-ahead of the next group: chunk `c`'s Engram rows in slot `c` (`aheadGroup`).
+    wave_ahead: [wave_max]?*engram.Prefetch = @splat(null),
     engram_ahead_used: u64 = 0,
     /// Prefill chunks that left state only (`extendState`).
     state_only_used: u64 = 0,
@@ -765,6 +767,10 @@ pub const Model = struct {
     fn dropAhead(self: *Model) void {
         if (self.engram_ahead) |pf| pf.finish();
         self.engram_ahead = null;
+        for (&self.wave_ahead) |*slot| if (slot.*) |pf| {
+            pf.finish();
+            slot.* = null;
+        };
     }
 
     fn dropEmbedAhead(self: *Model) void {
@@ -2773,6 +2779,8 @@ pub const Pass = struct {
     engram_pf: ?*engram.Prefetch = null,
     /// The prompt tokens after this chunk, whose Engram rows are read while the chunk runs (`aheadEngram`).
     ahead: []const u32 = &.{},
+    /// A wavefront's last pass: the chunks of the next group, whose Engram rows are all read ahead (`aheadGroup`).
+    ahead_group: []const []const u32 = &.{},
     ahead_started: bool = false,
     /// `[L]` bool, the rows inside an image span (none for text): they route by the image bias and take no Engram write.
     img: A = none,
@@ -3363,6 +3371,7 @@ fn prefetchEngram(m: *Model, p: *Pass) !void {
 /// arrive while its layers run and the SSD is not shared. Host memory: one chunk's rows, 264 B for each of the
 /// 24 row ids of 2 tables a token. A failure leaves the next pass to read its own.
 fn aheadEngram(m: *Model, p: *Pass) !void {
+    if (p.ahead_group.len > 1) return aheadGroup(m, p);
     if (p.ahead_started or p.ahead.len == 0) return;
     p.ahead_started = true;
     const hs = &(m.hash orelse return);
@@ -3378,6 +3387,38 @@ fn aheadEngram(m: *Model, p: *Pass) !void {
     for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
     m.dropAhead();
     m.engram_ahead = try engram.Prefetch.start(gpa, tables[0..m.engrams.len], &.{.{ .at = p.st.hist.items.len, .len = comp.len, .ids = rows }}, hs.cols(), comp.len);
+}
+
+/// `aheadEngram` for a wavefront's last pass: every chunk of the next group starts reading, one prefetch a chunk in
+/// `m.wave_ahead`, so the group's later chunks find their rows read as its first does. The rows hash the history as it
+/// stands (it ends after this pass) followed by the group's own tokens.
+fn aheadGroup(m: *Model, p: *Pass) !void {
+    if (p.ahead_started) return;
+    p.ahead_started = true;
+    const hs = &(m.hash orelse return);
+    if (m.engrams.len == 0) return;
+    const gpa = m.gpa;
+    var total: usize = 0;
+    for (p.ahead_group) |g| total += g.len;
+    const comp = try gpa.alloc(u32, total);
+    defer gpa.free(comp);
+    var at: usize = 0;
+    for (p.ahead_group) |g| for (g) |t| {
+        comp[at] = m.compressedId(t);
+        at += 1;
+    };
+    const per = hs.n_layers * hs.cols();
+    const rows = try gpa.alloc(u32, total * per);
+    defer gpa.free(rows);
+    hs.rows(p.st.hist.items, comp, rows);
+    var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
+    for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
+    m.dropAhead();
+    var off: usize = 0;
+    for (p.ahead_group, 0..) |g, c| {
+        m.wave_ahead[c] = try engram.Prefetch.start(gpa, tables[0..m.engrams.len], &.{.{ .at = p.st.hist.items.len + off, .len = g.len, .ids = rows[off * per ..][0 .. g.len * per] }}, hs.cols(), g.len);
+        off += g.len;
+    }
 }
 
 /// Whether the pass's chunk runs the CED decoder over its last rows only: it does when it is wider than the window and
@@ -3533,7 +3574,7 @@ pub fn waveOk(m: *const Model) bool {
 /// The state stands consistent only at the end: `st.n` moves once, after the last chunk, and a failure part-way
 /// leaves layers past `st.n` written (as a failed `extendState` does). `ahead` is the tokens after the group, read
 /// ahead while it runs. Images take `extendState`.
-pub fn extendStateWave(m: *Model, chunks: []const []const u32, span: usize, ahead: []const u32) !void {
+pub fn extendStateWave(m: *Model, chunks: []const []const u32, span: usize, ahead: []const u32, ahead_group: []const []const u32) !void {
     const split = m.ced_split orelse return error.Dsv41NoCedSplit;
     if (!waveOk(m) or chunks.len == 0 or chunks.len > wave_max) return error.Dsv41WaveRefused;
     errdefer m.dropAhead();
@@ -3552,7 +3593,16 @@ pub fn extendStateWave(m: *Model, chunks: []const []const u32, span: usize, ahea
         begun += 1;
         p0 += ids.len;
         // Only the last pass reads ahead: `aheadEngram` hashes the history as it stands, which ends after the last.
-        if (c + 1 == chunks.len) passes[c].ahead = ahead;
+        if (c + 1 == chunks.len) {
+            passes[c].ahead = ahead;
+            passes[c].ahead_group = ahead_group;
+        }
+        // The previous group read this chunk's rows ahead: hand them to `prefetchEngram` as the carried read.
+        if (m.wave_ahead[c]) |pf| {
+            m.wave_ahead[c] = null;
+            if (m.engram_ahead) |old| old.finish();
+            m.engram_ahead = pf;
+        }
         try prefetchEngram(m, &passes[c]);
     }
     aheadEmbed(m, ahead);
