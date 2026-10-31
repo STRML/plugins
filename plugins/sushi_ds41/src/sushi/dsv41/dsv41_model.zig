@@ -111,7 +111,7 @@ pub const Stq = struct {
 /// A trunk op `SUSHI_DS41_ANE_EMU` can select. `shared_gpu` emulates nothing: it only takes the shared expert out of
 /// the routed launches, the control for `shared` (which must leave the fold too).
 pub const AneOp = enum(u8) { none, wq_a, wkv, wq_b, wo_a, wo_b, shared, engram_wkv, idx_wq_b, idx_wk, idx_wproj, comp, shared_gpu };
-const ane_op_count = @typeInfo(AneOp).@"enum".fields.len;
+const ane_op_count = @typeInfo(AneOp).@"enum".field_names.len;
 
 /// `SUSHI_DS41_ANE_EMU=<comma list of AneOp names, or attn_in (= wq_a,wkv), or all>`: on a call of at least
 /// `SUSHI_DS41_ANE_EMU_MIN_ROWS` rows (default 256, prefill only), the selected op runs as the Neural Engine would:
@@ -145,18 +145,19 @@ fn aneConfig() AneCfg {
     if (c.mask != 0) {
         var buf: [256]u8 = undefined;
         var n: usize = 0;
-        inline for (@typeInfo(AneOp).@"enum".fields) |f| if (c.mask & aneBit(@enumFromInt(f.value)) != 0) {
-            const w = std.fmt.bufPrint(buf[n..], "{s} ", .{f.name}) catch "";
-            n += w.len;
-        };
-        log.warn("[sushi_ds41] ane-emu: ops {s}min_rows {d} prescale {} kchunk {d}\n", .{ buf[0..n], c.min_rows, c.prescale, c.kchunk });
+        for (0..ane_op_count) |i| {
+            const op: AneOp = @enumFromInt(i);
+            if (c.mask & aneBit(op) == 0) continue;
+            if (std.fmt.bufPrint(buf[n..], "{s} ", .{@tagName(op)})) |w| n += w.len else |_| {}
+        }
+        log.warn("[sushi_ds41] ane-emu: ops {s}min_rows {d} prescale {s} kchunk {d}\n", .{ buf[0..n], c.min_rows, if (c.prescale) "on" else "off", c.kchunk });
     }
     ane_cfg = c;
     return c;
 }
 
 fn aneBit(op: AneOp) u32 {
-    return @as(u32, 1) << @intFromEnum(op);
+    return @as(u32, 1) << @as(u5, @intCast(@intFromEnum(op)));
 }
 
 fn aneWants(op: AneOp, rows: usize) bool {
@@ -193,7 +194,7 @@ fn aneDenseT(sc: *Scope, l: *const Lin) !A {
 
 /// `l`'s weight through the int8 round trip, as fp16 `[G, in, out]`; built once and kept.
 fn aneWeight(sc: *Scope, l: *const Lin) !A {
-    const wkey: usize = @intFromPtr((if (l.stq) |q| q.p.trellis else l.w).ctx);
+    const wkey: usize = @intFromPtr((if (l.stq) |q| q.p.trellis else l.w).ctx.?);
     if (ane_weights.get(wkey)) |w| return w;
     var ws = Scope.init(sc.a, sc.s);
     defer ws.deinit();
