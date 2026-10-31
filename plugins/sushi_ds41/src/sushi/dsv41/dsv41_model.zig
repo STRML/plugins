@@ -202,6 +202,8 @@ pub const Experts = union(enum) {
         prefetch: ?*const fn (ctx: *anyopaque, layer: usize, cand: []const u16, rows: usize, n: usize, m: usize) void = null,
         /// Decode widths: the routed chain queued before the host knows the picks, checked one layer late.
         spec: ?Spec = null,
+        /// Whether layer `layer` maps its picks to experts on the GPU (no host read): its MoE needs no early submits.
+        gpu_route: ?*const fn (ctx: *anyopaque, layer: usize) bool = null,
     };
 
     pub const Spec = struct {
@@ -2302,7 +2304,11 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
         }
         // At decode widths the GPU runs the shared expert while the host reads the picks and fills the misses, and the
         // layer is only submitted: the next layer's picks depend on it, so their read is the one wait per layer.
-        const early = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
+        const narrow = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
+        // A layer routed on the GPU has no host read to hide: the layer's own submit (`buildLayer`) carries all of it,
+        // one command buffer where the early submits made four.
+        const on_gpu = narrow and pf == null and if (hk.gpu_route) |f| f(hk.ctx, li) else false;
+        const early = narrow and !on_gpu;
         if (early) try submit(r.idx);
         // A wide chunk's shared expert rides the routed launches when the trellis chain takes it there.
         const wide = m.tap == null and m.shared_fold and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX and ly.shared[0].stq != null;
@@ -2317,6 +2323,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
             try p.mark(.routed, &.{out});
             if (hk.host_ns) |f| p.hostShare(f(hk.ctx) - host0);
         }
+        if (on_gpu) return out;
         try if (early) submit(out) else mlx.check(mlx.mlx_array_eval(out));
         return out;
     }

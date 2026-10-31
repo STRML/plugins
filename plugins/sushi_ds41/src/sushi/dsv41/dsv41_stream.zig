@@ -150,7 +150,13 @@ pub const StqStream = struct {
             .can = canQueue,
             .queue = queueOpaque,
             .settle = settleOpaque,
-        } };
+        }, .gpu_route = gpuRoute };
+    }
+
+    /// A resident layer maps its picks to slots on the GPU (`applyScored`), with no host read.
+    fn gpuRoute(ctx: *anyopaque, layer: usize) bool {
+        const self: *StqStream = @ptrCast(@alignCast(ctx));
+        return layer < self.engine.layers.len and self.engine.residentRoute(@intCast(layer)) != null;
     }
 
     fn canQueue(ctx: *anyopaque, layer: usize) bool {
