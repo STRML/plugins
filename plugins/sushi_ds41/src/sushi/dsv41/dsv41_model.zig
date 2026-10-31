@@ -2818,6 +2818,8 @@ pub fn imageRows(m: *const Model, ids: []const u32) usize {
 
 /// `beginPass` with the images of the request: the span positions of `ids` take `vision`'s rows.
 pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: usize, vision: ?VisionRows) !Pass {
+    const tb = Waits.start();
+    defer Waits.began(tb);
     try flushMain(st);
     const gpa = m.gpa;
     const c = &m.cfg;

@@ -465,12 +465,12 @@ fn waveRows(m: *Model, ids: []const u32, at: usize, prefix: usize) !usize {
     return end;
 }
 
-const WaitMark = struct { t0: u64, n: u64, ns: u64 };
+const WaitMark = struct { t0: u64, n: u64, ns: u64, begin_ns: u64, engram_ns: u64 };
 
 fn waitsStart(m: *const Model) WaitMark {
     const W = dsv.Waits;
     W.on = m.prefill_log;
-    return .{ .t0 = W.start(), .n = W.n, .ns = W.ns };
+    return .{ .t0 = W.start(), .n = W.n, .ns = W.ns, .begin_ns = W.begin_ns, .engram_ns = m.mdl.engram_wait_ns };
 }
 
 /// `SUSHI_DS41_PREFILL_LOG`: the chunk's (or group's) wall time, the model's blocking host waits in it, and the expert
@@ -482,7 +482,7 @@ fn waitsReport(m: *const Model, w: WaitMark, kind: []const u8, chunks: usize, ro
     const n = W.n - w.n;
     const b = m.engine.breakdown();
     const layers = chunks * (m.mdl.ced_split orelse m.cfg.layers);
-    log.info("[sushi_ds41] prefill {s} chunks={d} rows={d} wall_ms={d:.1} ms_per_chunk={d:.1} waits={d} waits_per_layer={d:.2} wait_ms={d:.1} hook_layers={d} hook_xwait_ms={d:.1} hook_idswait_ms={d:.1}\n", .{
+    log.info("[sushi_ds41] prefill {s} chunks={d} rows={d} wall_ms={d:.1} ms_per_chunk={d:.1} waits={d} waits_per_layer={d:.2} wait_ms={d:.1} begin_ms={d:.1} engram_ms={d:.1} hook_layers={d} hook_xwait_ms={d:.1} hook_idswait_ms={d:.1}\n", .{
         kind,
         chunks,
         rows,
@@ -491,6 +491,8 @@ fn waitsReport(m: *const Model, w: WaitMark, kind: []const u8, chunks: usize, ro
         n,
         @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(@max(layers, 1))),
         @as(f64, @floatFromInt(W.ns - w.ns)) / 1e6,
+        @as(f64, @floatFromInt(W.begin_ns - w.begin_ns)) / 1e6,
+        @as(f64, @floatFromInt(m.mdl.engram_wait_ns -% w.engram_ns)) / 1e6,
         b.route_full.layers + b.route_linear.layers,
         @as(f64, @floatFromInt(b.route_full.x_wait_ns + b.route_linear.x_wait_ns)) / 1e6,
         @as(f64, @floatFromInt(b.route_full.ids_wait_ns + b.route_linear.ids_wait_ns)) / 1e6,

@@ -237,6 +237,8 @@ pub const Waits = struct {
     pub var on = false;
     pub var n: u64 = 0;
     pub var ns: u64 = 0;
+    /// Time in `beginPassWith` (embedding rows, Engram hashes, the first evaluation), counted beside the waits.
+    pub var begin_ns: u64 = 0;
 
     fn now() u64 {
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -245,6 +247,10 @@ pub const Waits = struct {
 
     pub fn start() u64 {
         return if (on) now() else 0;
+    }
+
+    pub fn began(t0: u64) void {
+        if (on) begin_ns += now() -| t0;
     }
 
     pub fn done(t0: u64) void {
