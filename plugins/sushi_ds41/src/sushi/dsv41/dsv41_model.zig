@@ -694,6 +694,9 @@ pub const Model = struct {
     shared_fold: bool = true,
     /// TEMPORARY A/B: a decode-width pass reads its Engram rows ahead (`prefetchEngram`).
     decode_engram_ahead: bool = true,
+    /// TEMPORARY A/B (`SUSHI_DS41_ENGRAM_FIRST`): a decode-width pass starts its Engram read as soon as the rows are
+    /// hashed, before the embedding read and layer 0's build, instead of after them.
+    engram_first: bool = false,
     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
     /// text does not depend on the round mix (`SUSHI_DSV41_DSPARK_EXACT=0` takes the faster arms, which sum by width).
     dspark_exact: bool = true,
@@ -2836,6 +2839,8 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
         try st.hist.appendSlice(gpa, comp);
     }
     dd.add("hash", hash_t0);
+    const early = try startEngramEarly(m, rows, p0, L);
+    errdefer if (early) |pf| pf.finish();
 
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
@@ -2881,7 +2886,21 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
     errdefer _ = mlx.mlx_array_free(cpre);
     // A decode-width pass builds layer 0 on these lazily: the embedding is a few microseconds of GPU work.
     if (L > exl3.kernels.DECODE_ROWS_MAX) try evalAll(if (img.ctx != null) &.{ x, cpre, img } else &.{ x, cpre });
-    return .{ .st = st, .ids = ids, .p0 = p0, .span = span, .rows = rows, .x = x, .cpre = cpre, .sh = try Shared.init(gpa, (L + span - 1) / span), .img = img };
+    return .{ .st = st, .ids = ids, .p0 = p0, .span = span, .rows = rows, .x = x, .cpre = cpre, .sh = try Shared.init(gpa, (L + span - 1) / span), .img = img, .engram_pf = early };
+}
+
+/// `engram_first`: the decode-width pass's Engram read, started before its embedding read so the reader's `pread`s run
+/// during it and layer 0's build. The same grid `prefetchEngram` would start (one span of the pass's rows a table),
+/// so the rows are the same; a carried read-ahead is left for `prefetchEngram` to adopt.
+fn startEngramEarly(m: *Model, rows: []const u32, p0: usize, L: usize) !?*engram.Prefetch {
+    if (!m.engram_first or L > NARROW_ROWS or !m.decode_engram_ahead or m.engram_ahead != null) return null;
+    const hs = &(m.hash orelse return null);
+    if (m.engrams.len == 0) return null;
+    var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
+    for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
+    const t0 = decode_diag.start();
+    defer decode_diag.add("pf_start", t0);
+    return try engram.Prefetch.startNarrow(m.gpa, tables[0..m.engrams.len], &.{.{ .at = p0, .len = L, .ids = rows }}, hs.cols(), L);
 }
 
 /// Diagnostic (`SUSHI_DSV41_READ_DIAG`): the blocking host reads of decode-width forwards by site, printed at debug
@@ -3059,6 +3078,25 @@ pub var decode_diag: DecodeDiag = .{};
 pub fn setDecodeDiag(on: bool) void {
     decode_diag.on = on;
     engram.diag = on;
+}
+
+/// TEMPORARY A/B: the decode prelude levers, each byte-exact (the same rows, bytes and graph; only where the host reads
+/// them moves). `first`: `engram_first`. `pool`: `engram.Pool` (no thread spawned per read). `embed_host`: the SSD
+/// embedding held in host memory (`Ssd.loadHost`). A lever that fails to start logs and stays off.
+pub fn setDecodeLevers(m: *Model, first: bool, pool: bool, embed_host: bool) void {
+    m.engram_first = first;
+    if (first) log.info("[sushi_ds41] decode lever: Engram read starts before the embedding read\n", .{});
+    if (pool) {
+        if (engram.startPool(m.gpa)) log.info("[sushi_ds41] decode lever: Engram reader and read workers pooled\n", .{}) else |e| log.warn("[sushi_ds41] Engram pool off: {s}\n", .{@errorName(e)});
+    }
+    if (embed_host) if (m.embed.ssd) |ssd| {
+        if (ssd.loadHost(m.gpa)) log.info("[sushi_ds41] decode lever: embedding in host memory ({d:.2} GB)\n", .{@as(f64, @floatFromInt(ssd.stored)) / 1e9}) else |e| log.warn("[sushi_ds41] embedding host copy off: {s}\n", .{@errorName(e)});
+    };
+}
+
+/// Stops what `setDecodeLevers` started that outlives the model.
+pub fn stopDecodeLevers() void {
+    engram.stopPool();
 }
 
 fn engramRowsRead(m: *const Model) u64 {
@@ -3506,7 +3544,8 @@ fn prefetchEngram(m: *Model, p: *Pass) !void {
         var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
         for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
         const t0 = decode_diag.start();
-        p.engram_pf = try engram.Prefetch.start(m.gpa, tables[0..m.engrams.len], &.{.{ .at = p.p0, .len = p.ids.len, .ids = p.rows }}, hs.cols(), p.ids.len);
+        const start = if (p.ids.len <= NARROW_ROWS) &engram.Prefetch.startNarrow else &engram.Prefetch.start;
+        p.engram_pf = try start(m.gpa, tables[0..m.engrams.len], &.{.{ .at = p.p0, .len = p.ids.len, .ids = p.rows }}, hs.cols(), p.ids.len);
         decode_diag.add("pf_start", t0);
     }
     if (p.engram_pf.?.finished()) aheadEngram(m, p) catch {};

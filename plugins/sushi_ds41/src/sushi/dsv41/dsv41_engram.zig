@@ -376,6 +376,10 @@ pub const Table = struct {
         // One thread per 16 rows (a verify's rows wait at the first Engram layer), this one included.
         const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, PAR_THREADS);
         if (parts > 1) {
+            if (read_pool) |p| if (p.split(&job, parts)) {
+                if (job.bad.load(.acquire)) return error.EngramRead;
+                return;
+            };
             var threads: [PAR_THREADS]?std.Thread = @splat(null);
             const t0 = if (diag) diagNow() else 0;
             for (threads[1..parts], 1..) |*t, k| t.* = std.Thread.spawn(.{}, Job.runVoid, .{ &job, k, parts }) catch null;
@@ -622,6 +626,8 @@ pub const Prefetch = struct {
     /// Set once the thread has read every grid (or was stopped).
     ended: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    /// Read by `read_pool`'s reader thread instead of a thread of its own.
+    pooled: bool = false,
 
     /// `ids` is `[len][tables.len][nc]` row ids (`Hash.rows`).
     pub const Spec = struct { at: usize, len: usize, ids: []const u32 };
@@ -642,6 +648,34 @@ pub const Prefetch = struct {
 
     /// Reads `specs` in order. Copies what it is given; the returned value must not move (the thread holds it).
     pub fn start(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize) !*Prefetch {
+        const self = try create(gpa, tables, specs, nc, span);
+        errdefer self.discard();
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
+
+    /// `start` for a decode-width pass: on `read_pool`'s reader thread when the pool runs and has room, else on a thread of
+    /// its own. The same grids are read in the same order either way.
+    pub fn startNarrow(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize) !*Prefetch {
+        const p = read_pool orelse return start(gpa, tables, specs, nc, span);
+        const self = try create(gpa, tables, specs, nc, span);
+        errdefer self.discard();
+        self.pooled = true;
+        if (p.post(self)) return self;
+        self.pooled = false;
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
+
+    /// Frees a prefetch no thread was given.
+    fn discard(self: *Prefetch) void {
+        for (self.grids) |g| freeGrid(self.gpa, g);
+        self.gpa.free(self.grids);
+        self.gpa.free(self.tables);
+        self.gpa.destroy(self);
+    }
+
+    fn create(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize) !*Prefetch {
         const self = try gpa.create(Prefetch);
         errdefer gpa.destroy(self);
         const own_tables = try gpa.dupe(*const Table, tables);
@@ -661,7 +695,6 @@ pub const Prefetch = struct {
             made += 1;
         }
         self.* = .{ .gpa = gpa, .tables = own_tables, .grids = grids, .span = span, .nc = nc };
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
     }
 
@@ -733,12 +766,138 @@ pub const Prefetch = struct {
     pub fn finish(self: *Prefetch) void {
         self.stop.store(true, .release);
         if (self.thread) |t| t.join();
-        for (self.grids) |g| freeGrid(self.gpa, g);
-        self.gpa.free(self.grids);
-        self.gpa.free(self.tables);
-        self.gpa.destroy(self);
+        // The reader stops at its next span (or skips a prefetch still queued); the frees wait for it to let go.
+        if (self.pooled) while (!self.ended.load(.acquire)) std.Thread.yield() catch {};
+        self.discard();
     }
 };
+
+/// TEMPORARY A/B (`SUSHI_DS41_ENGRAM_POOL`): threads started once at load instead of per read. One reader takes the
+/// decode-width prefetches (`Prefetch.startNarrow`) in the order posted; `PAR_THREADS - 1` workers take the parts of a
+/// `Table.readInto` split, each the same `Job.run(k, parts)` a spawned thread would run, so every row lands where it
+/// does today. A split that finds the workers busy (another thread's read) spawns as before.
+pub const Pool = struct {
+    gpa: std.mem.Allocator,
+    mu: std.Io.Mutex = .init,
+    /// The reader parks on `rcv`, the workers on `wcv`, a split's caller on `done`.
+    rcv: std.Io.Condition = .init,
+    wcv: std.Io.Condition = .init,
+    done: std.Io.Condition = .init,
+    quit: bool = false,
+    queue: [8]*Prefetch = undefined,
+    q_head: usize = 0,
+    q_len: usize = 0,
+    busy: std.atomic.Value(bool) = .init(false),
+    job: ?*const Table.Job = null,
+    parts: usize = 0,
+    gen: u64 = 0,
+    left: usize = 0,
+    reader: ?std.Thread = null,
+    workers: [PAR_THREADS - 1]?std.Thread = @splat(null),
+
+    fn io() std.Io {
+        return std.Io.Threaded.global_single_threaded.io();
+    }
+
+    fn post(self: *Pool, pf: *Prefetch) bool {
+        self.mu.lockUncancelable(io());
+        defer self.mu.unlock(io());
+        if (self.quit or self.q_len == self.queue.len) return false;
+        self.queue[(self.q_head + self.q_len) % self.queue.len] = pf;
+        self.q_len += 1;
+        self.rcv.signal(io());
+        return true;
+    }
+
+    fn readerMain(self: *Pool) void {
+        while (true) {
+            self.mu.lockUncancelable(io());
+            while (!self.quit and self.q_len == 0) self.rcv.wait(io(), &self.mu) catch {};
+            if (self.q_len == 0) {
+                self.mu.unlock(io());
+                return;
+            }
+            const pf = self.queue[self.q_head];
+            self.q_head = (self.q_head + 1) % self.queue.len;
+            self.q_len -= 1;
+            self.mu.unlock(io());
+            pf.run();
+        }
+    }
+
+    fn workerMain(self: *Pool, k: usize) void {
+        var seen: u64 = 0;
+        while (true) {
+            self.mu.lockUncancelable(io());
+            while (!self.quit and self.gen == seen) self.wcv.wait(io(), &self.mu) catch {};
+            if (self.quit) {
+                self.mu.unlock(io());
+                return;
+            }
+            seen = self.gen;
+            const job = self.job;
+            const parts = self.parts;
+            self.mu.unlock(io());
+            if (k >= parts) continue;
+            _ = job.?.run(k, parts);
+            self.mu.lockUncancelable(io());
+            self.left -= 1;
+            if (self.left == 0) self.done.signal(io());
+            self.mu.unlock(io());
+        }
+    }
+
+    /// Runs `job` in `parts` parts, part 0 on the caller; false when the workers are busy (the caller spawns instead).
+    fn split(self: *Pool, job: *const Table.Job, parts: usize) bool {
+        if (self.busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return false;
+        defer self.busy.store(false, .release);
+        self.mu.lockUncancelable(io());
+        self.job = job;
+        self.parts = parts;
+        self.left = parts - 1;
+        self.gen += 1;
+        self.wcv.broadcast(io());
+        self.mu.unlock(io());
+        _ = job.run(0, parts);
+        self.mu.lockUncancelable(io());
+        while (self.left > 0) self.done.wait(io(), &self.mu) catch {};
+        self.job = null;
+        self.mu.unlock(io());
+        return true;
+    }
+
+    fn stopAll(self: *Pool) void {
+        self.mu.lockUncancelable(io());
+        self.quit = true;
+        self.rcv.broadcast(io());
+        self.wcv.broadcast(io());
+        self.mu.unlock(io());
+        if (self.reader) |t| t.join();
+        for (self.workers) |w| if (w) |t| t.join();
+    }
+};
+
+pub var read_pool: ?*Pool = null;
+
+/// Starts `read_pool` (once). A thread that fails to start stops the pool and leaves reads to spawn as before.
+pub fn startPool(gpa: std.mem.Allocator) !void {
+    if (read_pool != null) return;
+    const self = try gpa.create(Pool);
+    errdefer gpa.destroy(self);
+    self.* = .{ .gpa = gpa };
+    errdefer self.stopAll();
+    const opts: std.Thread.SpawnConfig = .{ .stack_size = 256 * 1024 };
+    self.reader = try std.Thread.spawn(opts, Pool.readerMain, .{self});
+    for (&self.workers, 1..) |*w, k| w.* = try std.Thread.spawn(opts, Pool.workerMain, .{ self, k });
+    read_pool = self;
+}
+
+pub fn stopPool() void {
+    const self = read_pool orelse return;
+    read_pool = null;
+    self.stopAll();
+    self.gpa.destroy(self);
+}
 
 const PAR_ROWS_PER_THREAD = 16;
 const PAR_THREADS = 16;
@@ -902,6 +1061,49 @@ test "dsv41 engram: an id past the table is refused by a plain read and by one s
     }
     ids[100] = 7;
     try testing.expectError(error.EngramRead, t.read(testing.allocator, &ids));
+}
+
+test "sushi_ds41 engram pool: the read pool gives the bytes of spawned reads, refuses a bad id, and its prefetches match a read" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeFp8Fixture(io, td.dir, true);
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 1, 4, 64);
+    defer t.close();
+    var ids: [384]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast((i * 7 + i / 5) % 4);
+    var want: [4]Table.Raw = undefined;
+    const sizes = [_]usize{ 1, 31, 144, 384 };
+    for (sizes, &want) |n, *w| w.* = try t.read(testing.allocator, ids[0..n]);
+    defer for (want) |w| w.deinit(testing.allocator);
+    try startPool(testing.allocator);
+    defer stopPool();
+    for (0..3) |_| for (sizes, want) |n, w| {
+        const got = try t.read(testing.allocator, ids[0..n]);
+        defer got.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, w.w, got.w);
+        try testing.expectEqualSlices(u8, w.s, got.s);
+    };
+    var bad = ids;
+    bad[200] = 7;
+    try testing.expectError(error.EngramRead, t.read(testing.allocator, &bad));
+    // Two tables' worth of 6 tokens x 24 ids, as a verify posts them; one taken, one left for `finish`.
+    const tables = [_]*const Table{ &t, &t };
+    for (0..4) |round| {
+        var pf = try Prefetch.startNarrow(testing.allocator, &tables, &.{.{ .at = round, .len = 6, .ids = ids[0 .. 6 * 2 * 24] }}, 24, 6);
+        defer pf.finish();
+        try testing.expect(pf.pooled);
+        if (round % 2 == 1) continue;
+        var mine: [6 * 24]u32 = undefined;
+        for (0..6) |tok| @memcpy(mine[tok * 24 ..][0..24], ids[(tok * 2) * 24 ..][0..24]);
+        const ref = try t.read(testing.allocator, &mine);
+        defer ref.deinit(testing.allocator);
+        const raw = try pf.take(round, 0, 0);
+        defer raw.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, ref.w, raw.w);
+        try testing.expectEqualSlices(u8, ref.s, raw.s);
+    }
 }
 
 test "dsv41 engram: a row cache serves repeats from RAM with the bytes a pread gives, through evictions" {

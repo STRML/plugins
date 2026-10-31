@@ -207,6 +207,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     dsv.setReadDiag(std.c.getenv("SUSHI_DSV41_READ_DIAG") != null);
     dsv.setDecodeDiag(std.c.getenv("SUSHI_DS41_DECODE_DIAG") != null);
     if (std.c.getenv("SUSHI_DS41_DECODE_DIAG") != null) log.info("[sushi_ds41] decode diag on\n", .{});
+    dsv.setDecodeLevers(m.mdl, std.c.getenv("SUSHI_DS41_ENGRAM_FIRST") != null, std.c.getenv("SUSHI_DS41_ENGRAM_POOL") != null, std.c.getenv("SUSHI_DS41_EMBED_HOST") != null);
     const idx_nax = index_nax.fits(c.index_heads, c.index_head_dim, .bfloat16);
     log.info("[sushi_ds41] prefill index scores: {s}\n", .{if (idx_nax) "matmul2d (the M5's matrix units)" else "indexScoresTile (simdgroup matrices)"});
     // As sushi's server does: a synced per-stage `[dsv41-prof]` line per wide chunk, and with the verify profile per
@@ -289,6 +290,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     if (m.snap) |sn| freeSnap(sn);
     if (m.tower) |*t| t.deinit();
     m.mdl.deinit();
+    dsv.stopDecodeLevers();
     m.engine.deinit();
     gpa.destroy(m.engine);
     gpa.destroy(m.experts);
@@ -445,6 +447,8 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
 test {
     _ = config;
     _ = index_nax;
+    // The Engram read pool's test (named `sushi_ds41 ...` so the claims filter keeps it; the file's other tests need MLX).
+    _ = @import("src/sushi/dsv41/dsv41_engram.zig");
 }
 
 // ── prefix cache ──

@@ -19,9 +19,36 @@ pub const Ssd = struct {
     group: c_int,
     /// What the three tensors hold in the shard (the bytes a resident load would bill).
     stored: u64,
+    /// TEMPORARY A/B (`SUSHI_DS41_EMBED_HOST`): the three tensors copied whole into host memory at load, so a forward's
+    /// rows are a `memcpy` of the shard's bytes instead of a `pread` (the same bytes, the same graph).
+    host: ?[3][]align(4) u8 = null,
+    host_gpa: ?std.mem.Allocator = null,
 
     pub fn close(self: *Ssd) void {
         _ = std.c.close(self.fd);
+        if (self.host) |h| for (h) |b| self.host_gpa.?.free(b);
+        self.host = null;
+    }
+
+    /// Reads the three tensors into host memory (`stored` bytes); rows come from there from then on.
+    pub fn loadHost(self: *Ssd, gpa: std.mem.Allocator) !void {
+        if (self.host != null) return;
+        var bufs: [3][]align(4) u8 = undefined;
+        var made: usize = 0;
+        errdefer for (bufs[0..made]) |b| gpa.free(b);
+        for (0..3) |p| {
+            const total: usize = @intCast(self.rows * self.len[p]);
+            bufs[p] = try gpa.alignedAlloc(u8, .@"4", total);
+            made += 1;
+            const chunk: usize = 64 << 20;
+            var at: usize = 0;
+            while (at < total) : (at += chunk) {
+                const n = @min(chunk, total - at);
+                try expert_io.readExact(self.fd, bufs[p][at..][0..n], self.off[p] + at);
+            }
+        }
+        self.host = bufs;
+        self.host_gpa = gpa;
     }
 
     /// The triple in the checkpoint at `dir_path`, for a model of width `dim`.
@@ -162,6 +189,19 @@ pub const Ssd = struct {
         fn run(self: *const Job, first: usize, stride: usize) bool {
             const t = self.t;
             const n = if (self.only) |o| o.len else self.ids.len;
+            if (t.host) |h| {
+                var j = first;
+                while (j < n) : (j += stride) {
+                    const i = if (self.only) |o| o[j] else j;
+                    const r: u64 = self.ids[i];
+                    if (r >= t.rows) return self.fail();
+                    for (0..3) |p| {
+                        const l = t.len[p];
+                        @memcpy(self.raw.part(p)[i * l ..][0..l], h[p][r * l ..][0..l]);
+                    }
+                }
+                return true;
+            }
             if (comptime builtin.os.tag.isDarwin()) {
                 var j = first;
                 while (j < n) : (j += stride) {
