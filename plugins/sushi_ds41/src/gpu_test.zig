@@ -14,6 +14,7 @@ const ci = sc_mod.ci;
 
 test {
     _ = @import("vision_key.zig");
+    _ = @import("ablation_test.zig");
 }
 
 fn randn(sc: *Scope, shape: []const c_int, seed: u64, dt: mlx.mlx_dtype) !A {
