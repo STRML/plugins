@@ -75,6 +75,23 @@ pub const Lin = struct {
     }
 };
 
+/// `SUSHI_DS41_TRUNK_STANDIN` (measurement only, wrong output): 1 = every trellis trunk projection of a prefill-width
+/// call (>= 256 rows) returns zeros instead of running, 2 = the shared expert too. Bounds what moving them off the GPU
+/// could save.
+var trunk_standin_level: ?u8 = null;
+fn trunkStandin() u8 {
+    if (trunk_standin_level) |v| return v;
+    const v: u8 = if (std.c.getenv("SUSHI_DS41_TRUNK_STANDIN")) |e| std.fmt.parseInt(u8, std.mem.span(e), 10) catch 0 else 0;
+    trunk_standin_level = v;
+    return v;
+}
+const STANDIN_MIN_ROWS = 256;
+
+fn standinZeros(sc: *Scope, shape: []const c_int, dt: mlx.mlx_dtype) !A {
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_zeros(&o, shape.ptr, shape.len, dt, sc.s), &o);
+}
+
 /// A trunk weight as a trellis bank: `p.trellis` `[G, in/16, out/16, n]`, G > 1 only for the grouped `wo_a`.
 pub const Stq = struct {
     p: exl3.Proj,
@@ -89,6 +106,12 @@ pub const Stq = struct {
         const sh = mlx.getShape(x);
         const in = sh[sh.len - 1];
         const rows: c_int = @intCast(@divExact(mlx.mlx_array_size(x), @as(usize, @intCast(in))));
+        if (trunkStandin() >= 1 and rows >= STANDIN_MIN_ROWS) {
+            var zs: [8]c_int = undefined;
+            @memcpy(zs[0..sh.len], sh);
+            zs[sh.len - 1] = @intCast(self.outDim());
+            return standinZeros(sc, zs[0..sh.len], mlx.mlx_array_dtype(x));
+        }
         const y = try sc.keep(try exl3.linear.linear(sc.s, try sc.reshape(x, &.{ rows, in }), self.p, self.dec));
         var shape: [8]c_int = undefined;
         @memcpy(shape[0..sh.len], sh);
@@ -98,6 +121,8 @@ pub const Stq = struct {
 
     /// `x` `[G, rows, in]`, bank g serving `x[g]`.
     pub fn applyGrouped(self: Stq, sc: *Scope, x: A) !A {
+        if (trunkStandin() >= 1 and dim(x, 1) >= STANDIN_MIN_ROWS)
+            return standinZeros(sc, &.{ ci(dim(x, 0)), ci(dim(x, 1)), ci(self.outDim()) }, mlx.mlx_array_dtype(x));
         return sc.astype(try sc.keep(try exl3.linear.linearGrouped(sc.s, x, self.p, self.dec)), mlx.mlx_array_dtype(x));
     }
 };
@@ -2262,6 +2287,7 @@ fn sharedFused(sc: *Scope, m: *const Model, ly: *const Layer, h: A) !?A {
 }
 
 fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A) !A {
+    if (trunkStandin() >= 2 and dim(h, 0) >= STANDIN_MIN_ROWS) return standinZeros(sc, &.{ ci(dim(h, 0)), ci(dim(h, 1)) }, m.act);
     if (try sharedFused(sc, m, ly, h)) |y| return y;
     const g = try ly.shared[0].apply(sc, h);
     const u = try ly.shared[1].apply(sc, h);
