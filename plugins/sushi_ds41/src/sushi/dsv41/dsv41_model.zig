@@ -633,11 +633,15 @@ pub const StreamTap = struct {
         return .{ .gpa = gpa, .keep = keep, .sites = sites };
     }
 
-    fn record(self: *StreamTap, sc: *Scope, site: usize, x: A) !void {
+    pub fn record(self: *StreamTap, sc: *Scope, site: usize, x: A) !void {
         if (!self.on) return;
         const L = dim(x, 0);
         const last = try sc.slice(x, 0, L - @min(L, self.keep), L);
-        try self.sites[site].append(self.gpa, sc.out(try sc.keep(try sc.mean(try sc.astype(last, .float32), 1, false))));
+        const mean = sc.out(try sc.mean(try sc.astype(last, .float32), 1, false));
+        self.sites[site].append(self.gpa, mean) catch |e| {
+            _ = mlx.mlx_array_free(mean);
+            return e;
+        };
     }
 
     pub fn clear(self: *StreamTap) void {

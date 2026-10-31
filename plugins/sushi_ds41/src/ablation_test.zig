@@ -100,3 +100,27 @@ test "sushi_ds41 gpu: the Engram ablation leaves the gate's keys and clears the 
     const after = maxAbs(try along(&sc, try sc.slice(out, -1, HC * D, (HC + 1) * D), r));
     try testing.expect(before > 0.1 and after < before / 10);
 }
+
+test "sushi_ds41 gpu: the stream tap keeps the hc mean of each pass's last rows and frees them on clear" {
+    try skipNoGpu();
+    var sc = Scope.init(testing.allocator, mlx.mlx_default_gpu_stream_new());
+    defer sc.deinit();
+    var tap = try dsv.StreamTap.init(testing.allocator, 2, 4);
+    defer tap.deinit();
+    const x = try randn(&sc, &.{ 6, HC, D }, 41);
+    tap.on = true;
+    try tap.record(&sc, 0, x);
+    try tap.record(&sc, 2, try sc.slice(x, 0, 5, 6));
+    tap.on = false;
+    try tap.record(&sc, 1, x);
+    try testing.expectEqual(@as(usize, 1), tap.sites[0].items.len);
+    try testing.expectEqual(@as(usize, 0), tap.sites[1].items.len);
+    const got = try testing.allocator.dupe(f32, try sc_mod.hostF32(tap.sites[0].items[0]));
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 4 * D), got.len);
+    const want = try sc_mod.hostF32(try sc.mean(try sc.slice(x, 0, 2, 6), 1, false));
+    for (got, want) |g, w| try testing.expectApproxEqAbs(w, g, 1e-5);
+    try testing.expectEqual(@as(usize, 1 * D), mlx.mlx_array_size(tap.sites[2].items[0]));
+    tap.clear();
+    try testing.expectEqual(@as(usize, 0), tap.sites[0].items.len);
+}
