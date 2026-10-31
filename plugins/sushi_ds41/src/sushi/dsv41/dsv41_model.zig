@@ -61,12 +61,16 @@ pub const Lin = struct {
     s: A = none,
     /// A trellis bank (`trunk_quant`); `w` and `s` are then unused.
     stq: ?Stq = null,
+    /// The trunk op this linear is, for `SUSHI_DS41_ANE_EMU` (measurement only).
+    op: AneOp = .none,
 
     pub fn outDim(self: *const Lin) usize {
         return if (self.stq) |q| q.outDim() else dim(self.w, 0);
     }
 
     pub fn apply(self: *const Lin, sc: *Scope, x: A) !A {
+        if (self.op != .none and self.op != .shared and aneWants(self.op, @divExact(mlx.mlx_array_size(x), dim(x, -1))))
+            return aneLinear(sc, self, x, mlx.mlx_array_dtype(x));
         if (self.stq) |q| return q.apply(sc, x);
         if (self.s.ctx == null) return sc.matmul(x, try sc.t2(self.w));
         if (exact_matmul) return sc.matmul(x, try sc.t2(try dequant(sc, self.w, self.s, 8, "mxfp8", mlx.mlx_array_dtype(x))));
@@ -101,6 +105,185 @@ pub const Stq = struct {
         return sc.astype(try sc.keep(try exl3.linear.linearGrouped(sc.s, x, self.p, self.dec)), mlx.mlx_array_dtype(x));
     }
 };
+
+// ── ANE numerics emulation (measurement only) ────────────────────────────
+
+/// A trunk op `SUSHI_DS41_ANE_EMU` can select. `shared_gpu` emulates nothing: it only takes the shared expert out of
+/// the routed launches, the control for `shared` (which must leave the fold too).
+pub const AneOp = enum(u8) { none, wq_a, wkv, wq_b, wo_a, wo_b, shared, engram_wkv, idx_wq_b, idx_wk, idx_wproj, comp, shared_gpu };
+const ane_op_count = @typeInfo(AneOp).@"enum".fields.len;
+
+/// `SUSHI_DS41_ANE_EMU=<comma list of AneOp names, or attn_in (= wq_a,wkv), or all>`: on a call of at least
+/// `SUSHI_DS41_ANE_EMU_MIN_ROWS` rows (default 256, prefill only), the selected op runs as the Neural Engine would:
+/// x cast to fp16, the weight requantized to int8 with one fp16 scale per output channel (mlx-serve's `int8Rows`) and
+/// dequantized to fp16, an fp16 matmul (MLX: fp32 accumulate, fp16 out), the output cast back. The shared expert runs
+/// its clamped SwiGLU in fp16 between. `SUSHI_DS41_ANE_EMU_PRESCALE=1` divides each row of x by its absmax before the
+/// cast and multiplies the output back after, in f32. Every 256 calls an op logs how many fp16 values were non-finite.
+const AneCfg = struct { mask: u32 = 0, min_rows: usize = 256, prescale: bool = false };
+var ane_cfg: ?AneCfg = null;
+
+fn aneConfig() AneCfg {
+    if (ane_cfg) |c| return c;
+    var c: AneCfg = .{};
+    if (std.c.getenv("SUSHI_DS41_ANE_EMU")) |e| {
+        var it = std.mem.tokenizeScalar(u8, std.mem.span(e), ',');
+        while (it.next()) |name| {
+            if (std.mem.eql(u8, name, "attn_in")) {
+                c.mask |= aneBit(.wq_a) | aneBit(.wkv);
+            } else if (std.mem.eql(u8, name, "all")) {
+                c.mask |= ~(aneBit(.none) | aneBit(.shared_gpu)) & ((@as(u32, 1) << ane_op_count) - 1);
+            } else if (std.meta.stringToEnum(AneOp, name)) |op| {
+                if (op != .none) c.mask |= aneBit(op);
+            } else log.warn("[sushi_ds41] ane-emu: unknown op '{s}' ignored\n", .{name});
+        }
+    }
+    if (std.c.getenv("SUSHI_DS41_ANE_EMU_MIN_ROWS")) |e| c.min_rows = std.fmt.parseInt(usize, std.mem.span(e), 10) catch c.min_rows;
+    if (std.c.getenv("SUSHI_DS41_ANE_EMU_PRESCALE")) |e| c.prescale = std.mem.eql(u8, std.mem.span(e), "1");
+    if (c.mask != 0) {
+        var buf: [256]u8 = undefined;
+        var n: usize = 0;
+        inline for (@typeInfo(AneOp).@"enum".fields) |f| if (c.mask & aneBit(@enumFromInt(f.value)) != 0) {
+            const w = std.fmt.bufPrint(buf[n..], "{s} ", .{f.name}) catch "";
+            n += w.len;
+        };
+        log.warn("[sushi_ds41] ane-emu: ops {s}min_rows {d} prescale {}\n", .{ buf[0..n], c.min_rows, c.prescale });
+    }
+    ane_cfg = c;
+    return c;
+}
+
+fn aneBit(op: AneOp) u32 {
+    return @as(u32, 1) << @intFromEnum(op);
+}
+
+fn aneWants(op: AneOp, rows: usize) bool {
+    const c = aneConfig();
+    return c.mask & aneBit(op) != 0 and rows >= c.min_rows;
+}
+
+/// The shared expert leaves the routed launches when either `shared` or `shared_gpu` is selected at this width.
+fn aneSharedOff(rows: usize) bool {
+    return aneWants(.shared, rows) or aneWants(.shared_gpu, rows);
+}
+
+/// Each emulated linear's fp16 weight `[in, out]` (`[G, in, out]` grouped), keyed by its stored weight's handle.
+var ane_weights: std.AutoHashMapUnmanaged(usize, A) = .empty;
+
+extern "c" fn mlx_eye(res: *A, n: c_int, m: c_int, k: c_int, dtype: mlx.mlx_dtype, s: S) c_int;
+
+/// `l`'s weight as the GPU applies it, transposed to `[G, in, out]` in f32.
+fn aneDenseT(sc: *Scope, l: *const Lin) !A {
+    if (l.stq) |q| {
+        const g = dim(q.p.trellis, 0);
+        const in = dim(q.p.trellis, 1) * 16;
+        var e = mlx.mlx_array_new();
+        const eye = try sc.res(mlx_eye(&e, ci(in), ci(in), 0, .float32, sc.s), &e);
+        if (g == 1) return sc.reshape(try sc.keep(try exl3.linear.linear(sc.s, eye, q.p, q.dec)), &.{ 1, ci(in), -1 });
+        const eyes = try sc.contiguous(try sc.broadcast(eye, &.{ ci(g), ci(in), ci(in) }));
+        return sc.keep(try exl3.linear.linearGrouped(sc.s, eyes, q.p, q.dec));
+    }
+    // Dense `[out, in]` or grouped `[G, out, in]`, maybe mxfp8.
+    const w = if (l.s.ctx == null) l.w else try dequant(sc, l.w, l.s, 8, "mxfp8", .float32);
+    const w3 = if (mlx.mlx_array_ndim(w) == 3) w else try sc.reshape(w, &.{ 1, ci(dim(w, 0)), ci(dim(w, 1)) });
+    return sc.transpose(try sc.astype(w3, .float32), &.{ 0, 2, 1 });
+}
+
+/// `l`'s weight through the int8 round trip, as fp16 `[G, in, out]`; built once and kept.
+fn aneWeight(sc: *Scope, l: *const Lin) !A {
+    const wkey: usize = @intFromPtr((if (l.stq) |q| q.p.trellis else l.w).ctx);
+    if (ane_weights.get(wkey)) |w| return w;
+    var ws = Scope.init(sc.a, sc.s);
+    defer ws.deinit();
+    const wt = try aneDenseT(&ws, l);
+    // One scale per output channel (column of W^T), floored so a zero channel stays finite; codes against that fp16 scale.
+    const amax = try ws.max(try ws.op1(mlx.mlx_abs, wt), -2, true);
+    const s16 = try ws.astype(try ws.maximum(try ws.div(amax, try ws.f(127.0)), try ws.f(5.9604645e-8)), .float16);
+    const sf = try ws.astype(s16, .float32);
+    var r = mlx.mlx_array_new();
+    const q = try ws.clip(try ws.res(mlx.mlx_round(&r, try ws.mul(wt, try ws.div(try ws.f(1.0), sf)), 0, ws.s), &r), -127, 127);
+    const w16 = try ws.astype(try ws.mul(q, sf), .float16);
+    try mlx.check(mlx.mlx_array_eval(w16));
+    const kept = ws.out(w16);
+    try ane_weights.put(std.heap.c_allocator, wkey, kept);
+    return kept;
+}
+
+/// Per op: calls, then running [non-finite x16, non-finite y16, max |x|, max |y16|].
+var ane_calls: [ane_op_count]u64 = @splat(0);
+var ane_stats: [ane_op_count][4]A = @splat(@splat(none));
+
+fn aneCount(sc: *Scope, x: A) !A {
+    var o = mlx.mlx_array_new();
+    const fin = try sc.res(mlx.mlx_isfinite(&o, x, sc.s), &o);
+    var t = mlx.mlx_array_new();
+    const tot = try sc.res(mlx.mlx_sum(&t, try sc.astype(fin, .float32), false, sc.s), &t);
+    return sc.sub(try sc.f(@floatFromInt(mlx.mlx_array_size(x))), tot);
+}
+
+fn aneMaxAbs(sc: *Scope, x: A) !A {
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_max(&o, try sc.astype(try sc.op1(mlx.mlx_abs, x), .float32), false, sc.s), &o);
+}
+
+fn aneRecord(sc: *Scope, op: AneOp, x: A, x16: A, y16: A) !void {
+    const i = @intFromEnum(op);
+    const cur = [4]A{ try aneCount(sc, x16), try aneCount(sc, y16), try aneMaxAbs(sc, x), try aneMaxAbs(sc, y16) };
+    var next: [4]A = undefined;
+    for (0..4) |k| {
+        var o = mlx.mlx_array_new();
+        const old = ane_stats[i][k];
+        if (old.ctx == null) {
+            _ = mlx.mlx_array_set(&o, cur[k]);
+        } else {
+            try mlx.check(if (k < 2) mlx.mlx_add(&o, old, cur[k], sc.s) else mlx.mlx_maximum(&o, old, cur[k], sc.s));
+            _ = mlx.mlx_array_free(old);
+        }
+        next[k] = o;
+    }
+    ane_stats[i] = next;
+    const v = mlx.mlx_vector_array_new_data(&next, 4);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_async_eval(v));
+    ane_calls[i] += 1;
+    if (ane_calls[i] % 256 != 1) return;
+    var f: [4]f32 = undefined;
+    for (next, &f) |a, *d| try mlx.check(mlx.mlx_array_item_float32(d, a));
+    log.warn("[sushi_ds41] ane-emu stats {s}: calls {d} nonfinite x16 {d} y16 {d} max|x| {e} max|y16| {e}\n", .{ @tagName(op), ane_calls[i], f[0], f[1], f[2], f[3] });
+}
+
+/// `x` `[..., in]` (or `[G, rows, in]` for a grouped weight) through `l` as the ANE would compute it, in `out_dt`.
+fn aneLinear(sc: *Scope, l: *const Lin, x: A, out_dt: mlx.mlx_dtype) !A {
+    const w = try aneWeight(sc, l);
+    const g = dim(w, 0);
+    const in = dim(w, 1);
+    const sh = mlx.getShape(x);
+    const x3 = if (g > 1) x else try sc.reshape(x, &.{ 1, -1, ci(in) });
+    const xf = try sc.astype(x3, .float32);
+    const pre = aneConfig().prescale;
+    const amax = if (pre) try sc.maximum(try sc.max(try sc.op1(mlx.mlx_abs, xf), -1, true), try sc.f(1e-30)) else none;
+    const x16 = try sc.astype(if (pre) try sc.div(xf, amax) else xf, .float16);
+    const y16 = try sc.matmul(x16, w);
+    try aneRecord(sc, l.op, x3, x16, y16);
+    const y = if (pre) try sc.astype(try sc.mul(try sc.astype(y16, .float32), amax), out_dt) else try sc.astype(y16, out_dt);
+    if (g > 1) return y;
+    var shape: [8]c_int = undefined;
+    @memcpy(shape[0..sh.len], sh);
+    shape[sh.len - 1] = ci(dim(w, 2));
+    return sc.reshape(y, shape[0..sh.len]);
+}
+
+/// The shared expert as one ANE SwiGLU procedure: three emulated linears with the clamped SwiGLU in fp16 between.
+fn aneShared(sc: *Scope, m: *const Model, ly: *const Layer, h: A) !A {
+    var g = try aneLinear(sc, &ly.shared[0], h, .float16);
+    var u = try aneLinear(sc, &ly.shared[1], h, .float16);
+    const limit = m.cfg.swiglu_limit;
+    if (limit > 0) {
+        g = try sc.min(g, try sc.fl(limit, .float16));
+        u = try sc.min(try sc.maximum(u, try sc.fl(-limit, .float16)), try sc.fl(limit, .float16));
+    }
+    const act = try sc.mul(try sc.mul(g, try sc.sigmoid(g)), u);
+    return aneLinear(sc, &ly.shared[2], act, m.act);
+}
 
 /// The embedding as MLX's affine triple, gathered by row and dequantized. A pack's triple stays in its shard (`ssd`):
 /// the rows of a forward are read from it and dequantized the same way.
@@ -1124,6 +1307,21 @@ fn loadLayer(m: *Model, w: *model_mod.Weights, pfx: []const u8, id: usize, li: u
         n_in = 3;
     };
     ly.in_shared = try fuseShared(m, in_lins[0..n_in]);
+    ly.wq_a.op = .wq_a;
+    ly.wkv.op = .wkv;
+    ly.wq_b.op = .wq_b;
+    ly.wo_a.op = .wo_a;
+    ly.wo_b.op = .wo_b;
+    for (&ly.shared) |*l| l.op = .shared;
+    if (ly.comp) |*cw| {
+        cw.wkv.op = .comp;
+        if (cw.wgate) |*g| g.op = .comp;
+    }
+    if (ly.idx) |*iw| {
+        iw.wq_b.op = .idx_wq_b;
+        iw.weights_proj.op = .idx_wproj;
+        if (iw.wk) |*k| k.op = .idx_wk;
+    }
     if (ly.comp) |*cw| if (cw.wgate) |*g| {
         cw.shared = try fuseShared(m, &.{ &cw.wkv, g });
     };
@@ -1277,7 +1475,8 @@ fn initEngram(m: *Model, w: *model_mod.Weights, dir_path: []const u8) !void {
     var base: NameBuf = undefined;
     for (0..e.n) |i| {
         const l = e.layers[i];
-        const wkv = try loadLin(m, w, try key(&base, "layers.{d}.engram.wkv", .{l}), m.act);
+        var wkv = try loadLin(m, w, try key(&base, "layers.{d}.engram.wkv", .{l}), m.act);
+        wkv.op = .engram_wkv;
         const qw = try loadDense(m, w, try key(&b, "layers.{d}.engram.q_weight", .{l}), .float32);
         const kw = try loadDense(m, w, try key(&b, "layers.{d}.engram.k_weight", .{l}), .float32);
         var prod = mlx.mlx_array_new();
@@ -2026,7 +2225,9 @@ fn attnOut(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, o: A, round
 /// `attnOut` from the heads as `[og, L, in]`, rotated and rounded.
 fn attnOutGrouped(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, obg: A) !A {
     const L = dim(obg, 1);
-    const oa = if (ly.wo_a.stq) |q|
+    const oa = if (aneWants(.wo_a, L))
+        try aneLinear(sc, &ly.wo_a, obg, mlx.mlx_array_dtype(obg))
+    else if (ly.wo_a.stq) |q|
         try q.applyGrouped(sc, obg)
     else if (ly.wo_a.s.ctx == null)
         try sc.matmul(obg, try sc.transpose(ly.wo_a.w, &.{ 0, 2, 1 }))
@@ -2262,6 +2463,7 @@ fn sharedFused(sc: *Scope, m: *const Model, ly: *const Layer, h: A) !?A {
 }
 
 fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A) !A {
+    if (aneWants(.shared, dim(h, 0))) return aneShared(sc, m, ly, h);
     if (try sharedFused(sc, m, ly, h)) |y| return y;
     const g = try ly.shared[0].apply(sc, h);
     const u = try ly.shared[1].apply(sc, h);
@@ -2305,7 +2507,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
         const early = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
         if (early) try submit(r.idx);
         // A wide chunk's shared expert rides the routed launches when the trellis chain takes it there.
-        const wide = m.tap == null and m.shared_fold and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX and ly.shared[0].stq != null;
+        const wide = m.tap == null and m.shared_fold and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX and ly.shared[0].stq != null and !aneSharedOff(dim(h, 0));
         const sy: SharedOp = if (wide) .{ .layer = .{ .m = m, .li = li } } else .{ .array = try sharedExpert(sc, m, li, ly, h) };
         if (!wide) {
             if (early) try submit(sy.array);
