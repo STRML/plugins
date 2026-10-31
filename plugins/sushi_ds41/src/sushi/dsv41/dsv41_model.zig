@@ -121,7 +121,10 @@ const ane_op_count = @typeInfo(AneOp).@"enum".field_names.len;
 /// cast and multiplies the output back after, in f32. Every 256 calls an op logs how many fp16 values were non-finite.
 /// `SUSHI_DS41_ANE_EMU_KCHUNK=<k>` splits the contraction into k-wide chunks, each an fp16 matmul with fp16 output,
 /// summed in fp16 in order (lib/ane's in-graph K chunking); 0 (default) is one fp16 matmul (fp32 accumulate).
-const AneCfg = struct { mask: u32 = 0, min_rows: usize = 256, prescale: bool = false, kchunk: usize = 0 };
+/// `SUSHI_DS41_ANE_EMU_EXACT=1` is the benign control: the same ops on the same path (separate matmuls, the shared expert
+/// out of the routed launches) with the dense weight kept in f32 and an f32 matmul, so it differs from the live path only
+/// by rounding.
+const AneCfg = struct { mask: u32 = 0, min_rows: usize = 256, prescale: bool = false, kchunk: usize = 0, exact: bool = false };
 var ane_cfg: ?AneCfg = null;
 
 fn aneConfig() AneCfg {
@@ -142,6 +145,7 @@ fn aneConfig() AneCfg {
     if (std.c.getenv("SUSHI_DS41_ANE_EMU_MIN_ROWS")) |e| c.min_rows = std.fmt.parseInt(usize, std.mem.span(e), 10) catch c.min_rows;
     if (std.c.getenv("SUSHI_DS41_ANE_EMU_PRESCALE")) |e| c.prescale = std.mem.eql(u8, std.mem.span(e), "1");
     if (std.c.getenv("SUSHI_DS41_ANE_EMU_KCHUNK")) |e| c.kchunk = std.fmt.parseInt(usize, std.mem.span(e), 10) catch 0;
+    if (std.c.getenv("SUSHI_DS41_ANE_EMU_EXACT")) |e| c.exact = std.mem.eql(u8, std.mem.span(e), "1");
     if (c.mask != 0) {
         var buf: [256]u8 = undefined;
         var n: usize = 0;
@@ -150,7 +154,7 @@ fn aneConfig() AneCfg {
             if (c.mask & aneBit(op) == 0) continue;
             if (std.fmt.bufPrint(buf[n..], "{s} ", .{@tagName(op)})) |w| n += w.len else |_| {}
         }
-        log.warn("[sushi_ds41] ane-emu: ops {s}min_rows {d} prescale {s} kchunk {d}\n", .{ buf[0..n], c.min_rows, if (c.prescale) "on" else "off", c.kchunk });
+        log.warn("[sushi_ds41] ane-emu: ops {s}min_rows {d} prescale {s} kchunk {d} exact {s}\n", .{ buf[0..n], c.min_rows, if (c.prescale) "on" else "off", c.kchunk, if (c.exact) "on" else "off" });
     }
     ane_cfg = c;
     return c;
@@ -199,6 +203,12 @@ fn aneWeight(sc: *Scope, l: *const Lin) !A {
     var ws = Scope.init(sc.a, sc.s);
     defer ws.deinit();
     const wt = try aneDenseT(&ws, l);
+    if (aneConfig().exact) {
+        try mlx.check(mlx.mlx_array_eval(wt));
+        const kept32 = ws.out(wt);
+        try ane_weights.put(std.heap.c_allocator, wkey, kept32);
+        return kept32;
+    }
     // One scale per output channel (column of W^T), floored so a zero channel stays finite; codes against that fp16 scale.
     const amax = try ws.max(try ws.op1(mlx.mlx_abs, wt), -2, true);
     const s16 = try ws.astype(try ws.maximum(try ws.div(amax, try ws.f(127.0)), try ws.f(5.9604645e-8)), .float16);
@@ -265,7 +275,7 @@ fn aneLinear(sc: *Scope, l: *const Lin, x: A, out_dt: mlx.mlx_dtype) !A {
     const xf = try sc.astype(x3, .float32);
     const pre = aneConfig().prescale;
     const amax = if (pre) try sc.maximum(try sc.max(try sc.op1(mlx.mlx_abs, xf), -1, true), try sc.f(1e-30)) else none;
-    const x16 = try sc.astype(if (pre) try sc.div(xf, amax) else xf, .float16);
+    const x16 = try sc.astype(if (pre) try sc.div(xf, amax) else xf, aneDt());
     const y16 = try aneMatmul(sc, x16, w);
     try aneRecord(sc, l.op, x3, x16, y16);
     const y = if (pre) try sc.astype(try sc.mul(try sc.astype(y16, .float32), amax), out_dt) else try sc.astype(y16, out_dt);
@@ -274,6 +284,34 @@ fn aneLinear(sc: *Scope, l: *const Lin, x: A, out_dt: mlx.mlx_dtype) !A {
     @memcpy(shape[0..sh.len], sh);
     shape[sh.len - 1] = ci(dim(w, 2));
     return sc.reshape(y, shape[0..sh.len]);
+}
+
+/// The emulated ops' dtype: fp16 (the ANE), or f32 for the benign control.
+fn aneDt() mlx.mlx_dtype {
+    return if (aneConfig().exact) .float32 else .float16;
+}
+
+extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern "c" fn fwrite(ptr: *const anyopaque, size: usize, n: usize, f: *anyopaque) usize;
+extern "c" fn fflush(f: *anyopaque) c_int;
+var route_dump: ?*anyopaque = null;
+var route_dump_tried = false;
+
+/// `SUSHI_DS41_ROUTE_DUMP=<file>` (measurement only): every routed-expert pick of a call of >= 256 rows is appended to
+/// the file as `[layer u32, rows u32, k u32]` then `rows * k` i32 expert ids, in forward order, so two arms' picks can
+/// be compared row by row. One host read a layer (prefill already waits there).
+fn routeDump(sc: *Scope, li: usize, idx: A) !void {
+    if (!route_dump_tried) {
+        route_dump_tried = true;
+        if (std.c.getenv("SUSHI_DS41_ROUTE_DUMP")) |e| route_dump = fopen(e, "ab");
+    }
+    const f = route_dump orelse return;
+    if (dim(idx, 0) < 256) return;
+    const v = try sc_mod.hostI32(try sc.astype(idx, .int32));
+    const hdr = [3]u32{ @intCast(li), @intCast(dim(idx, 0)), @intCast(dim(idx, 1)) };
+    _ = fwrite(&hdr, 4, 3, f);
+    _ = fwrite(v.ptr, 4, v.len, f);
+    _ = fflush(f);
 }
 
 /// `x16` `[G, rows, in]` @ `w` `[G, in, out]` in fp16, K-chunked when `SUSHI_DS41_ANE_EMU_KCHUNK` asks.
@@ -293,12 +331,13 @@ fn aneMatmul(sc: *Scope, x16: A, w: A) !A {
 
 /// The shared expert as one ANE SwiGLU procedure: three emulated linears with the clamped SwiGLU in fp16 between.
 fn aneShared(sc: *Scope, m: *const Model, ly: *const Layer, h: A) !A {
-    var g = try aneLinear(sc, &ly.shared[0], h, .float16);
-    var u = try aneLinear(sc, &ly.shared[1], h, .float16);
+    const dt = aneDt();
+    var g = try aneLinear(sc, &ly.shared[0], h, dt);
+    var u = try aneLinear(sc, &ly.shared[1], h, dt);
     const limit = m.cfg.swiglu_limit;
     if (limit > 0) {
-        g = try sc.min(g, try sc.fl(limit, .float16));
-        u = try sc.min(try sc.maximum(u, try sc.fl(-limit, .float16)), try sc.fl(limit, .float16));
+        g = try sc.min(g, try sc.fl(limit, dt));
+        u = try sc.min(try sc.maximum(u, try sc.fl(-limit, dt)), try sc.fl(limit, dt));
     }
     const act = try sc.mul(try sc.mul(g, try sc.sigmoid(g)), u);
     return aneLinear(sc, &ly.shared[2], act, m.act);
@@ -2496,6 +2535,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const r = try router(sc, m, li, h, img);
+    if (li < c.layers) try routeDump(sc, li, r.idx);
     const pf = prof(m, dim(h, 0));
     if (pf) |p| try p.mark(.router, &.{ r.idx, r.wts });
     if (c.expert_dec) |dec| {
