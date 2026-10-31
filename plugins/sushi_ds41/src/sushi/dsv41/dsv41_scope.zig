@@ -231,21 +231,66 @@ pub const Scope = struct {
     }
 };
 
-/// Evaluates `xs` together.
-pub fn evalAll(xs: []const A) !void {
+/// Diagnostic (`SUSHI_DS41_GAP_LOG`): the host's evaluations by site, each split into its encode (`mlx_async_eval`,
+/// which returns once the work is committed to the GPU) and the wait for the GPU after it. Counted only while `on`.
+pub const Gap = struct {
+    pub const Site = enum { moe, layer, other };
+    const sites = std.enums.values(Site).len;
+    pub var on = false;
+    pub var n: [sites]u64 = @splat(0);
+    pub var enc_ns: [sites]u64 = @splat(0);
+    pub var wait_ns: [sites]u64 = @splat(0);
+
+    pub fn now() u64 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        return @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+    }
+
+    pub fn reset() void {
+        n = @splat(0);
+        enc_ns = @splat(0);
+        wait_ns = @splat(0);
+    }
+};
+
+/// Evaluates `xs` together, timed as `site` while the gap diagnostic is on.
+pub fn evalSite(site: Gap.Site, xs: []const A) !void {
     const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
     defer _ = mlx.mlx_vector_array_free(vec);
+    if (!Gap.on) return mlx.check(mlx.mlx_eval(vec));
+    const t0 = Gap.now();
+    try mlx.check(mlx.mlx_async_eval(vec));
+    const t1 = Gap.now();
     try mlx.check(mlx.mlx_eval(vec));
+    const t2 = Gap.now();
+    const i = @backingInt(site);
+    Gap.n[i] += 1;
+    Gap.enc_ns[i] += t1 - t0;
+    Gap.wait_ns[i] += t2 - t1;
+}
+
+/// Queues `xs` on the GPU without waiting, its encode timed as `site` while the gap diagnostic is on.
+pub fn submitSite(site: Gap.Site, xs: []const A) !void {
+    const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    const t0 = if (Gap.on) Gap.now() else 0;
+    try mlx.check(mlx.mlx_async_eval(vec));
+    if (Gap.on) Gap.enc_ns[@backingInt(site)] += Gap.now() - t0;
+}
+
+/// Evaluates `xs` together.
+pub fn evalAll(xs: []const A) !void {
+    return evalSite(.other, xs);
 }
 
 pub fn hostF32(a: A) ![]const f32 {
-    try mlx.check(mlx.mlx_array_eval(a));
+    try evalSite(.other, &.{a});
     const p = mlx.mlx_array_data_float32(a) orelse return error.HostRead;
     return p[0..mlx.mlx_array_size(a)];
 }
 
 pub fn hostI32(a: A) ![]const i32 {
-    try mlx.check(mlx.mlx_array_eval(a));
+    try evalSite(.other, &.{a});
     const p = mlx.mlx_array_data_int32(a) orelse return error.HostRead;
     return p[0..mlx.mlx_array_size(a)];
 }

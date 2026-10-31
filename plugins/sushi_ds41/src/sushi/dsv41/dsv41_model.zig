@@ -202,6 +202,9 @@ pub const Experts = union(enum) {
         prefetch: ?*const fn (ctx: *anyopaque, layer: usize, cand: []const u16, rows: usize, n: usize, m: usize) void = null,
         /// Decode widths: the routed chain queued before the host knows the picks, checked one layer late.
         spec: ?Spec = null,
+        /// Whether layer `layer` maps its picks to slots on the GPU (every expert resident): its route reads nothing on
+        /// the host and no later layer refills what it reads.
+        gpu_route: ?*const fn (ctx: *anyopaque, layer: usize) bool = null,
     };
 
     pub const Spec = struct {
@@ -713,6 +716,11 @@ pub const Model = struct {
     pack_kv: bool = true,
     /// Tests: each layer completes on the GPU before the next is built, the decode schedule's reference.
     sync_layers: bool = false,
+    /// `SUSHI_DS41_GAP_LOG`: one line per wide chunk with its wall time and the host's evaluations by site.
+    gap_log: bool = false,
+    /// `SUSHI_DS41_LAG_SYNC`: a wide layer whose route runs on the GPU is submitted, and the host then waits for the
+    /// layer before it, so the GPU holds one layer of work while the host builds the next (`lagLayer`).
+    lag_sync: bool = false,
     /// False: a decode-width pass submits its logits and returns them unevaluated, so the caller's first read of
     /// them (an argmax, the engine's sampling) is the pass's one wait. A DSpark round turns it off around its verify.
     head_wait: bool = true,
@@ -2317,7 +2325,8 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
             try p.mark(.routed, &.{out});
             if (hk.host_ns) |f| p.hostShare(f(hk.ctx) - host0);
         }
-        try if (early) submit(out) else mlx.check(mlx.mlx_array_eval(out));
+        const lag = m.lag_sync and !early and if (hk.gpu_route) |f| f(hk.ctx, li) else false;
+        try if (early or lag) submit(out) else sc_mod.evalSite(.moe, &.{out});
         return out;
     }
     if (fusedOn(sc, m) and dim(h, 0) > 1 and c.dim % 8 == 0) return moeWide(sc, m, li, h, r, try sharedExpert(sc, m, li, ly, h));
@@ -2781,9 +2790,12 @@ pub const Pass = struct {
     engram_rows: [cfg_mod.max_engram]A = @splat(none),
     /// Layers this pass rebuilt after a pick missed the map: past `Model.route_spec_rebuilds` it waits for every layer's picks.
     rollbacks: u32 = 0,
+    /// `Model.lag_sync`: the last submitted layer's stream, which the next layer's end waits for.
+    lag: A = none,
 
     pub fn deinit(self: *Pass, gpa: std.mem.Allocator) void {
         if (self.unresolved) |*u| u.deinit();
+        if (self.lag.ctx != null) _ = mlx.mlx_array_free(self.lag);
         for (self.engram_rows) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
@@ -3204,10 +3216,67 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     try appendVerifyArrays(gpa, &ev, p.st, li);
     if (m.trace) |t| try t.put("stream_{d}", .{li}, p.x);
     if (prof(m, L)) |pf| return pf.mark(.expand, ev.items);
-    if (wait) return evalAll(ev.items);
+    if (wait and m.lag_sync and lagReady(m, li)) return lagLayer(p, ev.items);
+    if (wait) return sc_mod.evalSite(.layer, ev.items);
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_async_eval(vec));
+}
+
+/// `Model.lag_sync` applies to layer `li`: its routed chain reads nothing the host fills.
+fn lagReady(m: *const Model, li: usize) bool {
+    const hk = switch (m.experts) {
+        .hook => |h| h,
+        .resident => return false,
+    };
+    const f = hk.gpu_route orelse return false;
+    return li >= m.cfg.layers or f(hk.ctx, li);
+}
+
+/// `Model.lag_sync`: the layer's arrays `xs` are submitted, then the host waits for the layer before it, so the GPU
+/// runs this layer while the host builds the next one. The graph is the same as a wait per layer; only when the host
+/// blocks moves, and at most two layers' work is in flight.
+fn lagLayer(p: *Pass, xs: []const A) !void {
+    try sc_mod.submitSite(.layer, xs);
+    if (p.lag.ctx != null) {
+        try sc_mod.evalSite(.layer, &.{p.lag});
+        _ = mlx.mlx_array_free(p.lag);
+        p.lag = none;
+    }
+    var h = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(h);
+    try mlx.check(mlx.mlx_array_set(&h, p.x));
+    p.lag = h;
+}
+
+/// `Model.gap_log`: the start of a wide chunk's timing; 0 while off.
+fn gapBegin(m: *const Model, L: usize) u64 {
+    if (!m.gap_log or L <= exl3.kernels.DECODE_ROWS_MAX) return 0;
+    sc_mod.Gap.on = true;
+    sc_mod.Gap.reset();
+    return sc_mod.Gap.now();
+}
+
+/// `Model.gap_log`: the chunk's wall time, the host's evaluations by site (encode, then the wait for the GPU), the
+/// Engram wait, and the host's time outside all of them (graph building and host work while nothing is evaluated).
+fn gapReport(m: *const Model, t0: u64, kind: []const u8, L: usize, p0: usize, engram_ns: u64) void {
+    if (t0 == 0) return;
+    const G = sc_mod.Gap;
+    G.on = false;
+    const wall = G.now() - t0;
+    var inside: u64 = 0;
+    for (G.enc_ns, G.wait_ns) |e, w| inside += e + w;
+    const ms = struct {
+        fn f(ns: u64) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1e6;
+        }
+    }.f;
+    log.info("[sushi_ds41] gap {s} rows={d} p0={d} lag={} wall_ms={d:.2} host_ms={d:.2} engram_ms={d:.2} moe n={d} enc_ms={d:.2} wait_ms={d:.2} layer n={d} enc_ms={d:.2} wait_ms={d:.2} other n={d} enc_ms={d:.2} wait_ms={d:.2}\n", .{
+        kind,             L,                  p0,              m.lag_sync,
+        ms(wall),         ms(wall -| inside), ms(engram_ns),   G.n[0],
+        ms(G.enc_ns[0]),  ms(G.wait_ns[0]),   G.n[1],          ms(G.enc_ns[1]),
+        ms(G.wait_ns[1]), G.n[2],             ms(G.enc_ns[2]), ms(G.wait_ns[2]),
+    });
 }
 
 /// The pass's logits (f32; `[1, vocab]` for the last position or `[L, vocab]` for every one; the caller frees);
@@ -3298,6 +3367,9 @@ pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision:
     errdefer m.dropEmbedAhead();
     const st = try ensureState(m);
     transient_peak.begin();
+    const g0 = gapBegin(m, ids.len);
+    const e0 = m.engram_wait_ns;
+    const p0 = st.n;
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
     pass.ahead = ahead;
@@ -3306,6 +3378,7 @@ pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision:
     try prefetchEngram(m, &pass);
     for (0..m.cfg.layers) |li| try passLayer(m, &pass, li);
     const logits = try finishPass(m, &pass, want);
+    gapReport(m, g0, "pass", ids.len, p0, m.engram_wait_ns -| e0);
     transient_peak.end(if (st.verify != null) .dspark_verify else if (ids.len > NARROW_ROWS) .prefill_chunk else .decode, ids.len);
     return logits;
 }
@@ -3432,6 +3505,8 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
     const st = try ensureState(m);
     if (st.verify != null or ids.len <= m.cfg.window) return error.Dsv41NoCedSplit;
     transient_peak.begin();
+    const g0 = gapBegin(m, ids.len);
+    const e0 = m.engram_wait_ns;
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
     pass.ahead = ahead;
@@ -3446,6 +3521,7 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
     defer ev.deinit(m.gpa);
     try appendStateArrays(m.gpa, &ev, &st.layers[split]);
     try evalAll(ev.items);
+    gapReport(m, g0, "state", ids.len, pass.p0, m.engram_wait_ns -| e0);
     reportEngramWait(m, ids.len);
     st.n = pass.p0 + ids.len;
     m.state_only_used += 1;

@@ -202,6 +202,9 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     m.mdl = try dsv.init(gpa, m.cfg, &m.weights, dir, s, .{ .experts = false, .dspark = priv.dspark });
     errdefer m.mdl.deinit();
     dsv.setAttnNax(m.mdl, kernels.attn_nax_bar);
+    m.mdl.gap_log = std.c.getenv("SUSHI_DS41_GAP_LOG") != null;
+    m.mdl.lag_sync = std.c.getenv("SUSHI_DS41_LAG_SYNC") != null;
+    if (m.mdl.lag_sync) log.info("[sushi_ds41] lag sync: a wide layer routed on the GPU is submitted; the host waits one layer behind\n", .{});
     const idx_nax = index_nax.fits(c.index_heads, c.index_head_dim, .bfloat16);
     log.info("[sushi_ds41] prefill index scores: {s}\n", .{if (idx_nax) "matmul2d (the M5's matrix units)" else "indexScoresTile (simdgroup matrices)"});
     // As sushi's server does: a synced per-stage `[dsv41-prof]` line per wide chunk, and with the verify profile per
