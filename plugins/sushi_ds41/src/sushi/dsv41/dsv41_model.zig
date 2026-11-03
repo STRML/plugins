@@ -775,6 +775,9 @@ pub const Model = struct {
     ane: ?*AneState = null,
     /// Diagnostic (`SUSHI_DS41_SKIP_SHARED`): wide chunks drop the shared expert (wrong output; the GPU ceiling of the ANE arm).
     skip_shared: bool = false,
+    /// A narrow index scan of at least this many rows over a long key list runs the matmul2d scorer (`decodeIndexNax`;
+    /// `SUSHI_DS41_DECODE_INDEX_NAX=<rows>`, 0 keeps every narrow scan on the packed kernel).
+    decode_index_nax_rows: usize = 2,
     /// TEMPORARY A/B: a decode-width pass reads its Engram rows ahead (`prefetchEngram`).
     decode_engram_ahead: bool = true,
     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
@@ -1798,7 +1801,12 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
         idx = try kernels.candidateKeys(sc, try topkRows(sc, m, scores, kk), cand.*, bs);
     } else {
         const packed_scan = rows.pack != null and narrowIndex(sc, m, Ls, nb);
-        var scores = if (packed_scan) // [Ls, nb]
+        // A verify block of 2+ rows over a long key list: unpack once and score on the matrix units, where every row
+        // shares each key tile, instead of the packed kernel that reads and decodes every key once a row.
+        const nax_scan = packed_scan and decodeIndexNax(m, Ls, nb, ih, ihd, rows.dtype);
+        var scores = if (nax_scan) // [Ls, nb]
+            try index_nax.indexScoresNax(sc, q, try rows.rows(sc, nb), wts, wscale, p0, r, 0)
+        else if (packed_scan)
             try kernels.indexScoresPacked(sc, q, try sc.slice(rows.buf, 0, 0, nb), try sc.slice(rows.sbuf, 0, 0, nb), wts, wscale, p0, r, rows.pack.?.mode, rows.pack.?.group)
         else
             try indexScores(sc, m, q, try rows.rows(sc, nb), wts, wscale, p0, r);
@@ -1830,6 +1838,19 @@ fn streamsIndex(sc: *const Scope, m: *const Model, Ls: usize, nb: usize) bool {
     const c = &m.cfg;
     return fusedOn(sc, m) and m.trace == null and !narrowIndex(sc, m, Ls, nb) and nb > m.index_stream_tile and kernels.indexTileFits(c.index_heads, c.index_head_dim, nb);
 }
+
+/// Whether a narrow (packed) index scan of `Ls` rows over `nb` keys unpacks and runs the matmul2d scorer instead
+/// (`decode_index_nax_rows`, `SUSHI_DS41_DECODE_INDEX_NAX`). M5 Max microbench (src/index_decode_bench.zig), one scan:
+/// 2 rows 0.17 -> 0.12 ms at 32k keys, 0.62 -> 0.39 at 256k, 2.29 -> 1.35 at 1M; 6 rows 0.43 -> 0.17, 1.74 -> 0.56,
+/// 6.74 -> 1.98. One row loses (0.34 -> 0.38 ms at 256k), so it stays on the packed kernel. Same scores to 2.9e-7
+/// relative, the same top-512 on random keys.
+fn decodeIndexNax(m: *const Model, Ls: usize, nb: usize, ih: usize, ihd: usize, dt: mlx.mlx_dtype) bool {
+    const min_rows = m.decode_index_nax_rows;
+    return min_rows > 0 and Ls >= min_rows and nb >= decode_index_nax_keys and index_nax.fits(ih, ihd, dt);
+}
+
+/// The fewest keys a decode scan takes the matrix scorer for: below it the unpack's fixed cost is not worth paying.
+const decode_index_nax_keys: usize = 32768;
 
 /// Whether `indexScores` runs the scalar kernel (a few rows), which reads packed keys as they are.
 fn narrowIndex(sc: *const Scope, m: *const Model, Ls: usize, nb: usize) bool {
@@ -2546,6 +2567,10 @@ pub fn setAneShared(m: *Model) void {
         m.skip_shared = true;
         log.warn("[sushi_ds41] SUSHI_DS41_SKIP_SHARED: wide chunks skip the shared expert (diagnostic, wrong output)\n", .{});
     }
+    if (std.c.getenv("SUSHI_DS41_DECODE_INDEX_NAX")) |v| {
+        if (std.fmt.parseInt(usize, std.mem.span(v), 10)) |n| m.decode_index_nax_rows = n else |_| {}
+    }
+    log.info("[sushi_ds41] decode index scan: matmul2d from {d} rows (0 = off)\n", .{m.decode_index_nax_rows});
     const raw = std.c.getenv("SUSHI_DS41_ANE_SHARED") orelse return;
     const units = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 1;
     const st = initAneShared(m, units) catch |e| {

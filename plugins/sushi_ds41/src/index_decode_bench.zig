@@ -41,8 +41,8 @@ test "sushi_ds41 gpu: index decode-width cost by depth (scratch bench)" {
     const alloc = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const wscale: f32 = 1.0 / @sqrt(@as(f32, IHD)) / @sqrt(@as(f32, IH));
-    const depths = [_]usize{ 65536, 131072, 262144, 524288, 1048576 };
-    const widths = [_]usize{ 1, 4, 6, 16 };
+    const depths = [_]usize{ 32768, 65536, 131072, 262144, 1048576 };
+    const widths = [_]usize{ 1, 2, 3, 4, 6 };
     for (depths) |D| {
         var sc = Scope.init(alloc, mlx.gpuStream());
         defer sc.deinit();
@@ -79,6 +79,33 @@ test "sushi_ds41 gpu: index decode-width cost by depth (scratch bench)" {
                 sc_r1[si] = try kernels.indexScoresPacked(&rs0, qs[si], try rs0.slice(rows[si].buf, 0, 0, D), try rs0.slice(rows[si].sbuf, 0, 0, D), ws[si], wscale, D - S, 1, .fp4_ue8m0, 32);
                 try mlx.check(mlx.mlx_array_eval(sc_r2[si]));
                 try mlx.check(mlx.mlx_array_eval(sc_r1[si]));
+            }
+            {
+                // The matrix scorer against the packed kernel on set 0: the same f32 sums in another order, so a small
+                // relative error, the same -inf columns, and a top-512 that keeps nearly the same keys.
+                const alt = try inax.indexScoresNax(&rs0, qs[0], try rows[0].rows(&rs0, D), ws[0], wscale, D - S, 1, 0);
+                const want = try sc_mod.hostF32(sc_r1[0]);
+                const got = try sc_mod.hostF32(alt);
+                var worst: f64 = 0;
+                var peak: f64 = 1e-30;
+                var inf_mismatch: usize = 0;
+                for (got, want) |g, w| {
+                    if (std.math.isInf(w) != std.math.isInf(g)) inf_mismatch += 1;
+                    if (std.math.isInf(w)) continue;
+                    worst = @max(worst, @abs(@as(f64, g) - @as(f64, w)));
+                    peak = @max(peak, @abs(@as(f64, w)));
+                }
+                const ka = try sc_mod.hostI32(try kernels.topkIndices(&rs0, sc_r1[0], K));
+                const kb = try sc_mod.hostI32(try kernels.topkIndices(&rs0, alt, K));
+                var seen = std.AutoHashMap(i32, void).init(alloc);
+                defer seen.deinit();
+                var same: usize = 0;
+                for (0..S) |l| {
+                    seen.clearRetainingCapacity();
+                    for (ka[l * K ..][0..K]) |x| try seen.put(x, {});
+                    for (kb[l * K ..][0..K]) |x| same += @intFromBool(seen.contains(x));
+                }
+                std.debug.print("idx-decode D={d} S={d} CHECK nax vs packed: max err {e} of peak {e} (rel {e}), inf mismatches {d}, top-{d} overlap {d:.5}\n", .{ D, S, worst, peak, worst / peak, inf_mismatch, K, @as(f64, @floatFromInt(same)) / @as(f64, @floatFromInt(S * K)) });
             }
             var best: [n_stages]f64 = @splat(std.math.inf(f64));
             var sum: [n_stages]f64 = @splat(0);
