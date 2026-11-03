@@ -84,7 +84,7 @@ const Model = struct {
     prev_cache_limit: ?usize = null,
     /// The MLX buffer-pool cap in force (`borrow.poolCap` of the last pass's rows): `pool_bytes` at decode widths.
     pool_now: u64 = pool_bytes,
-    /// `SUSHI_DS41_EARLY_ENGRAM=1`: the begin-prompt call starts reading the first chunk's embedding and Engram rows.
+    /// `SUSHI_DS41_EARLY_ENGRAM=1`: the begin-prompt call starts reading the first chunk's Engram rows.
     early_engram: bool = false,
     /// The begin-prompt call reset the state for a prompt at 0 and read ahead; the forward at 0 keeps it (`forward`).
     fresh: bool = false,

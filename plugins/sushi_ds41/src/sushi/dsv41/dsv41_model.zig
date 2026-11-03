@@ -3837,13 +3837,12 @@ fn startEngramAhead(m: *Model, st: *const State, ids: []const u32) !void {
     m.engram_ahead = try engram.Prefetch.start(gpa, tables[0..m.engrams.len], &.{.{ .at = st.hist.items.len, .len = comp.len, .ids = rows }}, hs.cols(), comp.len);
 }
 
-/// A prompt's first chunk, `ids`, known before its forward (the host's begin-prompt call): its embedding and Engram rows
-/// start reading now, so the forward finds them read instead of waiting on the SSD at layer 1. The same rows either
-/// way; a forward over other ids reads its own. A failure leaves the forward to read its own.
+/// A prompt's first chunk, `ids`, known before its forward (the host's begin-prompt call): its Engram rows start
+/// reading now, so the forward finds them read instead of waiting on the SSD at layer 1 (the embedding is resident on
+/// the GPU). The same rows either way; a forward over other ids reads its own. A failure leaves the forward to read its own.
 pub fn readAheadPrompt(m: *Model, ids: []const u32) void {
     if (ids.len == 0) return;
     const st = ensureState(m) catch return;
-    aheadEmbed(m, ids);
     startEngramAhead(m, st, ids) catch {};
 }
 
