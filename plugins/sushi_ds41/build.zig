@@ -38,6 +38,11 @@ pub fn build(b: *std.Build) void {
     const tiny = b.option([]const u8, "dsv41-tiny", "Directory of sushi's tiny DeepSeek-V4.1 checkpoint (the gpu-test pipeline test)");
     const mlx_lib = b.option([]const u8, "mlx-lib", "Directory holding the libmlxc.dylib the Metal test links") orelse return;
     const gpu = b.createModule(.{ .root_source_file = b.path("src/gpu_test.zig"), .target = root.resolved_target, .optimize = root.optimize, .link_libc = true });
+    gpu.addCSourceFile(.{ .file = b.path("src/ane/ane_bridge.m"), .flags = objc });
+    gpu.addCSourceFile(.{ .file = b.path("src/ane/ane_mlp.m"), .flags = objc });
+    gpu.addIncludePath(b.path("src/ane"));
+    gpu.linkFramework("Foundation", .{});
+    gpu.linkFramework("IOSurface", .{});
     gpu.addLibraryPath(.{ .cwd_relative = mlx_lib });
     gpu.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
     gpu.addRPath(.{ .cwd_relative = mlx_lib });

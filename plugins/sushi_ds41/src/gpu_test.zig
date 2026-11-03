@@ -3,7 +3,9 @@
 //! It also runs `vision_key.zig`'s test, which needs MLX but no M5. The attention kernel's own Metal tests are the
 //! slice's (`dsv41_model.zig`).
 const std = @import("std");
-const mlx = @import("sushi/mlx.zig");
+pub const mlx = @import("sushi/mlx.zig");
+pub const log = @import("sushi/log.zig");
+pub const io_util = @import("sushi/io_util.zig");
 const sc_mod = @import("sushi/dsv41/dsv41_scope.zig");
 const kernels = @import("sushi/dsv41/dsv41_kernels.zig");
 const inax = @import("index_nax.zig");
@@ -16,6 +18,7 @@ test {
     _ = @import("vision_key.zig");
     _ = @import("prefill_pipe_test.zig");
     _ = @import("ablation_test.zig");
+    _ = @import("index_decode_bench.zig");
 }
 
 fn randn(sc: *Scope, shape: []const c_int, seed: u64, dt: mlx.mlx_dtype) !A {
