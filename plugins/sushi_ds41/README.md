@@ -18,7 +18,8 @@ The slice is sushi ec2f5a29 (main, past v1.4.1; NOTICE). The numbers below were 
 and later ones. Against the cc1981df slice, ec2f5a29 measured prefill +1.5-2.4% (8k-64k) and decode +1.2-4.6% on an
 M5 Ultra, output byte-identical (https://github.com/CommunityServe/plugins/pull/28). This repo's edits to the slice are `patches/index-nax.patch`,
 `patches/prefill-pipeline.patch`, `patches/shared-expert-ane.patch`, `patches/stream-ablation.patch` and
-`patches/tensor-parallel.patch`, applied in that order by `scripts/sync-sushi.sh`.
+`patches/tensor-parallel.patch` and `patches/tp-index-split.patch` (tensor parallel ranks split a prefill span's
+index keys), applied in that order by `scripts/sync-sushi.sh`.
 
 Measured on M4 Max 128 GB, Sushi-STQ-1.75bpw, greedy:
 
