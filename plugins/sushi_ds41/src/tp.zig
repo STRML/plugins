@@ -1,6 +1,8 @@
 //! Tensor parallel across Macs (`SUSHI_DS41_TP=jaccl|ring`, off by default). Each rank serves a pack repacked to its
 //! half of every expert and attention head (`bench/studio-cluster/stq-tp-split.py` in local-llm), and the two partial
-//! sums of a layer (attention out, MoE out) are summed over MLX's distributed group before they join the stream. The
+//! sums of a layer (attention out, MoE out) are summed over MLX's distributed group before they join the stream. A
+//! prefill span's indexer splits its keys instead: each rank scores its share against whole weights and the ranks
+//! gather their top-k (`dsv41_model.splitsIndex`). The
 //! peers come from MLX's own environment: `MLX_RANK` plus `MLX_IBV_DEVICES` and `MLX_JACCL_COORDINATOR` for jaccl, or
 //! `MLX_HOSTFILE` for ring. Every rank must see the same requests in the same order.
 const std = @import("std");
@@ -17,12 +19,14 @@ extern "c" fn mlx_distributed_init(res: *Group, strict: bool, bk: ?[*:0]const u8
 extern "c" fn mlx_distributed_group_rank(group: Group) c_int;
 extern "c" fn mlx_distributed_group_size(group: Group) c_int;
 extern "c" fn mlx_distributed_all_sum(res: *A, x: A, group: Group, s: mlx.mlx_stream) c_int;
+extern "c" fn mlx_distributed_all_gather(res: *A, x: A, group: Group, s: mlx.mlx_stream) c_int;
 
 var group: Group = .{};
 var cpu: mlx.mlx_stream = .{};
 pub var rank: u32 = 0;
 pub var size: u32 = 1;
 pub var sums: u64 = 0;
+pub var gathers: u64 = 0;
 /// Set when a call failed after the other ranks were told to run it: the ranks' states may differ, so nothing more is
 /// served until both restart.
 pub var lost: bool = false;
@@ -75,6 +79,15 @@ pub fn sum(sc: *sc_mod.Scope, x: A) !A {
     sums += 1;
     var o = mlx.mlx_array_new();
     return sc.res(mlx_distributed_all_sum(&o, x, group, cpu), &o);
+}
+
+/// Every rank's `x` stacked on axis 0 in rank order: lazy, on the CPU stream, owned by `sc`. `x` itself when tensor
+/// parallel is off.
+pub fn gather(sc: *sc_mod.Scope, x: A) !A {
+    if (!on()) return x;
+    gathers += 1;
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx_distributed_all_gather(&o, x, group, cpu), &o);
 }
 
 /// Rank 0's `words` on every rank, in place: the others contribute zeros, and an integer sum with zeros is exact.

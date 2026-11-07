@@ -1675,8 +1675,9 @@ pub fn indexScores(sc: *Scope, m: *const Model, q: A, keys: A, w: A, wscale: f32
     return sc.where(try sc.lt(try sc.reshape(try sc.arange(0, nb), &.{ 1, ci(nb) }), lens), scores, try sc.f(-std.math.inf(f32)));
 }
 
-/// What `indexStream` returns: the top-k key ids per query (ascending) and the candidate-block mask, or none.
-pub const Streamed = struct { idx: A, cand: A };
+/// What `indexStream` returns: the top-k key ids per query (ascending), their scores, and the candidate-block mask, or
+/// none.
+pub const Streamed = struct { idx: A, vals: A, cand: A };
 
 /// A running top-k of `[L, k]` ids and values, folded over tiles of scores whose columns arrive in id order.
 const Running = struct {
@@ -1707,18 +1708,20 @@ const Running = struct {
     }
 };
 
-/// The `k` best keys per query of `nb` index keys, scored `tile` keys at a time by the matrix kernel and folded into a
-/// running top-k, so no `[Ls, nb]` scores exist: the picks are the whole row's, bit for bit. `mask` (a candidate-block
-/// mask or none) keeps only its blocks of `bs` keys. With `kb` > 0 it also returns this layer's candidate mask, the
-/// same fold over the block maxima (`lens` pins each query's newest block as `candidateMask` does).
-pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize, tile: usize, mask: A, bs: usize, kb: usize, lens: A) !Streamed {
-    std.debug.assert(tile % kernels.indexKeyTile(rows.dtype) == 0 and (bs == 0 or tile % bs == 0));
+/// The `k` best keys per query of index keys `[lo, nb)`, scored `tile` keys at a time by the matrix kernel and folded
+/// into a running top-k, so no `[Ls, nb]` scores exist: the picks are the whole row's, bit for bit. `mask` (a
+/// candidate-block mask or none) keeps only its blocks of `bs` keys. With `kb` > 0 it also returns this layer's
+/// candidate mask, the same fold over the block maxima (`lens` pins each query's newest block as `candidateMask` does);
+/// the mask and `kb` need `lo` 0.
+pub fn indexStream(sc: *Scope, rows: *const Rows, lo: usize, nb: usize, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize, tile: usize, mask: A, bs: usize, kb: usize, lens: A) !Streamed {
+    std.debug.assert(tile % kernels.indexKeyTile(rows.dtype) == 0 and lo % kernels.indexKeyTile(rows.dtype) == 0 and (bs == 0 or tile % bs == 0));
+    std.debug.assert(lo == 0 or (mask.ctx == null and kb == 0));
     const n_blocks = if (bs > 0) (nb + bs - 1) / bs else 0;
     var picks = Running{};
     defer picks.free();
     var blocks = Running{};
     defer blocks.free();
-    var t0: usize = 0;
+    var t0: usize = lo;
     while (t0 < nb) : (t0 += tile) {
         const t1 = @min(nb, t0 + tile);
         var ts = Scope.init(sc.a, sc.s);
@@ -1751,11 +1754,13 @@ pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale:
     }
     const idx = try sc.keep(picks.ids);
     picks.ids = none;
-    if (kb == 0) return .{ .idx = idx, .cand = none };
+    const vals = try sc.keep(picks.vals);
+    picks.vals = none;
+    if (kb == 0) return .{ .idx = idx, .vals = vals, .cand = none };
     const reach = try sc.op2(mlx.mlx_greater, blocks.vals, try sc.f(-std.math.inf(f32)));
     var o = mlx.mlx_array_new();
     const cand = try sc.res(mlx.mlx_put_along_axis(&o, try sc.zeros(&.{ ci(dim(lens, 0)), ci(n_blocks) }, .bool_), blocks.ids, reach, -1, sc.s), &o);
-    return .{ .idx = idx, .cand = cand };
+    return .{ .idx = idx, .vals = vals, .cand = cand };
 }
 
 /// The top-`index_topk` compressed groups each of a span's queries keeps (`[Ls, k]` int32, -1 = none),
@@ -1784,10 +1789,14 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
     const masked = cs >= 0 and li > @as(usize, @intCast(cs)) and cand.ctx != null;
     const bs = if (cs >= 0) c.cand_block_size else 0;
     var idx: A = undefined;
-    if (streamsIndex(sc, m, Ls, nb)) {
+    if (splitsIndex(sc, m, Ls, nb, kk, !is_source and !masked)) {
+        const share = keyShare(nb, tp.rank, tp.size);
+        const mine = try shareTopk(sc, m, rows, share[0], share[1], q, wts, wscale, p0, r, kk);
+        idx = try mergeShares(sc, m, try tp.gather(sc, mine), tp.size, kk);
+    } else if (streamsIndex(sc, m, Ls, nb)) {
         _ = index_streams.fetchAdd(1, .monotonic);
         const kb = if (is_source and (nb + bs - 1) / bs > c.cand_blocks) c.cand_blocks else 0;
-        const got = try indexStream(sc, rows, nb, q, wts, wscale, p0, r, kk, m.index_stream_tile, if (masked) cand.* else none, bs, kb, lens);
+        const got = try indexStream(sc, rows, 0, nb, q, wts, wscale, p0, r, kk, m.index_stream_tile, if (masked) cand.* else none, bs, kb, lens);
         if (is_source) {
             if (cand.ctx != null) _ = mlx.mlx_array_free(cand.*);
             cand.* = if (kb > 0) sc.out(got.cand) else none;
@@ -1834,6 +1843,60 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
     const picked = try sc.where(try sc.lt(idx, lens), idx, try sc.i(-1));
     if (m.trace) |t| try t.put("index_idx_{d}", .{li}, picked);
     return picked;
+}
+
+/// Whether the tensor-parallel ranks split this span's index keys (`keyShare`) instead of each scoring all of them: a
+/// prefill-width span of an indexer that neither makes nor reads candidate blocks (`whole_row`), every rank's share
+/// holding at least `k` keys. Only what every rank sees alike decides, so either all ranks gather or none does.
+fn splitsIndex(sc: *const Scope, m: *const Model, Ls: usize, nb: usize, k: usize, whole_row: bool) bool {
+    const c = &m.cfg;
+    if (!tp.on() or !whole_row or m.trace != null or !fusedOn(sc, m) or Ls <= NARROW_ROWS) return false;
+    if (nb >= 1 << 24 or !kernels.indexTileFits(c.index_heads, c.index_head_dim, nb)) return false;
+    for (0..tp.size) |i| {
+        const share = keyShare(nb, i, tp.size);
+        if (share[1] - share[0] < k) return false;
+    }
+    return true;
+}
+
+/// Rank `rank`'s contiguous share `[lo, hi)` of `nb` index keys, cut on the 64-key grid every index kernel tiles on;
+/// a lower rank holds lower ids.
+pub fn keyShare(nb: usize, rank: usize, size: usize) [2]usize {
+    return .{ keyCut(nb, rank, size), keyCut(nb, rank + 1, size) };
+}
+
+fn keyCut(nb: usize, i: usize, size: usize) usize {
+    if (i >= size) return nb;
+    return nb * i / size / 64 * 64;
+}
+
+/// The `k` best keys of the share `[lo, hi)` as `[Ls, 2k]` f32: their scores, then their ids (exact in f32 below
+/// 2^24), so one gather carries both.
+pub fn shareTopk(sc: *Scope, m: *const Model, rows: *const Rows, lo: usize, hi: usize, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize) !A {
+    var ids: A = undefined;
+    var vals: A = undefined;
+    if (hi - lo > m.index_stream_tile) {
+        const got = try indexStream(sc, rows, lo, hi, q, w, wscale, p0, r, k, m.index_stream_tile, none, 0, 0, none);
+        ids = got.idx;
+        vals = got.vals;
+    } else {
+        const scores = try indexScoresWide(sc, q, try rows.rowsIn(sc, lo, hi), w, wscale, p0, r, lo);
+        const local = try topkRows(sc, m, scores, k);
+        vals = try sc.takeAlong(scores, local, -1);
+        ids = try sc.add(local, try sc.i(ci(lo)));
+    }
+    return sc.concat(&.{ vals, try sc.astype(ids, .float32) }, -1);
+}
+
+/// The whole row's top-`k` (`[Ls, k]` int32, ascending) from every rank's `shareTopk` stacked `[size * Ls, 2k]` in rank
+/// order. A lower rank holds lower ids and each share's picks ascend, so the merged row lists ids in order and a tie
+/// goes to the lower id, as on the whole row (`Running.folded`'s argument).
+pub fn mergeShares(sc: *Scope, m: *const Model, stacked: A, size: usize, k: usize) !A {
+    const Ls = dim(stacked, 0) / size;
+    const per_row = try sc.transpose(try sc.reshape(stacked, &.{ ci(size), ci(Ls), ci(2 * k) }), &.{ 1, 0, 2 });
+    const vals = try sc.reshape(try sc.slice(per_row, -1, 0, k), &.{ ci(Ls), ci(size * k) });
+    const ids = try sc.reshape(try sc.slice(per_row, -1, k, 2 * k), &.{ ci(Ls), ci(size * k) });
+    return sc.astype(try sc.takeAlong(ids, try topkRows(sc, m, vals, k), -1), .int32);
 }
 
 /// Whether a span's index top-k streams over key tiles: the matrix kernel scores it (so a tile scores the bits of
@@ -6219,7 +6282,7 @@ test "dsv41 index stream: the streamed top-k is the whole scores' top-k, order a
         const keys = try rows.rows(&sc, c.nb);
         const scores = try kernels.indexScoresTile(&sc, try sc.astype(q, .bfloat16), keys, w, wscale, p0, c.r, 0);
 
-        const got = try indexStream(&sc, &rows, c.nb, q, w, wscale, p0, c.r, k, c.tile, none, 8, if (c.masked) 2048 else 0, lens);
+        const got = try indexStream(&sc, &rows, 0, c.nb, q, w, wscale, p0, c.r, k, c.tile, none, 8, if (c.masked) 2048 else 0, lens);
         try expectSameInts(try kernels.topkIndices(&sc, scores, k), got.idx);
         if (!c.masked) continue;
 
@@ -6230,8 +6293,45 @@ test "dsv41 index stream: the streamed top-k is the whole scores' top-k, order a
         var o = mlx.mlx_array_new();
         const rep = try sc.res(mlx.mlx_repeat_axis(&o, want_mask, 8, -1, sc.s), &o);
         const held = try sc.where(try sc.slice(rep, -1, 0, c.nb), scores, try sc.f(-std.math.inf(f32)));
-        const masked = try indexStream(&sc, &rows, c.nb, q, w, wscale, p0, c.r, k, c.tile, want_mask, 8, 0, lens);
+        const masked = try indexStream(&sc, &rows, 0, c.nb, q, w, wscale, p0, c.r, k, c.tile, want_mask, 8, 0, lens);
         try expectSameInts(try kernels.topkIndices(&sc, held, k), masked.idx);
+    }
+}
+
+test "dsv41 index split: every rank's share of the keys, gathered and merged, picks the whole scores' top-k, order and ties included (release shapes)" {
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, gpu);
+    defer sc.deinit();
+    var fake: Model = undefined;
+    fake.fused = true;
+    fake.trace = null;
+    const IH = 32;
+    const IHD = 128;
+    const cases = [_]StreamCase{
+        .{ .L = 256, .nb = 50000, .r = 2, .tile = 8192, .distinct = 700 },
+        .{ .L = 128, .nb = 40000, .r = 1, .tile = 32768, .distinct = 997 },
+        .{ .L = 40, .nb = 3000, .r = 1, .tile = 64, .distinct = 37 },
+    };
+    for (cases, 0..) |c, ci_| {
+        fake.index_stream_tile = c.tile;
+        var rows = try streamKeys(&sc, c.nb, c.distinct, 0x7d0 + ci_);
+        defer rows.deinit();
+        const p0 = c.nb * c.r - c.L;
+        const q = try sc.astype(try sc_mod_randn(&sc, &.{ ci(c.L), IH, IHD }, 0x8d0 + ci_), .float32);
+        const w = try sc.astype(try sc_mod_randn(&sc, &.{ ci(c.L), IH }, 0x9d0 + ci_), .bfloat16);
+        const wscale: f32 = 1.0 / @sqrt(@as(f32, IHD)) / @sqrt(@as(f32, IH));
+        const k = 512;
+        const whole = try indexScoresWide(&sc, q, try rows.rows(&sc, c.nb), w, wscale, p0, c.r, 0);
+        const want = try kernels.topkIndices(&sc, whole, k);
+        for ([_]usize{ 2, 3 }) |size| {
+            var shares: [3]A = undefined;
+            for (shares[0..size], 0..) |*o, rank| {
+                const share = keyShare(c.nb, rank, size);
+                o.* = try shareTopk(&sc, &fake, &rows, share[0], share[1], q, w, wscale, p0, c.r, k);
+            }
+            try expectSameInts(want, try mergeShares(&sc, &fake, try sc.concat(shares[0..size], 0), size, k));
+        }
     }
 }
 
