@@ -1,5 +1,5 @@
 diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
-index e91603d..6516ee0 100644
+index e91603d..53d7a70 100644
 --- a/src/sushi/dsv41/dsv41_model.zig
 +++ b/src/sushi/dsv41/dsv41_model.zig
 @@ -1675,8 +1675,9 @@ pub fn indexScores(sc: *Scope, m: *const Model, q: A, keys: A, w: A, wscale: f32
@@ -65,7 +65,7 @@ index e91603d..6516ee0 100644
 -    if (streamsIndex(sc, m, Ls, nb)) {
 +    if (splitsIndex(sc, m, Ls, nb, kk, !is_source and !masked)) {
 +        const share = keyShare(nb, tp.rank, tp.size);
-+        const mine = try shareTopk(sc, m, rows, share[0], share[1], q, wts, wscale, p0, r, kk);
++        const mine = try shareTopk(sc, m, rows, share[0], share[1], sharesStream(m, nb, tp.size), q, wts, wscale, p0, r, kk);
 +        idx = try mergeShares(sc, m, try tp.gather(sc, mine), tp.size, kk);
 +    } else if (streamsIndex(sc, m, Ls, nb)) {
          _ = index_streams.fetchAdd(1, .monotonic);
@@ -75,7 +75,7 @@ index e91603d..6516ee0 100644
          if (is_source) {
              if (cand.ctx != null) _ = mlx.mlx_array_free(cand.*);
              cand.* = if (kb > 0) sc.out(got.cand) else none;
-@@ -1836,6 +1845,60 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0:
+@@ -1836,6 +1845,71 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0:
      return picked;
  }
  
@@ -104,12 +104,23 @@ index e91603d..6516ee0 100644
 +    return nb * i / size / 64 * 64;
 +}
 +
++/// Whether the shares stream over key tiles: decided by the widest share, so every rank takes the same path and evaluates
++/// at the same points.
++fn sharesStream(m: *const Model, nb: usize, size: usize) bool {
++    var widest: usize = 0;
++    for (0..size) |i| {
++        const share = keyShare(nb, i, size);
++        widest = @max(widest, share[1] - share[0]);
++    }
++    return widest > m.index_stream_tile;
++}
++
 +/// The `k` best keys of the share `[lo, hi)` as `[Ls, 2k]` f32: their scores, then their ids (exact in f32 below
-+/// 2^24), so one gather carries both.
-+pub fn shareTopk(sc: *Scope, m: *const Model, rows: *const Rows, lo: usize, hi: usize, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize) !A {
++/// 2^24), so one gather carries both. `stream`: `sharesStream`.
++pub fn shareTopk(sc: *Scope, m: *const Model, rows: *const Rows, lo: usize, hi: usize, stream: bool, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize) !A {
 +    var ids: A = undefined;
 +    var vals: A = undefined;
-+    if (hi - lo > m.index_stream_tile) {
++    if (stream) {
 +        const got = try indexStream(sc, rows, lo, hi, q, w, wscale, p0, r, k, m.index_stream_tile, none, 0, 0, none);
 +        ids = got.idx;
 +        vals = got.vals;
@@ -136,7 +147,7 @@ index e91603d..6516ee0 100644
  /// Whether a span's index top-k streams over key tiles: the matrix kernel scores it (so a tile scores the bits of
  /// the whole list's columns), the keys outnumber one tile, and no trace wants the whole scores.
  fn streamsIndex(sc: *const Scope, m: *const Model, Ls: usize, nb: usize) bool {
-@@ -6219,7 +6282,7 @@ test "dsv41 index stream: the streamed top-k is the whole scores' top-k, order a
+@@ -6219,7 +6293,7 @@ test "dsv41 index stream: the streamed top-k is the whole scores' top-k, order a
          const keys = try rows.rows(&sc, c.nb);
          const scores = try kernels.indexScoresTile(&sc, try sc.astype(q, .bfloat16), keys, w, wscale, p0, c.r, 0);
  
@@ -145,7 +156,7 @@ index e91603d..6516ee0 100644
          try expectSameInts(try kernels.topkIndices(&sc, scores, k), got.idx);
          if (!c.masked) continue;
  
-@@ -6230,11 +6293,48 @@ test "dsv41 index stream: the streamed top-k is the whole scores' top-k, order a
+@@ -6230,11 +6304,48 @@ test "dsv41 index stream: the streamed top-k is the whole scores' top-k, order a
          var o = mlx.mlx_array_new();
          const rep = try sc.res(mlx.mlx_repeat_axis(&o, want_mask, 8, -1, sc.s), &o);
          const held = try sc.where(try sc.slice(rep, -1, 0, c.nb), scores, try sc.f(-std.math.inf(f32)));
@@ -185,7 +196,7 @@ index e91603d..6516ee0 100644
 +            var shares: [3]A = undefined;
 +            for (shares[0..size], 0..) |*o, rank| {
 +                const share = keyShare(c.nb, rank, size);
-+                o.* = try shareTopk(&sc, &fake, &rows, share[0], share[1], q, w, wscale, p0, c.r, k);
++                o.* = try shareTopk(&sc, &fake, &rows, share[0], share[1], sharesStream(&fake, c.nb, size), q, w, wscale, p0, c.r, k);
 +            }
 +            try expectSameInts(want, try mergeShares(&sc, &fake, try sc.concat(shares[0..size], 0), size, k));
 +        }

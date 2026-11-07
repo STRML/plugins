@@ -1791,7 +1791,7 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
     var idx: A = undefined;
     if (splitsIndex(sc, m, Ls, nb, kk, !is_source and !masked)) {
         const share = keyShare(nb, tp.rank, tp.size);
-        const mine = try shareTopk(sc, m, rows, share[0], share[1], q, wts, wscale, p0, r, kk);
+        const mine = try shareTopk(sc, m, rows, share[0], share[1], sharesStream(m, nb, tp.size), q, wts, wscale, p0, r, kk);
         idx = try mergeShares(sc, m, try tp.gather(sc, mine), tp.size, kk);
     } else if (streamsIndex(sc, m, Ls, nb)) {
         _ = index_streams.fetchAdd(1, .monotonic);
@@ -1870,12 +1870,23 @@ fn keyCut(nb: usize, i: usize, size: usize) usize {
     return nb * i / size / 64 * 64;
 }
 
+/// Whether the shares stream over key tiles: decided by the widest share, so every rank takes the same path and evaluates
+/// at the same points.
+fn sharesStream(m: *const Model, nb: usize, size: usize) bool {
+    var widest: usize = 0;
+    for (0..size) |i| {
+        const share = keyShare(nb, i, size);
+        widest = @max(widest, share[1] - share[0]);
+    }
+    return widest > m.index_stream_tile;
+}
+
 /// The `k` best keys of the share `[lo, hi)` as `[Ls, 2k]` f32: their scores, then their ids (exact in f32 below
-/// 2^24), so one gather carries both.
-pub fn shareTopk(sc: *Scope, m: *const Model, rows: *const Rows, lo: usize, hi: usize, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize) !A {
+/// 2^24), so one gather carries both. `stream`: `sharesStream`.
+pub fn shareTopk(sc: *Scope, m: *const Model, rows: *const Rows, lo: usize, hi: usize, stream: bool, q: A, w: A, wscale: f32, p0: usize, r: usize, k: usize) !A {
     var ids: A = undefined;
     var vals: A = undefined;
-    if (hi - lo > m.index_stream_tile) {
+    if (stream) {
         const got = try indexStream(sc, rows, lo, hi, q, w, wscale, p0, r, k, m.index_stream_tile, none, 0, 0, none);
         ids = got.idx;
         vals = got.vals;
@@ -6328,7 +6339,7 @@ test "dsv41 index split: every rank's share of the keys, gathered and merged, pi
             var shares: [3]A = undefined;
             for (shares[0..size], 0..) |*o, rank| {
                 const share = keyShare(c.nb, rank, size);
-                o.* = try shareTopk(&sc, &fake, &rows, share[0], share[1], q, w, wscale, p0, c.r, k);
+                o.* = try shareTopk(&sc, &fake, &rows, share[0], share[1], sharesStream(&fake, c.nb, size), q, w, wscale, p0, c.r, k);
             }
             try expectSameInts(want, try mergeShares(&sc, &fake, try sc.concat(shares[0..size], 0), size, k));
         }
