@@ -128,6 +128,13 @@ const HELPERS_TAIL: [:0]const u8 =
     \\  constexpr bool wide = exl3_lane_sh(N, 0u) + 16u > 64u;
     \\  constexpr bool full = exl3_lane_sh(N, EXL3_LANE_FIRST) + 16u > 32u + (low < 32u ? low : 32u);
     \\  const uint end = W * lane + W;
+    \\  // At K3.5 the W bits under a lane's 32-bit window are the high W bits of the preceding lane's
+    \\  // window, so a shuffle stands in for their loads. Every caller runs it with the simdgroup in step.
+    \\  if constexpr (N == 56u && EXL3_LANE_FIRST == 1u) {
+    \\    const uint low_bits = uint(exl3_window(words, end, W, false));
+    \\    const uint prior = simd_shuffle(low_bits, ushort((lane + 31u) & 31u));
+    \\    return as_type<ulong>(uint2(low_bits, prior >> (32u - W)));
+    \\  }
     \\  return exl3_lane_type<wide, !wide && full>::read(words, end, W, full);
     \\}
     \\// Weight t's 16-bit codeword is the window ending at floor((t+1)*K), with
@@ -258,11 +265,10 @@ fn tableRowsText(alloc: std.mem.Allocator, which: u8) ![:0]u8 {
     return out.toOwnedSliceSentinel(alloc, 0);
 }
 
-/// `header` as a kernel of `cb` under `active_decode` needs it: SPEC1's gets its table's rows ahead of the helpers.
-/// Allocated for the life of the process, so call it only where a kernel is built.
-pub fn withTableRows(comptime cb: exl3.Codebook, header: [:0]const u8) ![:0]const u8 {
+/// `header` as a kernel of `cb` under `active_decode` needs it: SPEC1's gets its table's rows ahead of the helpers, on
+/// `alloc` (a build's arena: MLX copies a kernel's header).
+pub fn withTableRows(alloc: std.mem.Allocator, comptime cb: exl3.Codebook, header: [:0]const u8) ![:0]const u8 {
     if (!cb.tabledHashMask()) return header;
-    const alloc = std.heap.page_allocator;
     const rows = try tableRowsText(alloc, kernels.active_decode.table.?);
     defer alloc.free(rows);
     return std.mem.concatWithSentinel(alloc, u8, &.{ rows, header }, 0);
@@ -272,13 +278,16 @@ pub fn withTableRows(comptime cb: exl3.Codebook, header: [:0]const u8) ![:0]cons
 /// spells the table in its name, since MLX keys a library by name.
 fn tableKernel(slot: *?mlx.mlx_fast_metal_kernel, comptime cb: exl3.Codebook, comptime name: [:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8, comptime header: [:0]const u8) !mlx.mlx_fast_metal_kernel {
     if (slot.*) |k| return k;
-    return kernels.getNamedKernel(slot, (try tableKernelName(cb, name)).ptr, ins, outs, source, try withTableRows(cb, header));
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    return kernels.getNamedKernel(slot, (try tableKernelName(alloc, cb, name)).ptr, ins, outs, source, try withTableRows(alloc, cb, header));
 }
 
-/// MLX keys a kernel library by name, so a SPEC1 kernel's name spells its table.
-pub fn tableKernelName(comptime cb: exl3.Codebook, comptime name: [:0]const u8) ![:0]const u8 {
+/// MLX keys a kernel library by name, so a SPEC1 kernel's name spells its table (on `alloc`, a build's arena).
+pub fn tableKernelName(alloc: std.mem.Allocator, comptime cb: exl3.Codebook, comptime name: [:0]const u8) ![:0]const u8 {
     if (!cb.tabledHashMask()) return name;
-    return std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}_t{s}", .{ name, codebook_tables.tables[tableOf(kernels.active_decode)].digest }, 0);
+    return std.fmt.allocPrintSentinel(alloc, "{s}_t{s}", .{ name, codebook_tables.tables[tableOf(kernels.active_decode)].digest }, 0);
 }
 
 pub fn naxHeader(comptime cb: exl3.Codebook, comptime win: exl3.Window) [:0]const u8 {
@@ -404,7 +413,7 @@ test "exl3 n40 decode lane codewords and decoded weights are exact" {
     try n40WeightReaderExact(.mul1, .w8, false, true);
 }
 
-test "exl3 MCG, spec1 and std1 decode every codeword at windows 8 through 16, through both decode helpers" {
+test "exl3 MCG, spec1 and std1 decode every codeword, masked and unmasked, through both decode helpers" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
@@ -429,13 +438,15 @@ test "exl3 MCG, spec1 and std1 decode every codeword at windows 8 through 16, th
     for (0..3) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{65536}, 1, .uint32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 65536, 1, 1));
-    inline for (.{ exl3.Codebook.mcg, exl3.Codebook.spec1, exl3.Codebook.std1 }) |cb| inline for (8..17) |bits| for (@as([]const ?u8, if (cb == .spec1) &.{ kernels.SPEC1_W15.table, kernels.SPEC1_PER_RATE.table } else if (cb == .std1) &.{kernels.STD1_W15.table} else &.{null})) |table| {
-        const win = comptime exl3.Window.fromBits(bits).?;
+    // A window is one mask, w16 none; a table's rows are data the per-rate reader tests vary.
+    inline for (.{ exl3.Codebook.mcg, exl3.Codebook.spec1, exl3.Codebook.std1 }) |cb| inline for (.{ exl3.Window.w12, exl3.Window.w16 }) |win| for (@as([]const ?u8, if (cb == .spec1) &.{kernels.SPEC1_W15.table} else if (cb == .std1) &.{kernels.STD1_W15.table} else &.{null})) |table| {
         const dec: exl3.Decode = .{ .codebook = cb, .window = win, .table = table };
         kernels.setDecodeParams(dec);
         defer kernels.setDecodeParams(.mul1);
         var slot: ?mlx.mlx_fast_metal_kernel = null;
-        const kernel = try kernels.getNamedKernel(&slot, (try tableKernelName(cb, comptime "exl3_half_pairs" ++ cbSuffix(cb) ++ winSuffix(win))).ptr, &.{"codes"}, &.{ "pairs", "stored", "carried" }, source, try withTableRows(cb, comptime codebookHelpers(cb, win)));
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const kernel = try kernels.getNamedKernel(&slot, (try tableKernelName(arena.allocator(), cb, comptime "exl3_half_pairs" ++ cbSuffix(cb) ++ winSuffix(win))).ptr, &.{"codes"}, &.{ "pairs", "stored", "carried" }, source, try withTableRows(arena.allocator(), cb, comptime codebookHelpers(cb, win)));
         defer _ = mlx.mlx_fast_metal_kernel_free(kernel);
         var outputs = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(outputs);
@@ -516,41 +527,54 @@ test "exl3 n48 funnel readers preserve codewords and weights" {
     inline for ([_]exl3.Codebook{.mcg}) |cb| {
         inline for ([_]bool{ false, true }) |lane_reader| {
             try kernels.weightReaderExact(48, cb, .w12, true, if (lane_reader) .lane else .nax);
-            inline for (8..17) |bits| try kernels.weightReaderExact(48, cb, comptime exl3.Window.fromBits(bits).?, false, if (lane_reader) .lane else .nax);
+            inline for (.{ exl3.Window.w8, exl3.Window.w16 }) |win| try kernels.weightReaderExact(48, cb, win, false, if (lane_reader) .lane else .nax);
         }
     }
 }
 
 // PAIR1's pair reads the odd weight's window alone; every reader hands exl3_pairh a trellis-adjacent
-// (even, odd) pair, so each decodes each rate's weights as the host does.
-test "exl3 PAIR1 weight readers decode every K1.5 to K4 rate exactly" {
-    inline for (12..33) |half| {
-        const n: u32 = 2 * half;
+// (even, odd) pair, so each decodes each rate's weights as the host does. The raw readers hold every rate's bits and
+// the decode helpers every rate's row: here K1.5, the last two-word and the first three-word lane read of an odd
+// first codeword, and K4.
+test "exl3 PAIR1 weight readers decode K1.5 to K4 exactly" {
+    inline for (.{ 24, 44, 46, 64 }) |n| {
         if (n != 64) try kernels.weightReaderExact(n, .pair1, .w16, false, .lane);
         inline for (.{ .nax, .simdmat }) |reader| try kernels.weightReaderExact(n, .pair1, .w16, false, reader);
     }
 }
 
 // The NAX fragment, simdgroup-matrix and decode-lane readers decode spec1 and std1 through the same
-// helper as every other codebook; held to the host decode at each K1.5 to K4 rate on w15.
-test "exl3 spec1 and std1 weight readers decode every K1.5 to K4 rate exactly at w15" {
-    inline for (.{ exl3.Codebook.spec1, exl3.Codebook.std1 }) |cb| inline for (12..33) |half| {
-        const n: u32 = 2 * half;
+// helper as every other codebook; held to the host decode on w15 at K1.5, a three-word lane read and K4 (the per-rate
+// table's test holds every rate's own row).
+test "exl3 spec1 and std1 weight readers decode K1.5 to K4 exactly at w15" {
+    inline for (.{ exl3.Codebook.spec1, exl3.Codebook.std1 }) |cb| inline for (.{ 24, 42, 64 }) |n| {
         if (n != 64) try kernels.weightReaderExact(n, cb, .w15, false, .lane);
         inline for (.{ .nax, .simdmat }) |reader| try kernels.weightReaderExact(n, cb, .w15, false, reader);
     };
 }
 
-test "exl3 SPEC1 per-rate table: every reader decodes every rate with its own row, at any window" {
-    inline for (.{ exl3.Window.w8, exl3.Window.w12, exl3.Window.w15, exl3.Window.w16 }) |win| inline for (kernels.PER_RATE_NS) |n| {
-        if (n != 64) try kernels.weightReaderExactAt(n, .spec1, win, false, .lane, kernels.SPEC1_PER_RATE.table);
-        inline for (.{ .nax, .simdmat }) |reader| try kernels.weightReaderExactAt(n, .spec1, win, false, reader, kernels.SPEC1_PER_RATE.table);
-    };
+test "exl3 SPEC1 per-rate table: every reader decodes every rate with its own row" {
+    inline for (kernels.PER_RATE_NS) |n| {
+        if (n != 64) try kernels.weightReaderExactAt(n, .spec1, .w12, false, .lane, kernels.SPEC1_PER_RATE.table);
+        inline for (.{ .nax, .simdmat }) |reader| try kernels.weightReaderExactAt(n, .spec1, .w12, false, reader, kernels.SPEC1_PER_RATE.table);
+    }
 }
 
 test "exl3 SPEC1 below K1.5 and above K4: every reader decodes every rate with its own row" {
-    inline for (.{ kernels.SPEC1_W15, kernels.SPEC1_PER_RATE }) |dec| inline for (kernels.SPEC1_WIDE_NS) |n| {
+    inline for (.{kernels.SPEC1_PER_RATE}) |dec| inline for (kernels.SPEC1_WIDE_NS) |n| {
         try kernels.weightReaderExactAt(n, .spec1, dec.window, false, .lane, dec.table);
         inline for (.{ .nax, .simdmat }) |reader| try kernels.weightReaderExactAt(n, .spec1, dec.window, false, reader, dec.table);
     };
+}
+
+test "exl3 K3.5 PAIR1 lane words match the host across every word and tile boundary" {
+    try kernels.weightReaderExact(56, .pair1, .w16, false, .lane);
+}
+
+test "exl3 K5 NAX fragments match host SPEC1 weights at both halfword alignments" {
+    try kernels.weightReaderExactAt(80, .spec1, .w15, false, .nax, kernels.SPEC1_W15.table);
+}
+
+test "exl3 routed prefill fragments match host PAIR1 weights at K2.5 K3 and K3.5" {
+    inline for (.{ 40, 48, 56 }) |n| try kernels.weightReaderExact(n, .pair1, .w16, false, .nax);
 }

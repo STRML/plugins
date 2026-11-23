@@ -1,8 +1,8 @@
 diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
-index bd1aec4..beff764 100644
+index bddeb14..f55bd68 100644
 --- a/src/sushi/dsv41/dsv41_model.zig
 +++ b/src/sushi/dsv41/dsv41_model.zig
-@@ -592,6 +592,81 @@ pub const Tap = struct {
+@@ -724,6 +724,81 @@ pub const Tap = struct {
      expert_act: *const fn (ctx: *anyopaque, layer: usize, act: A, ids: A) anyerror!void,
  };
  
@@ -22,7 +22,7 @@ index bd1aec4..beff764 100644
 +    return sc.astype(try sc.sub(yf, try sc.mul(proj, ab.r)), mlx.mlx_array_dtype(y));
 +}
 +
-+/// `ablate` of the FFN output inside a stream the fused decode kernel already expanded (`x2 = post y + comb^T x1`): the
++/// `ablate` of the output inside a stream the fused decode kernel already expanded (`x2 = post y + comb^T x1`): the
 +/// output's component along `r` in copy k is `x2_k . r - sum_j comb[j, k] (x1_j . r)`.
 +fn ablateExpanded(sc: *Scope, m: *const Model, x1: A, x2: A, comb: A) !A {
 +    return if (m.ablation) |ab| ablateExpandedWith(sc, ab, x1, x2, comb) else x2;
@@ -84,33 +84,34 @@ index bd1aec4..beff764 100644
  /// Host wall time of a wide chunk per stage, each stage evaluated before the next is built (so graph building counts
  /// with the GPU work it queues). `routed` includes the expert fill the `[expert-stream]` line splits out.
  pub const Profile = struct {
-@@ -761,6 +836,10 @@ pub const Model = struct {
-     ced_split: ?usize = null,
+@@ -916,6 +991,10 @@ pub const Model = struct {
      /// Diagnostic (`SUSHI_DSV41_PREFILL_PROFILE`): a wide chunk evaluates after every stage and logs where its time went.
      profile: ?*Profile = null,
+     ane: ?*ane_mod.AneState = null,
 +    /// The request's directional ablation (`ablate`), set by the caller for the length of one call; null = none.
 +    ablation: ?Ablation = null,
 +    /// Calibration: the stream entering each layer, recorded for every prompt pass (`StreamTap`); null = none.
 +    stream_tap: ?*StreamTap = null,
  
-     pub fn deinit(self: *Model) void {
-         pipeDrain(self) catch {};
-@@ -2504,7 +2583,7 @@ fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A)
+     /// What a forward is for: it alone picks the arm the trellis linears launch on (`rowsOf`).
+     pub const Forward = enum {
+@@ -3090,7 +3169,7 @@ fn residentLayer(m: *const Model, li: usize) bool {
  fn foldsExpand(m: *const Model, sh: *const Shared, li: usize, x1: A) bool {
      const rows = dim(x1, 0);
-     return m.fused and mlx.streamIsGpu(m.s) and sh.spec_on and sh.img.ctx == null and m.experts == .hook and m.cfg.expert_dec != null and
+     return m.fused and mlx.streamIsGpu(m.s) and (sh.spec_on or (residentLayer(m, li) and m.layers[li].shared[0].stq != null)) and sh.img.ctx == null and m.experts == .hook and m.cfg.expert_dec != null and
 -        li < m.cfg.layers and rows <= exl3.kernels.DECODE_ROWS_MAX and m.trace == null and m.tap == null and prof(m, rows) == null and
 +        li < m.cfg.layers and rows <= exl3.kernels.DECODE_ROWS_MAX and m.trace == null and m.tap == null and m.ablation == null and prof(m, rows) == null and
          kernels.hcExpandServes(x1) and mlx.mlx_array_dtype(x1) == m.act;
  }
  
-@@ -2580,11 +2659,22 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
+@@ -3171,12 +3250,23 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
  fn engramApply(sc: *Scope, m: *const Model, e: *const EngramLayer, x: A, rows: A) !A {
      const wkv_in = try sc.astype(try sc.reshape(rows, &.{ ci(dim(x, 0)), -1 }), m.act);
      try tapInput(m, e.layer, .engram_in, wkv_in);
 -    const kv = try e.wkv.apply(sc, wkv_in);
 +    const kv = try ablateEngramValue(sc, m, try e.wkv.apply(sc, wkv_in));
-     if (fusedOn(sc, m) and dim(x, 0) <= NARROW_ROWS) return kernels.engramGate(sc, x, kv, e.qk, m.cfg.eps);
+     // One threadgroup a (row, copy) at any width: the op chain's f32 intermediates are ~670 MB each at 8192 rows.
+     if (fusedOn(sc, m)) return kernels.engramGate(sc, x, kv, e.qk, m.cfg.eps);
      return engramGateOps(sc, &m.cfg, e.qk, x, kv);
  }
  
@@ -128,26 +129,27 @@ index bd1aec4..beff764 100644
  /// `engramApply`, except on an image span's rows (`img`, none for text): the reference shuts their gate, so
  /// they pass through.
  fn engramWrite(sc: *Scope, m: *const Model, e: *const EngramLayer, x: A, rows: A, img: A) !A {
-@@ -2683,7 +2773,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0:
-         var asc = Scope.init(sc.a, sc.s);
-         defer asc.deinit();
-         const o = if (ds) |d| try dsparkAttention(&asc, m, li, h, d, p0) else try attention(&asc, m, st, li, h, p0, sh, span);
+@@ -3333,7 +3423,8 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0:
+         else
+             try attention(&asc, m, st, li, h, p0, sh, span, ride);
+         if (rode) |r| pa.mix.sp = .{ .pre = try sc.keep(asc.out(r.pre)), .post = try sc.keep(asc.out(r.post)), .comb = try sc.keep(asc.out(r.comb)) };
 -        break :blk try sc.keep(asc.out(o));
-+        break :blk try ablate(sc, m, try sc.keep(asc.out(o)));
++        const kept = try sc.keep(asc.out(o));
++        break :blk if (expanded) try ablateExpanded(sc, m, x, kept, pa.mix.sp.?.comb) else try ablate(sc, m, kept);
      };
      if (m.trace) |t| try t.put("attn_{d}", .{li}, a);
      if (width_probe) |t| try t.put("attn_{d}", .{li}, a);
-@@ -2698,7 +2788,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0:
+@@ -3348,7 +3439,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0:
      try tapInput(m, li, .ffn_in, h2);
      if (m.trace) |t| try t.put("ffn_in_{d}", .{li}, h2);
      if (width_probe) |t| try t.put("ffn_in_{d}", .{li}, h2);
 -    if (sh.img.ctx == null) if (try ffnDecode(sc, m, li, h2, x1, &mix)) |x2| return .{ .x = sc.out(x2), .pre = sc.out(mix.sp.?.pre) };
 +    if (sh.img.ctx == null) if (try ffnDecode(sc, m, li, h2, x1, &mix)) |x2| return .{ .x = sc.out(try ablateExpanded(sc, m, x1, x2, mix.sp.?.comb)), .pre = sc.out(mix.sp.?.pre) };
-     const r = try router(sc, m, li, h2, sh.img, &mix);
+     const r = try router(sc, m, li, h2, sh.img, &mix, sh.spec_on);
      const sf = try mix.splitOnce(sc, m);
      const folded = foldsExpand(m, sh, li, x1);
-@@ -2707,7 +2797,9 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0:
-         var fsc = Scope.init(sc.a, sc.s);
+@@ -3357,7 +3448,9 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0:
+         var fsc = sc.child();
          defer fsc.deinit();
          const expand: ?Expand = if (folded) .{ .x = x1, .post = sf.post, .comb = sf.comb } else null;
 -        break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh, r, &.{ sf.pre, sf.post, sf.comb }, expand)));
@@ -157,7 +159,7 @@ index bd1aec4..beff764 100644
      };
      if (sh.spec) |*u| {
          u.x1 = sc.out(x1);
-@@ -3105,8 +3197,9 @@ pub const Pass = struct {
+@@ -4365,8 +4458,9 @@ pub const Pass = struct {
  pub const VisionRows = struct { rows: A, offset: usize };
  
  /// The residual streams before layer 0 (the embedding in every hyper-connection copy) and the first pre-mix weights.
@@ -168,17 +170,17 @@ index bd1aec4..beff764 100644
      const x = sc.out(try sc.contiguous(try sc.broadcast(try sc.expand(emb, 1), &.{ ci(L), ci(c.hc_mult), ci(c.dim) })));
      errdefer _ = mlx.mlx_array_free(x);
      const first = try sc.op2(mlx.mlx_equal, try sc.arange(0, c.hc_mult), try sc.i(0));
-@@ -3333,7 +3426,8 @@ const Undo = struct {
+@@ -4604,7 +4698,8 @@ const Undo = struct {
  /// Whether layer `li` of the pass queues its routed chain from the stream's cache map.
  fn specOn(m: *const Model, p: *const Pass, li: usize) bool {
-     if (!m.route_spec or m.sync_layers or p.ids.len > exl3.kernels.DECODE_ROWS_MAX or p.rollbacks >= m.route_spec_rebuilds + li / 3) return false;
+     if (!m.route_spec or m.sync_layers or p.ids.len > cfg_mod.route_spec_rows or p.rollbacks >= m.route_spec_rebuilds + li / 3) return false;
 -    if (m.trace != null or m.profile != null or p.tail != null or p.img.ctx != null) return false;
 +    const tapping = if (m.stream_tap) |t| t.on else false;
 +    if (m.trace != null or tapping or m.profile != null or p.tail != null or p.img.ctx != null) return false;
      const hk = switch (m.experts) {
          .resident => return false,
          .hook => |hk| hk,
-@@ -3410,7 +3504,7 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
+@@ -4681,7 +4776,7 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
      if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
      if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map ({d} of those {d} picks recomputed)\n", .{ spec_kept, spec_rebuilt, spec_redo_picks, spec_rebuilt_picks });
      if (sum == null) return null;
@@ -187,15 +189,15 @@ index bd1aec4..beff764 100644
  }
  
  /// Checks the pass's unresolved layer, if any, and takes its exact output where the queued chain missed.
-@@ -3464,6 +3558,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
+@@ -4777,6 +4872,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
      const L = p.ids.len;
-     var sc = Scope.init(gpa, m.s);
+     var sc = m.scope();
      defer sc.deinit();
 +    if (m.stream_tap) |t| try t.record(&sc, li, p.x);
      if (prof(m, L)) |pf| {
          pf.restart();
          pf.decoder = if (m.ced_split) |split| li >= split else false;
-@@ -3524,6 +3619,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
+@@ -4802,6 +4898,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
      try appendStateArrays(gpa, &ev, &p.st.layers[li]);
      try appendVerifyArrays(gpa, &ev, p.st, li);
      if (m.trace) |t| try t.put("stream_{d}", .{li}, p.x);
@@ -203,7 +205,7 @@ index bd1aec4..beff764 100644
      if (prof(m, L)) |pf| return pf.mark(.expand, ev.items);
      if (piped) return pipeSubmit(m, ev.items, p.x);
      if (wait) return evalAll(ev.items);
-@@ -3962,7 +4058,7 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
+@@ -5371,7 +5468,7 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
      const hc = c.hc_mult;
      var in: [cfg_mod.max_block]i32 = undefined;
      for (in[0..B], 0..) |*v, k| v.* = @intCast(if (k == 0) t1 else c.dspark.noise_id);

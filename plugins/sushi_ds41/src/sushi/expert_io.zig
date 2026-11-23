@@ -1,6 +1,8 @@
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const fill_marks = @import("fill_marks.zig");
 const layout = @import("sushi_exl3").group_layout;
 
 pub const align_bytes: usize = std.heap.page_size_max;
@@ -33,7 +35,7 @@ pub fn applyReadHints(fd: std.c.fd_t, hints: ReadHints) void {
     if (hints.readahead_off and std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0)) != 0) failed = true;
     if (failed and !hint_failure_logged) {
         hint_failure_logged = true;
-        log.warn("[expert-io] read hints declined (fd {d})", .{fd});
+        log.warn("[expert-io] read hints declined (fd {d})\n", .{fd});
     }
 }
 
@@ -157,9 +159,23 @@ pub const FileCache = struct {
 
 pub fn openHinted(path: [:0]const u8, hints: ReadHints) !std.c.fd_t {
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return error.FillOpenFailed;
+    if (fd < 0) {
+        var buf: [2 * std.fs.max_path_bytes + 128]u8 = undefined;
+        log.err("{s}\n", .{openFailureLine(&buf, path, std.posix.errno(fd))});
+        return error.FillOpenFailed;
+    }
     applyReadHints(fd, hints);
     return fd;
+}
+
+/// The log line of a failed open: the path and errno, and the target when the path is a link to nothing (a pack copied
+/// from another Mac whose shard links point into that Mac's folders).
+pub fn openFailureLine(buf: []u8, path: [:0]const u8, e: std.posix.E) []const u8 {
+    var target: [std.fs.max_path_bytes]u8 = undefined;
+    const n = std.c.readlink(path.ptr, &target, target.len);
+    if (n > 0 and e == .NOENT)
+        return std.fmt.bufPrint(buf, "cannot open {s}: a link to {s}, which does not exist", .{ path, target[0..@intCast(n)] }) catch "cannot open a shard";
+    return std.fmt.bufPrint(buf, "cannot open {s}: {s}", .{ path, @tagName(e) }) catch "cannot open a shard";
 }
 
 /// A trellis span's tile grid: the fill lands it in `layout.tileMajor` order instead of the file's.
@@ -770,6 +786,7 @@ pub const PageSlab = struct {
 
     pub fn destroy(self: *PageSlab) void {
         const allocator = self.allocator;
+        fill_marks.remove(@intFromPtr(self.bytes.ptr));
         self.live.deinit(allocator);
         _ = slab_bytes.fetchSub(self.bytes.len, .monotonic);
         std.posix.munmap(self.bytes);
@@ -792,6 +809,7 @@ pub const PageSlab = struct {
 
     fn startFillLocked(self: *PageSlab) u64 {
         self.state = .filling;
+        fill_marks.add(@intFromPtr(self.bytes.ptr), self.bytes.len);
         self.epoch += 1;
         return self.epoch;
     }
@@ -806,6 +824,12 @@ pub const PageSlab = struct {
             .ready, .readers_complete => return error.SlabPublished,
             .leased => return error.SlabLeased,
         }
+    }
+
+    /// The fill goes on but the slab as a whole is no longer marked: the caller marks the ranges still being written, so a
+    /// pass may bind the rest.
+    pub fn dropMark(self: *PageSlab) void {
+        fill_marks.remove(@intFromPtr(self.bytes.ptr));
     }
 
     pub fn beginFillTimeout(self: *PageSlab, nanoseconds: u64) !u64 {
@@ -848,6 +872,7 @@ pub const PageSlab = struct {
         switch (self.state) {
             .filling => {
                 self.state = .ready;
+                fill_marks.remove(@intFromPtr(self.bytes.ptr));
                 self.cv.broadcast(io);
                 return self.epoch;
             },
@@ -962,6 +987,8 @@ fn dataPointerOf(array: mlx.mlx_array, dtype: mlx.mlx_dtype) ?*const anyopaque {
 
 pub const ImportOptions = struct {
     copy: bool = false,
+    /// The engine of our own wraps the bytes as its buffer, and MLX never sees them.
+    engine: bool = false,
 };
 
 pub fn importHostBytes(
@@ -978,8 +1005,15 @@ pub fn importHostBytes(
         elements *= @intCast(d);
     }
     if (elements * try dtypeBytes(dtype) != bytes.len) return error.ImportShapeMismatch;
+    if (opts.engine) {
+        if (opts.copy) return error.ImportFailed;
+        const array = mlx.engine.wrapMapped(bytes.ptr, shape, dtype, @ptrCast(payload), payloadRelease);
+        if (array.ctx == null) return error.ImportFailed;
+        _ = aliased_imports.fetchAdd(1, .monotonic);
+        return .{ .array = array, .aliased = true, .data_ptr = @ptrCast(bytes.ptr), .host_ptr = @ptrCast(bytes.ptr) };
+    }
     const array = if (opts.copy)
-        mlx.mlx_array_new_data(@ptrCast(bytes.ptr), shape.ptr, @intCast(shape.len), dtype)
+        try mlx.newData(@ptrCast(bytes.ptr), shape, dtype)
     else
         mlx.mlx_array_new_data_managed_payload(
             @ptrCast(bytes.ptr),
@@ -1059,6 +1093,41 @@ fn alignedDest(allocator: std.mem.Allocator, len: usize) ![]align(align_bytes) u
     const buf = try allocator.alignedAlloc(u8, .fromByteUnits(align_bytes), pageRoundUp(len));
     @memset(buf, 0);
     return buf;
+}
+
+test "a shard that cannot be opened is named, with the missing target of a dangling link" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try tmp.dir.symLink(io, "/nonexistent-sushi-test/model-00047.safetensors", "engram.safetensors", .{});
+    const link = try std.fmt.allocPrintSentinel(a, "{s}/engram.safetensors", .{root}, 0);
+    defer a.free(link);
+    try std.testing.expectError(error.FillOpenFailed, openHinted(link, .{}));
+    var buf: [2 * std.fs.max_path_bytes + 128]u8 = undefined;
+    const dangling = openFailureLine(&buf, link, .NOENT);
+    try std.testing.expect(std.mem.indexOf(u8, dangling, link) != null);
+    try std.testing.expect(std.mem.indexOf(u8, dangling, "a link to /nonexistent-sushi-test/model-00047.safetensors, which does not exist") != null);
+    const plain = try std.fmt.allocPrintSentinel(a, "{s}/absent.safetensors", .{root}, 0);
+    defer a.free(plain);
+    const missing = openFailureLine(&buf, plain, .NOENT);
+    try std.testing.expect(std.mem.indexOf(u8, missing, plain) != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "NOENT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "a link") == null);
+}
+
+test "a shard index whose weight_map is not an object fails at open, by name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    for ([_][]const u8{ "{\"weight_map\": 5}", "{\"weight_map\": []}", "{\"weight_map\": \"m\"}" }) |body| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = body });
+        try std.testing.expectError(error.InvalidSafetensorsIndex, ShardIndex.open(std.testing.allocator, root));
+    }
 }
 
 test "expert io fill reads identical bytes for aligned and unaligned spans" {
@@ -1395,18 +1464,7 @@ pub const TensorRegion = struct {
     dtype: Dtype,
 };
 
-pub fn readExact(fd: std.c.fd_t, dst: []u8, offset: u64) !void {
-    var done: usize = 0;
-    while (done < dst.len) {
-        const got = std.c.pread(fd, dst[done..].ptr, dst.len - done, @intCast(offset + done));
-        if (got < 0) {
-            if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
-            return error.FillReadFailed;
-        }
-        if (got == 0) return error.FillShortRead;
-        done += @intCast(got);
-    }
-}
+pub const readExact = io_util.readExact;
 
 /// A shard's parsed safetensors header; tensor payloads start at `data_start`.
 pub const SafetensorsHeader = struct {
@@ -1632,7 +1690,8 @@ pub const ShardIndex = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return error.InvalidSafetensorsIndex;
         errdefer parsed.deinit();
         if (parsed.value != .object) return error.InvalidSafetensorsIndex;
-        if (parsed.value.object.get("weight_map") == null) return error.InvalidSafetensorsIndex;
+        const map = parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
+        if (map != .object) return error.InvalidSafetensorsIndex;
         return .{ .allocator = allocator, .model_dir = model_dir, .parsed = parsed };
     }
 

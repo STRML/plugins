@@ -27,7 +27,8 @@ var last_key: std.ArrayList(u8) = .empty;
 pub fn on() bool {
     if (mode == .unknown) {
         log_on = diagOn(std.c.getenv("SUSHI_KERNEL_BUILD_LOG"));
-        mode = if (log_on or builtin.is_test) .on else .off;
+        // A process tracing its MLX calls by name needs each kernel's name at launch (`mlx.noteKernelLaunch`).
+        mode = if (log_on or builtin.is_test or mlx.callNamesTraced()) .on else .off;
     }
     return mode == .on;
 }
@@ -96,11 +97,17 @@ pub fn configFree(cfg: mlx.mlx_fast_metal_kernel_config) void {
 
 pub fn apply(k: mlx.mlx_fast_metal_kernel, inputs: mlx.mlx_vector_array, cfg: mlx.mlx_fast_metal_kernel_config) void {
     if (!on()) return;
+    // The tracking reads each input's shape and dtype; the engine's own query count excludes that.
+    const queries = mlx.query_count;
+    defer if (comptime builtin.is_test) {
+        mlx.query_count = queries;
+    };
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(gpa);
     _ = std.c.pthread_mutex_lock(&mu);
     defer _ = std.c.pthread_mutex_unlock(&mu);
     if (kernels.get(@intFromPtr(k.ctx))) |kn| {
+        mlx.noteKernelLaunch(kn.name);
         key.print(gpa, "{s} src={x}", .{ kn.name, kn.source }) catch return;
     } else key.print(gpa, "kernel@{x}", .{@intFromPtr(k.ctx)}) catch return;
     if (configs.get(@intFromPtr(cfg.ctx))) |c| {
@@ -134,9 +141,9 @@ fn probeRun(k: mlx.mlx_fast_metal_kernel, s: mlx.mlx_stream, dtype: mlx.mlx_dtyp
     var b_vals: [64]f32 = undefined;
     for (0..out.len) |i| x_vals[i] = 0.5 * @as(f32, @floatFromInt(i));
     for (0..@intCast(b_len)) |i| b_vals[i] = 0.25 * @as(f32, @floatFromInt(i + 1));
-    const x32 = mlx.mlx_array_new_data(&x_vals, &[_]c_int{n}, 1, .float32);
+    const x32 = try mlx.newData(&x_vals, &[_]c_int{n}, .float32);
     defer _ = mlx.mlx_array_free(x32);
-    const b32 = mlx.mlx_array_new_data(&b_vals, &[_]c_int{b_len}, 1, .float32);
+    const b32 = try mlx.newData(&b_vals, &[_]c_int{b_len}, .float32);
     defer _ = mlx.mlx_array_free(b32);
     var x = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x);
@@ -193,8 +200,6 @@ test "one kernel object across input dtypes and bindings: same outputs, one libr
     }
 }
 
-extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_bool(cls: mlx.mlx_fast_metal_kernel_config, name: [*:0]const u8, value: bool) c_int;
-
 test "template args of one value and different kinds each get their own source" {
     try mlx.requireGpu();
     const t = std.testing;
@@ -220,7 +225,7 @@ test "template args of one value and different kinds each get their own source" 
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{4}, 1, .float32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 4, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 4, 1, 1));
-        try mlx.check(if (as_bool) mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "N", true) else mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "N", 1));
+        try mlx.check(if (as_bool) mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "N", true) else mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "N", 1));
         var outs_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(outs_vec);
         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs_vec, k, inputs, cfg, s));
@@ -231,4 +236,31 @@ test "template args of one value and different kinds each get their own source" 
         const got = mlx.mlx_array_data_float32(y).?;
         try t.expectEqual(@as(f32, if (as_bool) 1 else 4), got[0]);
     };
+}
+
+fn kernelTally(name: []const u8) u64 {
+    var got: std.ArrayList(mlx.NameCount) = .empty;
+    defer got.deinit(std.testing.allocator);
+    mlx.callsByName(&got, std.testing.allocator) catch return 0;
+    for (got.items) |n| if (std.mem.startsWith(u8, n.name, "kernel ") and std.mem.eql(u8, n.name["kernel ".len..], name)) return n.count;
+    return 0;
+}
+
+test "a custom kernel launched on MLX's side is tallied under its name, once a launch" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const names = [_][*:0]const u8{ "x", "b" };
+    const outs = [_][*:0]const u8{"out"};
+    const iv = mlx.mlx_vector_string_new_data(&names, names.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_kernel_tally_probe", iv, ov, probe_source, "", true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const before = kernelTally("sushi_kernel_tally_probe");
+    var got: [32]f32 = undefined;
+    for (0..3) |_| try probeRun(k, s, .float32, 16, &got);
+    try t.expectEqual(before + 3, kernelTally("sushi_kernel_tally_probe"));
 }

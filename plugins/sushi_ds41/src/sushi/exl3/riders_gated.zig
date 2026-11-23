@@ -6,27 +6,30 @@ const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const fuse = @import("fuse.zig");
 const kernels = @import("expert_exl3_kernels.zig");
+const trellis = @import("shared_trellis.zig");
 
-pub const Affine = struct { weight: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array };
+pub const Affine = struct { weight: mlx.mlx_array = .{ .ctx = null }, scales: mlx.mlx_array = .{ .ctx = null }, biases: mlx.mlx_array = .{ .ctx = null } };
 
-/// The shared expert's banks (affine8, bf16 scales and biases), the bf16 sigmoid table, and the shared-expert gate's
-/// one-output bank when the gate logit rides the gate/up launch (null: the caller passes it to the reduce).
+/// The shared expert's banks (affine8, bf16 scales and biases, or `trellis` banks with the three affine ones unused),
+/// the bf16 sigmoid table, and the shared-expert gate's one-output bank when the gate logit rides the gate/up launch
+/// (null: the caller passes it to the reduce).
 pub const Shared = struct {
-    gate: Affine,
-    up: Affine,
-    down: Affine,
+    gate: Affine = .{},
+    up: Affine = .{},
+    down: Affine = .{},
     sigmoid: mlx.mlx_array,
     logit: ?Affine = null,
+    trellis: ?trellis.Banks = null,
 };
 
-pub const Geometry = struct { hidden: c_int, width: c_int, group: c_int, logit_group: c_int };
+pub const Geometry = struct { hidden: c_int, width: c_int, group: c_int, logit_group: c_int, tr: ?trellis.Geo = null };
 
 pub const HEADER: [:0]const u8 =
     \\#include <metal_simdgroup>
     \\#include <metal_stdlib>
     \\using namespace metal;
     \\template <int K, int GS, int FST, int RPS>
-    \\inline void qwen_qmv_rows(const device uint8_t* w, const device bfloat16_t* sc, const device bfloat16_t* bi, const device bfloat16_t* x, uint lane, thread float* result) {
+    \\inline void qmv_rows(const device uint8_t* w, const device bfloat16_t* sc, const device bfloat16_t* bi, const device bfloat16_t* x, uint lane, thread float* result) {
     \\  constexpr int VPT = FST != 0 ? 8 : 4;
     \\  constexpr int BLOCK = VPT * 32;
     \\  constexpr int GROUPS = K / GS;
@@ -82,17 +85,16 @@ const GATE_UP_OPEN: [:0]const u8 =
     \\
 ;
 
-/// The threadgroup past the gate/up ones computes the shared-expert gate logit of its row into `gl[row]`.
-const LOGIT_BRANCH: [:0]const u8 =
-    \\if (tgx == N / 8) {
-    \\  if (sgi == 0) {
-    \\    float result[1] = {0.0f};
-    \\    qwen_qmv_rows<K, LGS, 0, 1>((const device uint8_t*)lw, ls, lb, xr, lane, result);
-    \\    const float v = simd_sum(result[0]);
-    \\    if (lane == 0) gl[row] = bfloat16_t(v);
-    \\  }
-    \\} else
+const LOGIT_CALC: [:0]const u8 =
+    \\float result[1] = {0.0f};
+    \\qmv_rows<K, LGS, 0, 1>((const device uint8_t*)lw, ls, lb, xr, lane, result);
+    \\const float v = simd_sum(result[0]);
+    \\if (lane == 0) gl[row] = bfloat16_t(v);
+    \\
 ;
+
+/// The threadgroup past the gate/up ones computes the shared-expert gate logit of its row into `gl[row]`.
+const LOGIT_BRANCH: [:0]const u8 = "if (tgx == N / 8) {\n  if (sgi == 0) {\n" ++ LOGIT_CALC ++ "  }\n} else\n";
 
 /// Eight rows a threadgroup (two row groups of four, a gate and an up simdgroup each); `x` is [rows, K] and `y`
 /// [rows, N].
@@ -105,7 +107,7 @@ const GATE_UP_BLOCK: [:0]const u8 =
     \\  const device bfloat16_t* sp = which == 0 ? sg : su;
     \\  const device bfloat16_t* bp = which == 0 ? bg : bu;
     \\  float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    \\  qwen_qmv_rows<K, GS, FAST, 4>(wp + size_t(r0) * K, sp + r0 * (K / GS), bp + r0 * (K / GS), xr, lane, result);
+    \\  qmv_rows<K, GS, FAST, 4>(wp + size_t(r0) * K, sp + r0 * (K / GS), bp + r0 * (K / GS), xr, lane, result);
     \\  threadgroup float parts[16];
     \\  for (int r = 0; r < 4; ++r) {
     \\    const float v = simd_sum(result[r]);
@@ -130,7 +132,7 @@ const DOWN: [:0]const u8 =
     \\const int row = int(threadgroup_position_in_grid.y);
     \\const int r0 = int(threadgroup_position_in_grid.x) * 16 + int(simdgroup_index_in_threadgroup) * 4;
     \\float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    \\qwen_qmv_rows<K, GS, FAST, 4>((const device uint8_t*)w + size_t(r0) * K, sc + r0 * (K / GS), bi + r0 * (K / GS), x + size_t(row) * K, lane, result);
+    \\qmv_rows<K, GS, FAST, 4>((const device uint8_t*)w + size_t(r0) * K, sc + r0 * (K / GS), bi + r0 * (K / GS), x + size_t(row) * K, lane, result);
     \\for (int r = 0; r < 4; ++r) {
     \\  const float v = simd_sum(result[r]);
     \\  if (lane == 0) y[row * N + r0 + r] = bfloat16_t(v);
@@ -164,8 +166,14 @@ fn affineGroup(a: Affine, k: c_int, n: c_int) ?c_int {
 
 /// The shapes the riders serve for hidden width `hidden`, or null: affine8 g64 or g128 throughout, K a multiple of 128
 /// and at least 256, the gate/up width a multiple of 128 and the hidden width of 16.
-pub fn geometry(sh: Shared, hidden: c_int) ?Geometry {
+pub fn geometry(sh: Shared, hidden: c_int, rows: c_int) ?Geometry {
     if (!isBf16(sh.sigmoid) or mlx.mlx_array_size(sh.sigmoid) != 65536) return null;
+    if (sh.trellis) |t| {
+        const tr = trellis.geometry(t, hidden, rows) orelse return null;
+        var logit_group: c_int = 64;
+        if (sh.logit) |l| logit_group = affineGroup(l, hidden, 1) orelse return null;
+        return .{ .hidden = hidden, .width = tr.width, .group = 0, .logit_group = logit_group, .tr = tr };
+    }
     if (hidden < 256 or @mod(hidden, 128) != 0 or sh.gate.weight.ctx == null) return null;
     const gw = mlx.getShape(sh.gate.weight);
     if (gw.len != 2 or gw[0] < 128 or @mod(gw[0], 128) != 0) return null;
@@ -179,7 +187,33 @@ pub fn geometry(sh: Shared, hidden: c_int) ?Geometry {
     return .{ .hidden = hidden, .width = width, .group = g, .logit_group = logit_group };
 }
 
+/// Whether `geo` was read for a shared expert of `sh`'s kind (the riders and the trellis banks each run only on their
+/// own), and for trellis banks whether the NAX arm it was read for is still on.
+pub fn geometryFits(geo: Geometry, sh: Shared) bool {
+    return (geo.tr != null) == (sh.trellis != null) and (geo.tr == null or kernels.gemmNaxOn());
+}
+
+/// The same logit as one more threadgroup along the trellis gate/up grid, past its `TILES` columns of blocks: row
+/// `x - TILES`.
+const LOGIT_ROW: [:0]const u8 = "if (threadgroup_position_in_grid.x >= uint(TILES)) {\n  if (threadgroup_position_in_grid.y == 0u && simdgroup_index_in_threadgroup == 0u) {\n" ++
+    "const uint lane = thread_index_in_simdgroup;\nconst int row = int(threadgroup_position_in_grid.x) - TILES;\nconst device bfloat16_t* xr = x + size_t(row) * K;\n" ++ LOGIT_CALC ++ "  }\n} else\n";
+
+fn trellisGateUp(alloc: std.mem.Allocator, geo: Geometry, rows: c_int, with_logit: bool) !fuse.Part {
+    if (!with_logit) return trellis.gateUpPart(alloc, geo.tr.?, rows, 0, &.{}, "");
+    const tiles = @divExact(2 * geo.width, 128);
+    var part = try trellis.gateUpPart(alloc, geo.tr.?, rows, rows, try ints(alloc, .{ .{ "K", geo.hidden }, .{ "LGS", geo.logit_group }, .{ "TILES", tiles } }), LOGIT_ROW);
+    part.ins = &.{ "x", "trellis", "suh", "svh", "lw", "ls", "lb" };
+    part.outs = &.{ "y", "gl" };
+    part.header = try std.mem.concat(alloc, u8, &.{ part.header, HEADER });
+    const outs = try alloc.alloc(fuse.Out, 2);
+    outs[0] = part.launch.outs[0];
+    outs[1] = try bf16Out(alloc, &.{rows});
+    part.launch.outs = outs;
+    return part;
+}
+
 pub fn gateUpPart(alloc: std.mem.Allocator, geo: Geometry, rows: c_int, with_logit: bool) !fuse.Part {
+    if (geo.tr != null) return trellisGateUp(alloc, geo, rows, with_logit);
     const fast: c_int = @intFromBool(@mod(geo.hidden, 256) == 0);
     const outs = try alloc.alloc(fuse.Out, if (with_logit) 2 else 1);
     outs[0] = try bf16Out(alloc, &.{ rows, geo.width });
@@ -194,6 +228,7 @@ pub fn gateUpPart(alloc: std.mem.Allocator, geo: Geometry, rows: c_int, with_log
 }
 
 pub fn downPart(alloc: std.mem.Allocator, geo: Geometry, rows: c_int) !fuse.Part {
+    if (geo.tr) |tr| return trellis.downPart(alloc, tr, rows);
     const fast: c_int = @intFromBool(@mod(geo.width, 256) == 0);
     const outs = try alloc.alloc(fuse.Out, 1);
     outs[0] = try bf16Out(alloc, &.{ rows, geo.hidden });
@@ -208,12 +243,33 @@ pub fn downPart(alloc: std.mem.Allocator, geo: Geometry, rows: c_int) !fuse.Part
 
 /// The rider inputs of the gate/up launch, in `gateUpPart`'s order.
 pub fn gateUpInputs(sh: Shared, x: mlx.mlx_array, buf: *[11]mlx.mlx_array) []const mlx.mlx_array {
+    if (sh.trellis) |t| {
+        _ = trellis.gateUpInputs(t, x, buf);
+        if (sh.logit) |l| {
+            buf[4..7].* = .{ l.weight, l.scales, l.biases };
+            return buf[0..7];
+        }
+        return buf[0..4];
+    }
     buf[0..8].* = .{ x, sh.gate.weight, sh.gate.scales, sh.gate.biases, sh.up.weight, sh.up.scales, sh.up.biases, sh.sigmoid };
     if (sh.logit) |l| {
         buf[8..11].* = .{ l.weight, l.scales, l.biases };
         return buf[0..11];
     }
     return buf[0..8];
+}
+
+/// The shared inputs of the down launch: `y` is the gate/up launch's shared output, `x` the layer input.
+pub fn downInputs(sh: Shared, x: mlx.mlx_array, y: mlx.mlx_array, buf: *[7]mlx.mlx_array) []const mlx.mlx_array {
+    if (sh.trellis) |t| return trellis.downInputs(t, x, y, sh.sigmoid, buf);
+    buf[0..4].* = .{ y, sh.down.weight, sh.down.scales, sh.down.biases };
+    return buf[0..4];
+}
+
+/// The routed sum plus `sigmoid(gate) * shared`, with `shared` the down launch's shared output.
+pub fn reduce(s: mlx.mlx_stream, sh: Shared, geo: Geometry, down: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, hidden: c_int, rows: c_int, topk: c_int, shared: mlx.mlx_array, gate: mlx.mlx_array) !mlx.mlx_array {
+    if (sh.trellis) |t| return trellis.reduce(s, down, svh, slots, scores, hidden, rows, topk, shared, t.down.svh, geo.tr.?.dn.nsplit, gate);
+    return kernels.downFinishReduceWithShared(s, down, svh, slots, scores, hidden, rows, topk, .bfloat16, shared, gate, false);
 }
 
 /// The routed ids and scores of `rows` rows of `x` flattened as the chain reads them, or null where the shapes or

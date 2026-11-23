@@ -85,8 +85,8 @@ pub const Codebook = enum(u8) {
         return if (self == .pair1) pair1Pair(rate) else null;
     }
 
-    /// The codebooks whose bytes GLM's lane, one-row, group2 and prefill-grid kernels are proven on.
-    pub fn servesGlmFastPaths(self: Codebook) bool {
+    /// The codebooks whose bytes the lane, one-row, cooperative-rows and prefill-grid kernels are proven on.
+    pub fn servesLaneFastPaths(self: Codebook) bool {
         return switch (self) {
             .mcg, .spec1, .std1, .pair1 => true,
             .mul1 => false,

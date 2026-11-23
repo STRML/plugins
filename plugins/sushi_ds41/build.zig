@@ -6,6 +6,10 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const lib = @import("mlx_serve_kit").plugin(b, .{ .name = "sushi_ds41" });
     const root = lib.root_module.import_table.get("plugin").?;
+    const opts = b.addOptions();
+    opts.addOption(bool, "host_tier", false);
+    opts.addOption([]const u8, "git_sha", "unknown");
+    root.addOptions("build_options", opts);
     const exl3 = b.createModule(.{
         .root_source_file = b.path("src/sushi/exl3/root.zig"),
         .target = root.resolved_target,
@@ -33,6 +37,11 @@ pub fn build(b: *std.Build) void {
     gpu.addLibraryPath(.{ .cwd_relative = mlx_lib });
     gpu.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
     gpu.addRPath(.{ .cwd_relative = mlx_lib });
+    if (root.resolved_target.?.result.os.tag == .macos) {
+        gpu.linkFramework("Metal", .{});
+        gpu.linkFramework("Foundation", .{});
+        gpu.linkSystemLibrary("objc", .{ .use_pkg_config = .no });
+    }
     // The slice's model reaches the vendored module, whose `mlx_host` is this root (it exports mlx, log and io_util).
     const gpu_exl3 = b.createModule(.{
         .root_source_file = b.path("src/sushi/exl3/root.zig"),
@@ -43,6 +52,7 @@ pub fn build(b: *std.Build) void {
     });
     gpu.addImport("sushi_exl3", gpu_exl3);
     gpu.addImport("mlx_serve", root.import_table.get("mlx_serve").?);
+    gpu.addOptions("build_options", opts);
     const gpu_run = b.addRunArtifact(b.addTest(.{ .root_module = gpu, .filters = &.{"sushi_ds41 gpu"} }));
     gpu_run.setEnvironmentVariable("SUSHI_DS41_GPU_TEST", "1");
     if (tiny) |dir| gpu_run.setEnvironmentVariable("DSV41_TINY", dir);

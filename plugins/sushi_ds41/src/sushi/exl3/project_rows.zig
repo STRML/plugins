@@ -1,6 +1,8 @@
+const device = @import("device.zig");
 const exl3 = @import("expert_exl3.zig");
 const kernel_src = @import("kernel_source.zig");
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
 const std = @import("std");
 const kernels = @import("expert_exl3_kernels.zig");
 
@@ -29,6 +31,40 @@ pub const ROWS_HELPERS: [:0]const u8 =
     \\
 ;
 
+/// A chunk's read of row r's 128-block at k: the input times suh, through the input H128.
+const ROWS_X_PLAIN: []const u8 =
+    \\    const auto xr = x + (size_t)r * uint(IDIM) + k;
+    \\    const float4 v = exl3_h128(float4(
+    \\      float(xr[lane]) * float(suh[k + lane]),
+    \\      float(xr[lane + 32u]) * float(suh[k + lane + 32u]),
+    \\      float(xr[lane + 64u]) * float(suh[k + lane + 64u]),
+    \\      float(xr[lane + 96u]) * float(suh[k + lane + 96u])), lane);
+    \\
+;
+
+/// `ROWS_X_PLAIN` where `x` holds the k-split partials of the launch before this one (`[XG * ROWS * XSPLIT, XODIM]` f32,
+/// that launch's bank g making input columns `g * XODIM` on): the block is first finished as `ROWS_FINISH_SOURCE`
+/// finishes it, in its order, and rounded to that launch's output type `XT`, so the prepared row is the same bytes.
+const ROWS_X_PENDING: []const u8 =
+    \\    static_assert(GROUPS == 1, "a launch that reads partials has one bank");
+    \\    const uint xg = k / uint(XODIM);
+    \\    const uint xc = k - xg * uint(XODIM) + lane;
+    \\    float4 xv = 0.0f;
+    \\    for (uint xs = 0u; xs < uint(XSPLIT); xs++) {
+    \\      const device float *xp = x + ((size_t)(xg * uint(ROWS) + r) * uint(XSPLIT) + xs) * uint(XODIM) + xc;
+    \\      xv += float4(xp[0], xp[32], xp[64], xp[96]);
+    \\    }
+    \\    xv = exl3_h128(xv, lane);
+    \\    const auto xw = xsvh + (size_t)xg * uint(XODIM) + xc;
+    \\    xv = float4(float(XT(xv.x * psc * float(xw[0]))), float(XT(xv.y * psc * float(xw[32]))), float(XT(xv.z * psc * float(xw[64]))), float(XT(xv.w * psc * float(xw[96]))));
+    \\    const float4 v = exl3_h128(float4(
+    \\      xv.x * float(suh[k + lane]),
+    \\      xv.y * float(suh[k + lane + 32u]),
+    \\      xv.z * float(suh[k + lane + 64u]),
+    \\      xv.w * float(suh[k + lane + 96u])), lane);
+    \\
+;
+
 /// The multi-row kernels' k walk: KT k-tiles from tk0, CHUNK halves per row at a time, each chunk first
 /// prepared (suh + H128) for every row into `prep`, element e of a 128-block at offset `PREP_SLOT`.
 const ROWS_CHUNK_OPEN: []const u8 =
@@ -40,12 +76,8 @@ const ROWS_CHUNK_OPEN: []const u8 =
     \\    const uint r = item / nb;
     \\    const uint b = (item - r * nb) * 128u;
     \\    const uint k = c0 * TILE + b;
-    \\    const auto xr = x + (size_t)r * uint(IDIM) + k;
-    \\    const float4 v = exl3_h128(float4(
-    \\      float(xr[lane]) * float(suh[k + lane]),
-    \\      float(xr[lane + 32u]) * float(suh[k + lane + 32u]),
-    \\      float(xr[lane + 64u]) * float(suh[k + lane + 64u]),
-    \\      float(xr[lane + 96u]) * float(suh[k + lane + 96u])), lane);
+    \\
+++ ROWS_X_PLAIN ++
     \\    threadgroup half *pw = prep + r * uint(CHUNK) + b + PREP_SLOT;
     \\    pw[0] = half(v.x * psc);
     \\    pw[32] = half(v.y * psc);
@@ -220,10 +252,12 @@ pub const ROWS_BODY: [:0]const u8 =
 /// `ROWS_SOURCE` on the matrix units: a simdgroup owns 32 outputs, decodes them into `matmul2d` weight
 /// fragments (the NAX GEMM's) and multiplies every k-tile with a 16-row tile holding the prepared rows
 /// (rows past ROWS repeat the last row; their sums are never stored), so a row costs no ALU of its own.
-/// A threadgroup owns one 128-wide output block; FOLD as in `ROWS_SOURCE`.
+/// A threadgroup owns one 128-wide output block; FOLD as in `ROWS_SOURCE`. UNR k-tiles' fragments are read
+/// before their MMAs run, in the one-tile walk's order; R32 reads them on 32-bit funnels where they fit.
 pub const ROWS_NAX_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_BODY, "PREP_SLOT", "lane");
 
 const ROWS_NAX_BODY: [:0]const u8 =
+    \\static_assert(UNR == 1 || KPH == 1, "an unrolled walk steps whole chunks of one slice");
     \\constexpr uint SGS = 4u * uint(KPH);
     \\constexpr uint KPARTS = uint(KPH);
     \\constexpr uint TGT = 8u;
@@ -238,6 +272,7 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\nax_zero(destination);
     \\const short2 origin = nax_origin(lane);
     \\const uint xrow = min(uint(origin.y), uint(ROWS) - 1u);
+    \\const uint xrow8 = min(uint(origin.y) + 8u, uint(ROWS) - 1u);
     \\const uint lid = uint(thread_index_in_threadgroup);
     \\const uint col0 = sg & 3u;
     \\const uint kslice = sg >> 2u;
@@ -245,29 +280,38 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\
 ++ ROWS_CHUNK_OPEN ++
     \\  const threadgroup half *pl = prep + xrow * uint(CHUNK) + uint(origin.x);
-    \\  for (uint tk = c0 + (kslice + uint(KPH) - (c0 - tk0) % uint(KPH)) % uint(KPH); tk < c1; tk += uint(KPH)) {
-    \\    const device uint *wp = wcol + (size_t)(tk - tk0) * OT * PACKED_W;
-    \\    const nfrag w0 = nax_wfrag_k<N>(wp, lane);
-    \\    const nfrag w1 = nax_wfrag_k<N>(wp + PACKED_W, lane);
-    \\    for (short s = 0; s < 8; s++) {
-    \\      right[s] = w0[s];
-    \\      right[8 + s] = w1[s];
+    \\  const threadgroup half *pl8 = prep + xrow8 * uint(CHUNK) + uint(origin.x);
+    \\  for (uint tk = c0 + (kslice + uint(KPH) - (c0 - tk0) % uint(KPH)) % uint(KPH); tk < c1; tk += uint(UNR) * uint(KPH)) {
+    \\    nfrag wf[UNR][2];
+    \\    for (uint u = 0u; u < uint(UNR); u++) {
+    \\      const device uint *wp = wcol + (size_t)(tk + u * uint(KPH) - tk0) * OT * PACKED_W;
+    \\      wf[u][0] = rows_wfrag<N, R32, SW>(wp, lane);
+    \\      wf[u][1] = rows_wfrag<N, R32, SW>(wp + PACKED_W, lane);
     \\    }
-    \\    const half4 v = *((const threadgroup half4 *)(pl + (tk - c0) * TILE));
-    \\    for (uint c = 0u; c < 4u; c++) {
-    \\      left[c] = v[c];
-    \\      left[4 + c] = half(0.0h);
+    \\    for (uint u = 0u; u < uint(UNR); u++) {
+    \\      for (short s = 0; s < 8; s++) {
+    \\        right[s] = wf[u][0][s];
+    \\        right[8 + s] = wf[u][1][s];
+    \\      }
+    \\      const half4 v = *((const threadgroup half4 *)(pl + (tk + u * uint(KPH) - c0) * TILE));
+    \\      const half4 v8 = ROWS > 8 ? *((const threadgroup half4 *)(pl8 + (tk + u * uint(KPH) - c0) * TILE)) : half4(0.0h);
+    \\      for (uint c = 0u; c < 4u; c++) {
+    \\        left[c] = v[c];
+    \\        left[4 + c] = v8[c];
+    \\      }
+    \\      op.run(left, right, destination);
     \\    }
-    \\    op.run(left, right, destination);
     \\  }
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (uint(origin.y) < uint(ROWS)) {
+    \\for (uint h = 0u; h < (ROWS > 8 ? 2u : 1u); h++) {
+    \\  const uint row = uint(origin.y) + 8u * h;
+    \\  if (row >= uint(ROWS)) continue;
     \\  for (uint ct = 0u; ct < 2u; ct++) {
     \\    for (uint c = 0u; c < 4u; c++) {
     \\      const uint col = col0 * 32u + ct * 16u + uint(origin.x) + c;
-    \\      if constexpr (FOLD || KPARTS > 1u) tgm[(uint(origin.y) * KPARTS + kslice) * 128u + col] = destination[ct * 8u + c];
-    \\      else exl3_store(y + (size_t)(uint(origin.y) * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + col, float(destination[ct * 8u + c]));
+    \\      if constexpr (FOLD || KPARTS > 1u) tgm[(row * KPARTS + kslice) * 128u + col] = destination[ct * 8u + 4u * h + c];
+    \\      else exl3_store(y + (size_t)(row * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + col, float(destination[ct * 8u + 4u * h + c]));
     \\    }
     \\  }
     \\}
@@ -288,6 +332,17 @@ const ROWS_NAX_BODY: [:0]const u8 =
 ;
 
 /// Sums a row's k-split partials, then applies the output H128 + svh.
+/// Where a finished block of a bank's row lands: bank-major rows, segmented.
+const ROWS_FINISH_AT =
+    \\device OutT *yr = y + (size_t)g * uint(ROWS) * uint(ODIM) + exl3_seg_at(uint(threadgroup_position_in_grid.y), b, uint(ROWS), uint(ODIM), uint(SB1), uint(SB2), uint(SB3));
+;
+
+/// The same block of an unsegmented launch with the banks side by side in each row: `[rows, groups * out]`.
+const ROWS_FINISH_AT_ROW_MAJOR =
+    \\device OutT *yr = y + ((size_t)threadgroup_position_in_grid.y * uint(GRP) + g) * uint(ODIM) + b;
+    \\
+;
+
 const ROWS_FINISH_SOURCE: [:0]const u8 =
     \\const uint lane = uint(thread_index_in_simdgroup);
     \\const uint b = uint(threadgroup_position_in_grid.x) * 128u + lane;
@@ -300,24 +355,139 @@ const ROWS_FINISH_SOURCE: [:0]const u8 =
     \\}
     \\v = exl3_h128(v, lane);
     \\const float psc = 0.08838834764831845f;
-    \\device OutT *yr = y + (size_t)g * uint(ROWS) * uint(ODIM) + exl3_seg_at(uint(threadgroup_position_in_grid.y), b, uint(ROWS), uint(ODIM), uint(SB1), uint(SB2), uint(SB3));
+++ ROWS_FINISH_AT ++
     \\yr[0] = OutT(v.x * psc * float(svh[g * uint(ODIM) + b]));
     \\yr[32] = OutT(v.y * psc * float(svh[g * uint(ODIM) + b + 32u]));
     \\yr[64] = OutT(v.z * psc * float(svh[g * uint(ODIM) + b + 64u]));
     \\yr[96] = OutT(v.w * psc * float(svh[g * uint(ODIM) + b + 96u]));
 ;
 
+const ROWS_FINISH_ROW_MAJOR_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_FINISH_SOURCE, ROWS_FINISH_AT, ROWS_FINISH_AT_ROW_MAJOR);
+
+/// `ROWS_FINISH_SOURCE` of a one-bank launch whose row `y` leaves as HC streams: stream i is
+/// `fma(post[i], y, sum over j of fma(comb[j][i], x[j], acc))` rounded to OutT, `y` rounded to OutT first.
+const ROWS_FINISH_EXPAND_SOURCE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint lane = uint(thread_index_in_simdgroup);
+    \\const uint b = uint(threadgroup_position_in_grid.x) * 128u + lane;
+    \\const uint r = uint(threadgroup_position_in_grid.y);
+    \\float4 v = 0.0f;
+    \\for (uint s = 0u; s < uint(NSPLIT); s++) {
+    \\  const device float *p = part + (size_t)(r * uint(NSPLIT) + s) * uint(ODIM) + b;
+    \\  v += float4(p[0], p[32], p[64], p[96]);
+    \\}
+    \\v = exl3_h128(v, lane);
+    \\const float psc = 0.08838834764831845f;
+    \\const size_t row = (size_t)r * uint(HC);
+    \\for (uint q = 0u; q < 4u; q++) {
+    \\  const uint col = b + 32u * q;
+    \\  const float yv = float(OutT(v[q] * psc * float(svh[col])));
+    \\  float sv[HC];
+    \\  for (uint j = 0u; j < uint(HC); j++) sv[j] = float(x[(row + j) * uint(ODIM) + col]);
+    \\  for (uint i = 0u; i < uint(HC); i++) {
+    \\    float acc = 0.0f;
+    \\    for (uint j = 0u; j < uint(HC); j++) acc = metal::fma(comb[(row + j) * uint(HC) + i], sv[j], acc);
+    \\    y[(row + i) * uint(ODIM) + col] = OutT(metal::fma(post[row + i], yv, acc));
+    \\  }
+    \\}
+;
+
+/// `ROWS_FINISH_SOURCE` for a stacked launch whose first NORM columns leave rms-normed with `w`, one threadgroup a
+/// row. The norm is MLX's `rms_single_row` on the finished row, sum for sum: a thread squares four neighbours with a
+/// fused multiply-add (as MLX's compiled kernel does: f32 outputs show the ulp), a simdgroup sums its 128 columns,
+/// simdgroup 0 the simdgroups', and an output is `w * OutT(x * inv)`.
+const ROWS_FINISH_RMS_SOURCE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint lane = uint(thread_index_in_simdgroup);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\const uint r = uint(threadgroup_position_in_grid.y);
+    \\threadgroup float fin[NORM];
+    \\threadgroup float sums[32];
+    \\threadgroup float inv_mean[1];
+    \\const uint b = sg * 128u + lane;
+    \\const bool normed = sg * 128u < uint(NORM);
+    \\float4 v = 0.0f;
+    \\for (uint s = 0u; s < uint(NSPLIT); s++) {
+    \\  const device float *p = part + (size_t)(r * uint(NSPLIT) + s) * uint(ODIM) + b;
+    \\  v += float4(p[0], p[32], p[64], p[96]);
+    \\}
+    \\v = exl3_h128(v, lane);
+    \\const float psc = 0.08838834764831845f;
+    \\const OutT o0 = OutT(v.x * psc * float(svh[b]));
+    \\const OutT o1 = OutT(v.y * psc * float(svh[b + 32u]));
+    \\const OutT o2 = OutT(v.z * psc * float(svh[b + 64u]));
+    \\const OutT o3 = OutT(v.w * psc * float(svh[b + 96u]));
+    \\if (normed) {
+    \\  fin[b] = float(o0);
+    \\  fin[b + 32u] = float(o1);
+    \\  fin[b + 64u] = float(o2);
+    \\  fin[b + 96u] = float(o3);
+    \\} else {
+    \\  device OutT *yr = y + exl3_seg_at(r, b, uint(ROWS), uint(ODIM), uint(SB1), uint(SB2), uint(SB3));
+    \\  yr[0] = o0;
+    \\  yr[32] = o1;
+    \\  yr[64] = o2;
+    \\  yr[96] = o3;
+    \\}
+    \\if (sg == 0u) sums[lane] = 0.0f;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\float tx[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    \\float acc = 0.0f;
+    \\if (normed) {
+    \\  for (int i = 0; i < 4; i++) {
+    \\    tx[i] = fin[sg * 128u + lane * 4u + uint(i)];
+    \\    acc = metal::fma(tx[i], tx[i], acc);
+    \\  }
+    \\}
+    \\acc = simd_sum(acc);
+    \\if (lane == 0u && normed) sums[sg] = acc;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (sg == 0u) {
+    \\  acc = simd_sum(sums[lane]);
+    \\  if (lane == 0u) inv_mean[0] = metal::precise::rsqrt(acc / uint(NORM) + eps[0]);
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (normed) {
+    \\  const uint c0 = sg * 128u + lane * 4u;
+    \\  device OutT *yr = y + exl3_seg_at(r, c0, uint(ROWS), uint(ODIM), uint(SB1), uint(SB2), uint(SB3));
+    \\  for (int i = 0; i < 4; i++) yr[i] = w[c0 + uint(i)] * OutT(tx[i] * inv_mean[0]);
+    \\}
+;
+
 pub const PROJECT_ROWS_MAX: c_int = 8;
+
+/// The NAX arm runs one 16-row MMA tile whatever the row count, so it serves up to 16 rows on the same sums.
+pub const NAX_ROWS_MAX: c_int = 16;
+
+/// How a multi-row launch is built, per call.
+pub const Mode = struct {
+    /// A row has the same bytes at every width: the NAX arm at one row too, and for the lm_head, where the SIMD rows
+    /// arm is the faster one up to 5 rows and equals its one-row launch bit for bit, the SIMD arm at every width.
+    exact: bool = false,
+    /// A spec verify's trunk launches: with `exact` on a NAX machine, rows past `PROJECT_ROWS_MAX` stay on the NAX arm
+    /// instead of the sorted GEMM, so each still has its decode tick's bytes. Prefill chunks keep the GEMM.
+    wide: bool = false,
+};
+
+/// The most rows a multi-row launch serves in `mode`.
+pub fn rowsMax(mode: Mode) c_int {
+    return if (mode.wide and mode.exact and kernels.gemmNaxOn()) NAX_ROWS_MAX else PROJECT_ROWS_MAX;
+}
 
 /// Threadgroup memory a launch stages its prepared rows in: an occupancy bound.
 const ROWS_TG_BYTES: c_int = 8192;
 
 /// One multi-row launch: `tgrp` output tile pairs per threadgroup, `kph` simdgroups per pair over its k
 /// range, `nsplit` threadgroups over the k dim, `chunk` halves per row staged at a time. `nax` launches
-/// `ROWS_NAX_SOURCE`, whose threadgroup is always tgrp 4, kph 1.
-pub const RowsGeom = struct { tgrp: c_int, kph: c_int, nsplit: c_int, chunk: c_int, nax: bool = false };
+/// `ROWS_NAX_SOURCE`, whose threadgroup is always tgrp 4, kph 1; its `unr` (kph 1 only), `r32` and `sw` (n96: the four
+/// words a lane's windows span, loaded once) change how the fragments are read, never a byte.
+pub const RowsGeom = struct { tgrp: c_int, kph: c_int, nsplit: c_int, chunk: c_int, nax: bool = false, unr: c_int = 1, r32: bool = false, sw: bool = false };
 
-const RowsKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: u32, out_dt: mlx.mlx_dtype, bounds: [3]c_int, geom: RowsGeom };
+/// What a launch reads in place of finished input rows: the partials of the launch before it, `xsplit` k-split parts a
+/// row of `xodim` columns a bank, finished to `xdt`. `xsplit` 0: plain rows.
+pub const Pending = struct { xsplit: c_int = 0, xodim: c_int = 0, xdt: mlx.mlx_dtype = .float32 };
+
+const RowsKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: u32, out_dt: mlx.mlx_dtype, bounds: [3]c_int, geom: RowsGeom, pend: Pending = .{} };
 
 const RowsFinishKey = struct { out_dim: c_int, rows: c_int, groups: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, bounds: [3]c_int };
 
@@ -330,11 +500,190 @@ var rows_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 
 var rows_nax_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 
+var rows_pend_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+
+var rows_nax_pend_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+
 var rows_finish_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// Joined rows of a batch (`trunk.joinedRows`): a NAX launch of any row total runs one of two pipelines, compiled at
+/// eight rows or the cap's and their chunk, its kernel reading the row count off its input, so a total no warm met
+/// compiles nothing. On the NAX
+/// arm the k walk never depends on the row count (`rowsLaunch`), so a row keeps its bits.
+pub var dyn_rows: bool = false;
+
+var rows_nax_dyn_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+
+var rows_finish_dyn_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+var rows_dyn_cfgs: kernel_src.CfgCache(RowsKey, 64) = .{};
+
+var rows_finish_dyn_cfgs: kernel_src.CfgCache(RowsFinishKey, 64) = .{};
+
+/// `src` with its row count `RN`, read at run time as `rn`; the threadgroup arrays keep the compiled ROWS (the cap).
+fn dynRowsSource(comptime src: []const u8, comptime rn: []const u8) [:0]const u8 {
+    comptime {
+        var t: []const u8 = kernels.metalReplaceFound(src, "uint(ROWS)", "RN");
+        // Past eight rows is decided at compile time on an eight-row pipeline, at run time on the cap's.
+        if (std.mem.indexOf(u8, t, "ROWS > 8") != null) t = kernels.metalReplaceFound(t, "ROWS > 8", "(ROWS > 8 && RN > 8u)");
+        for ([_][]const u8{ "PREP_F", "PART_F" }) |f| {
+            if (std.mem.indexOf(u8, t, "constexpr uint " ++ f ++ " = RN") != null)
+                t = kernels.metalReplaceFound(t, "constexpr uint " ++ f ++ " = RN", "constexpr uint " ++ f ++ " = uint(ROWS)");
+        }
+        return "const uint RN = " ++ rn ++ ";\n" ++ t;
+    }
+}
+
+const ROWS_NAX_DYN_SOURCE: [:0]const u8 = dynRowsSource(ROWS_NAX_SOURCE, "uint(x_shape[0]) / uint(GROUPS)");
+
+const ROWS_FINISH_DYN_SOURCE: [:0]const u8 = dynRowsSource(ROWS_FINISH_SOURCE, "uint(threadgroups_per_grid.y)");
+
+/// The rows a dynamic-rows launch of `rows` compiles at: eight or the cap, so a small total keeps a wide chunk.
+fn dynCap(rows: c_int) c_int {
+    return if (rows <= 8) 8 else NAX_ROWS_MAX;
+}
+
+/// The geometry a dynamic-rows launch compiles at: `g`'s, staged at its cap's chunk.
+fn dynGeom(l: RowsLaunch, g: RowsGeom) RowsGeom {
+    var d = g;
+    d.chunk = rowsChunk(l.in_dim, dynCap(l.rows), g.nsplit);
+    return d;
+}
+
+/// How many template sets a dynamic-rows launch of this shape compiles over every row total: one a cap.
+fn dynTemplates(in_dim: c_int, out_dim: c_int, groups: c_int, n: u32, mode: Mode, expected: NaxSplit) !usize {
+    const Set = struct { cap: c_int, geom: RowsGeom };
+    var seen: [@intCast(NAX_ROWS_MAX)]Set = undefined;
+    var count: usize = 0;
+    for (1..@as(usize, @intCast(NAX_ROWS_MAX)) + 1) |rows| {
+        const l: RowsLaunch = .{ .in_dim = in_dim, .out_dim = out_dim, .rows = @intCast(rows), .groups = groups, .n = n, .out_dt = .bfloat16 };
+        const d: Set = .{ .cap = dynCap(l.rows), .geom = dynGeom(l, rowsGeometry(in_dim, out_dim, @intCast(rows), groups, @intCast(l.n), mode)) };
+        try std.testing.expectEqual(expected, NaxSplit{ .kph = d.geom.kph, .nsplit = d.geom.nsplit });
+        for (seen[0..count]) |x| {
+            if (std.meta.eql(x, d)) break;
+        } else {
+            seen[count] = d;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn launchRowsDyn(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, bounds: [3]c_int) !mlx.mlx_array {
+    const d = dynGeom(l, g);
+    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = d };
+    const cfg = rows_dyn_cfgs.get(key) orelse blk: {
+        const c = try buildRowsCfg(l, d, bounds, .{}, dynCap(l.rows));
+        rows_dyn_cfgs.put(key, c);
+        break :blk c;
+    };
+    const kernel = try kernel_src.codebookKernelWith(&rows_nax_dyn_kernel, "sushi_exl3_rows_nax_dyn", &ROWS_INS, &.{"y"}, ROWS_NAX_DYN_SOURCE, ROWS_NAX_FRAGS);
+    const ov = try kernels.applyOuts(s, kernel, &.{ x, trellis, suh, svh }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
+    if (rowsFolds(d)) {
+        const whole = y;
+        y = mlx.mlx_array_new();
+        return whole;
+    }
+    const fkey = RowsFinishKey{ .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .nsplit = d.nsplit, .out_dt = l.out_dt, .bounds = bounds };
+    const fcfg = rows_finish_dyn_cfgs.get(fkey) orelse blk: {
+        const c = try buildFinishCfg(l, d.nsplit, bounds, dynCap(l.rows));
+        rows_finish_dyn_cfgs.put(fkey, c);
+        break :blk c;
+    };
+    const fk = try kernels.getNamedKernel(&rows_finish_dyn_kernel, "sushi_exl3_rows_finish_dyn", &.{ "part", "svh" }, &.{"y"}, ROWS_FINISH_DYN_SOURCE, ROWS_HELPERS);
+    const fv = try kernels.applyOuts(s, fk, &.{ y, svh }, fcfg, 1);
+    defer _ = mlx.mlx_vector_array_free(fv);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, fv, 0));
+    return out;
+}
+
+const RowsFinishRmsKey = struct { out_dim: c_int, rows: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, bounds: [3]c_int, norm: c_int };
+
+/// A stacked shape at each of its decode widths.
+var rows_finish_rms_cfgs: kernel_src.CfgCache(RowsFinishRmsKey, 32) = .{};
+
+var rows_finish_rms_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+const RowsFinishExpandKey = struct { out_dim: c_int, rows: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, hc: c_int };
+
+var rows_finish_expand_cfgs: kernel_src.CfgCache(RowsFinishExpandKey, 16) = .{};
+
+var rows_finish_expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+var rows_finish_row_major_cfgs: kernel_src.CfgCache(RowsFinishKey, 16) = .{};
+
+var rows_finish_row_major_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 pub const ROWS_INS = [_][*:0]const u8{ "x", "trellis", "suh", "svh" };
 
-pub const ROWS_NAX_FRAGS: [:0]const u8 = kernels.GEMM_NAX_INCLUDES ++ kernels.GEMM_NAX_FRAGS ++ ROWS_HELPERS;
+pub const ROWS_NAX_FRAGS: [:0]const u8 = kernels.GEMM_NAX_INCLUDES ++ kernels.GEMM_NAX_FRAGS ++ ROWS_HELPERS ++ W32_FRAGS;
+
+/// `nax_wfrag_k` on two 32-bit funnels (`nax_win2`) where a quad's two early codewords lie in the 32 bits ending 16
+/// before its last bit and its two late ones in the last 32 (n62 to n102): the same codewords, no 64-bit shift. n64 keeps
+/// `nax_wfrag`, whose two-word read measured faster there.
+const W32_FRAGS: [:0]const u8 =
+    \\static inline constexpr bool nax_w32_fits(uint N) {
+    \\  for (uint b = 0u; b < 2u; b++) {
+    \\    const uint last = nax_end(N, b, 5u);
+    \\    if (last - nax_end(N, b, 1u) < 16u || last - nax_end(N, b, 0u) > 32u || last - nax_end(N, b, 4u) > 16u) return false;
+    \\  }
+    \\  return true;
+    \\}
+    \\static inline constexpr bool rows_w32(uint N, uint R32) { return R32 != 0u && N != 64u && nax_w32_fits(N); }
+    \\template<uint N, uint R32, uint SW>
+    \\static inline nfrag rows_wfrag(const device uint *words, uint lane) {
+    \\  if constexpr (N == 80u && SW != 0u) return nax_k5_frag<N>(words, lane);
+    \\  if constexpr (rows_w32(N, R32)) {
+    \\    constexpr uint W = N / 2u;
+    \\    const uint b = (lane >> 3u) & 1u;
+    \\    const uint end = 8u * N * (lane >> 4u) + N * (lane & 7u) + (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * b + nax_end(N, 0u, 5u);
+    \\    const uint s0 = nax_sh(N, b, 0u) - 16u;
+    \\    const uint s1 = nax_sh(N, b, 1u) - 16u;
+    \\    const uint s4 = nax_sh(N, b, 4u);
+    \\    uint2 lo, hi;
+    \\    if constexpr (SW != 0u && N == 96u) {
+    \\      const uint l = (end - 1u) >> 5u;
+    \\      const uint s = (0u - end) & 31u;
+    \\      const uint sp = (s + 16u) & 31u;
+    \\      const uint wm = words[l == 1u ? W - 1u : l - 2u];
+    \\      const uint w0 = words[l - 1u];
+    \\      const uint w1 = words[l];
+    \\      const uint w2 = words[l + 1u];
+    \\      lo = uint2(nax_funnel(w1, w0, s), nax_funnel(w0, wm, sp));
+    \\      hi = uint2(nax_funnel(w2, w1, sp), nax_funnel(w2, w1, s));
+    \\    } else {
+    \\      lo = nax_win2(words, end, W);
+    \\      hi = nax_win2(words, end + W, W);
+    \\    }
+    \\    const half2 p0 = exl3_pairh(uint2((lo.y >> s0) & 0xffffu, (lo.y >> s1) & 0xffffu));
+    \\    const half2 p1 = exl3_pairh(uint2((lo.x >> s4) & 0xffffu, lo.x & 0xffffu));
+    \\    const half2 p2 = exl3_pairh(uint2((hi.y >> s0) & 0xffffu, (hi.y >> s1) & 0xffffu));
+    \\    const half2 p3 = exl3_pairh(uint2((hi.x >> s4) & 0xffffu, hi.x & 0xffffu));
+    \\    return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+    \\  } else {
+    \\    return nax_wfrag_k<N>(words, lane);
+    \\  }
+    \\}
+    \\
+;
+
+const ROWS_PEND_INS = ROWS_INS ++ [_][*:0]const u8{"xsvh"};
+
+const ROWS_PEND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_SOURCE, ROWS_X_PLAIN, ROWS_X_PENDING);
+
+const ROWS_NAX_PEND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_SOURCE, ROWS_X_PLAIN, ROWS_X_PENDING);
+
+/// `rowsKernel` for a launch whose input is another launch's partials (`Pending`).
+pub fn rowsPendKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
+    if (g.nax) return kernel_src.codebookKernelWith(&rows_nax_pend_kernel, "sushi_exl3_rows_nax_pend", &ROWS_PEND_INS, &.{"y"}, ROWS_NAX_PEND_SOURCE, ROWS_NAX_FRAGS);
+    return kernel_src.codebookKernelWith(&rows_pend_kernel, "sushi_exl3_rows_pend", &ROWS_PEND_INS, &.{"y"}, ROWS_PEND_SOURCE, ROWS_HELPERS);
+}
 
 pub fn rowsKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
     if (g.nax) return kernel_src.codebookKernelWith(&rows_nax_kernel, "sushi_exl3_rows_nax", &ROWS_INS, &.{"y"}, ROWS_NAX_SOURCE, ROWS_NAX_FRAGS);
@@ -352,14 +701,13 @@ fn rowsChunk(in_dim: c_int, rows: c_int, nsplit: c_int) c_int {
 /// Picked on dependent chains of calls: a threadgroup walking a whole k range is
 /// latency-bound in a forward, so k splits into ranges of at most 512 over at least 320 threadgroups; only an
 /// lm_head-wide output fills the GPU with whole 128-wide blocks and folds the finish.
-pub fn rowsGeometry(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int) RowsGeom {
-    const nax = if (rows_exact) !isLmHead(in_dim, out_dim, groups) else rows >= 2;
-    return rowsGeometryFor(in_dim, out_dim, rows, groups, nax and kernels.gemmNaxOn());
-}
+/// A bench arm: null follows the mode, a value forces the NAX arm on or off at every width.
+pub var nax_force: ?bool = null;
 
-/// A row has the same bytes at every width: the NAX arm at one row too, and for the lm_head, where the SIMD rows arm is
-/// the faster one up to 5 rows and equals its one-row launch bit for bit, the SIMD arm at every width.
-pub var rows_exact: bool = false;
+pub fn rowsGeometry(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: c_int, mode: Mode) RowsGeom {
+    const nax = nax_force orelse if (mode.exact) !isLmHead(in_dim, out_dim, groups) else rows >= 2;
+    return rowsGeometryFor(in_dim, out_dim, rows, groups, n, nax and kernels.gemmNaxOn());
+}
 
 fn isLmHead(in_dim: c_int, out_dim: c_int, groups: c_int) bool {
     return groups == 1 and in_dim == 5120 and out_dim == 129280;
@@ -368,20 +716,42 @@ fn isLmHead(in_dim: c_int, out_dim: c_int, groups: c_int) bool {
 /// DeepSeek's trunk linears on the NAX arm: `kph` simdgroups split a threadgroup's k range and sum in threadgroup
 /// memory, so a launch needs fewer k-split partials (none, and no finish dispatch, at `nsplit` 1). The geometry never
 /// depends on the row count, which keeps a row's bytes equal at every width.
-const NaxTuned = struct { in_dim: c_int, out_dim: c_int, groups: c_int, kph: c_int, nsplit: c_int };
+const NaxSplit = struct { kph: c_int, nsplit: c_int };
+/// `ultra_k5`: the split a K5 bank takes on the widest desktop class (an M5 Ultra); every other box and rate keeps
+/// `kph`/`nsplit`. A different split sums in another order, so the bytes differ by GPU class.
+const NaxTuned = struct { in_dim: c_int, out_dim: c_int, groups: c_int, kph: c_int, nsplit: c_int, ultra_k5: ?NaxSplit = null };
 
 const NAX_TUNED = [_]NaxTuned{
     .{ .in_dim = 5120, .out_dim = 1792, .groups = 1, .kph = 4, .nsplit = 5 },
-    .{ .in_dim = 1280, .out_dim = 32768, .groups = 1, .kph = 4, .nsplit = 1 },
-    .{ .in_dim = 4096, .out_dim = 1024, .groups = 8, .kph = 4, .nsplit = 8 },
-    .{ .in_dim = 8192, .out_dim = 5120, .groups = 1, .kph = 2, .nsplit = 4 },
+    .{ .in_dim = 1280, .out_dim = 32768, .groups = 1, .kph = 4, .nsplit = 1, .ultra_k5 = .{ .kph = 2, .nsplit = 1 } },
+    .{ .in_dim = 4096, .out_dim = 1024, .groups = 8, .kph = 4, .nsplit = 8, .ultra_k5 = .{ .kph = 4, .nsplit = 2 } },
+    .{ .in_dim = 8192, .out_dim = 5120, .groups = 1, .kph = 2, .nsplit = 4, .ultra_k5 = .{ .kph = 2, .nsplit = 8 } },
     .{ .in_dim = 5120, .out_dim = 129280, .groups = 1, .kph = 1, .nsplit = 2 },
 };
 
-fn rowsGeometryFor(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, nax: bool) RowsGeom {
+/// The NAX arm walks two k-tiles' fragments ahead of their MMAs at one simdgroup per pair, on 32-bit funnels: a one-row
+/// trunk launch is bound by the fragment reads and decode, not the MMA.
+fn rowsGeometryFor(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: c_int, nax: bool) RowsGeom {
+    var g = rowsLaunch(in_dim, out_dim, rows, groups, n, nax);
+    if (g.nax) {
+        g.r32 = true;
+        g.sw = true;
+        if (g.kph == 1) g.unr = 2;
+    }
+    return g;
+}
+
+/// A bench arm: forces the NAX arm's `kph` and `nsplit` at every shape.
+pub var nax_geom_force: ?struct { kph: c_int, nsplit: c_int } = null;
+
+fn rowsLaunch(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: c_int, nax: bool) RowsGeom {
+    if (nax) if (nax_geom_force) |f| return .{ .tgrp = 4, .kph = f.kph, .nsplit = f.nsplit, .chunk = rowsChunk(in_dim, rows, f.nsplit), .nax = true };
     if (nax) for (NAX_TUNED) |t| {
-        if (t.in_dim == in_dim and t.out_dim == out_dim and t.groups == groups)
-            return .{ .tgrp = 4, .kph = t.kph, .nsplit = t.nsplit, .chunk = rowsChunk(in_dim, rows, t.nsplit), .nax = true };
+        if (t.in_dim == in_dim and t.out_dim == out_dim and t.groups == groups) {
+            const base: NaxSplit = .{ .kph = t.kph, .nsplit = t.nsplit };
+            const g = if (n == 80 and device.current().class == .d) t.ultra_k5 orelse base else base;
+            return .{ .tgrp = 4, .kph = g.kph, .nsplit = g.nsplit, .chunk = rowsChunk(in_dim, rows, g.nsplit), .nax = true };
+        }
     };
     if (@divExact(out_dim, 128) * groups >= 1024) return .{ .tgrp = 4, .kph = if (nax) 1 else 2, .nsplit = 1, .chunk = rowsChunk(in_dim, rows, 1), .nax = nax };
     const blocks = @divExact(in_dim, 128);
@@ -394,24 +764,45 @@ fn rowsGeometryFor(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, na
     return .{ .tgrp = if (rows >= 2) 2 else 1, .kph = 4, .nsplit = nsplit, .chunk = rowsChunk(in_dim, rows, nsplit) };
 }
 
-/// `y[r] = svh * H128(W . H128(suh * x[r]))` for every row of `x` (`[rows, in]` f16, bf16 or f32, rows 1..8), over one
+/// `y[r] = svh * H128(W . H128(suh * x[r]))` for every row of `x` (`[rows, in]` f16, bf16 or f32, rows 1 to `rowsMax(mode)`), over one
 /// trellis `[in/16, out/16, n]` (or a one-matrix bank), its `suh [in]` and `svh [out]`: `projectIndexed`'s
 /// numbers, each weight decoded once for all rows. Returns `[rows, out]` in x's dtype, rounded once from the f32 sum. A bank `[G, in/16, out/16, n]` takes
 /// `x` `[G * rows, in]`, group g's rows contiguous, `suh [G, in]` and `svh [G, out]`, and returns `[G * rows, out]`.
-pub fn projectRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array) !mlx.mlx_array {
+pub fn projectRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, mode: Mode) !mlx.mlx_array {
     const xs = mlx.getShape(x);
     const ts = mlx.getShape(trellis);
     if (xs.len != 2 or ts.len < 3) return error.BadExl3Shape;
     const groups: c_int = if (ts.len == 4) ts[0] else 1;
-    const g = rowsGeometry(xs[1], ts[ts.len - 2] * 16, @divExact(xs[0], groups), groups);
-    return projectRowsWith(s, x, trellis, suh, svh, g, try rowsKernel(g), null);
+    const rows = @divExact(xs[0], groups);
+    const out = ts[ts.len - 2] * 16;
+    const g = rowsGeometry(xs[1], out, rows, groups, ts[ts.len - 1], mode);
+    if (g.nax or groups != 1 or rows <= PROJECT_ROWS_MAX or rows > rowsMax(mode)) return projectRowsWith(s, x, trellis, suh, svh, g, try rowsKernel(g), null);
+    // A SIMD launch holds `PROJECT_ROWS_MAX` rows and sums a row the same at every count: a wider call goes in halves.
+    const half = @divFloor(rows + 1, 2);
+    var parts: [2]mlx.mlx_array = @splat(.{});
+    defer for (parts) |part| {
+        _ = mlx.mlx_array_free(part);
+    };
+    for (&parts, [_][2]c_int{ .{ 0, half }, .{ half, rows } }) |*part, span| {
+        var xp: mlx.mlx_array = .{};
+        defer _ = mlx.mlx_array_free(xp);
+        try mlx.check(mlx.mlx_slice(&xp, x, &[_]c_int{ span[0], 0 }, 2, &[_]c_int{ span[1], xs[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        const gp = rowsGeometry(xs[1], out, span[1] - span[0], 1, ts[ts.len - 1], mode);
+        part.* = try projectRowsWith(s, xp, trellis, suh, svh, gp, try rowsKernel(gp), null);
+    }
+    const joined = mlx.mlx_vector_array_new_data(&parts, parts.len);
+    defer _ = mlx.mlx_vector_array_free(joined);
+    var y: mlx.mlx_array = .{};
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_concatenate_axis(&y, joined, 0, s));
+    return y;
 }
 
 /// `projectRows` over linears that share their input, stacked along the output (one trellis `[1, in/16, out/16, n]`,
 /// `suh [S, in]` one row per linear, `svh [out]`): linear s owns the columns from `bounds[s - 1]` (0 for s = 0) to
 /// `bounds[s]` (`out` past the last), every bound a multiple of 128. Returns `[rows * out]`, each linear's
 /// `[rows, width]` contiguous at `start * rows`.
-pub fn projectRowsSegmented(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, bounds: [3]c_int) !mlx.mlx_array {
+pub fn projectRowsSegmented(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, bounds: [3]c_int, mode: Mode) !mlx.mlx_array {
     const xs = mlx.getShape(x);
     const ts = mlx.getShape(trellis);
     if (xs.len != 2 or ts.len != 4 or ts[0] != 1) return error.BadExl3Shape;
@@ -424,7 +815,7 @@ pub fn projectRowsSegmented(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.ml
         prev = b;
     }
     if (mlx.mlx_array_size(suh) != segs * @as(usize, @intCast(xs[1]))) return error.BadExl3Shape;
-    const g = rowsGeometry(xs[1], out, xs[0], 1);
+    const g = rowsGeometry(xs[1], out, xs[0], 1, ts[3], mode);
     const y = try projectRowsWith(s, x, trellis, suh, svh, g, try rowsKernel(g), bounds);
     defer _ = mlx.mlx_array_free(y);
     var flat = mlx.mlx_array_new();
@@ -441,57 +832,278 @@ pub fn projectRowsWith(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_arr
     const rows = @divExact(xs[0], groups);
     const in_dim = xs[1];
     const out_tiles = ts[ts.len - 2];
-    if (rows < 1 or rows > PROJECT_ROWS_MAX or @rem(in_dim, 128) != 0 or ts[ts.len - 3] * 16 != in_dim or @rem(out_tiles, 8) != 0) return error.BadExl3Shape;
+    if (rows < 1 or rows > (if (g.nax) NAX_ROWS_MAX else PROJECT_ROWS_MAX) or @rem(in_dim, 128) != 0 or ts[ts.len - 3] * 16 != in_dim or @rem(out_tiles, 8) != 0) return error.BadExl3Shape;
     switch (mlx.mlx_array_dtype(x)) {
         .float16, .bfloat16, .float32 => {},
         else => return error.BadExl3Shape,
     }
     if (mlx.mlx_array_dtype(trellis) != .uint16) return error.BadExl3Shape;
-    const out_dim = out_tiles * 16;
-    const out_dt = mlx.mlx_array_dtype(x);
     const rate = try kernels.packedRate(ts[ts.len - 1]);
+    return launchRows(s, x, trellis, suh, svh, .{ .in_dim = in_dim, .out_dim = out_tiles * 16, .rows = rows, .groups = groups, .n = rate.n, .out_dt = mlx.mlx_array_dtype(x) }, g, kernel, seg_bounds, null);
+}
+
+/// What one multi-row launch reads off its operands: their shapes, the rate and `x`'s dtype.
+pub const RowsLaunch = struct { in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: u32, out_dt: mlx.mlx_dtype };
+
+/// The configs of a launch, kept for good so a call looks neither up: the kernel's and, when its k split needs a
+/// finish, the finish kernel's.
+pub const PinnedCfg = struct { cfg: mlx.mlx_fast_metal_kernel_config, finish: ?mlx.mlx_fast_metal_kernel_config };
+
+var pinned: std.ArrayList(struct { key: RowsKey, cfgs: PinnedCfg }) = .empty;
+
+/// `l`'s configs under `g`, built on first ask and never freed: one set per distinct launch, which the model's shapes
+/// bound. For a load to call, not a forward.
+pub fn pinCfg(l: RowsLaunch, g: RowsGeom, seg_bounds: ?[3]c_int) !PinnedCfg {
+    const bounds = seg_bounds orelse @as([3]c_int, @splat(l.out_dim));
+    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g };
+    for (pinned.items) |p| if (std.meta.eql(p.key, key)) return p.cfgs;
+    const cfg = try buildRowsCfg(l, g, bounds, .{}, null);
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const finish: ?mlx.mlx_fast_metal_kernel_config = if (rowsFolds(g)) null else try buildFinishCfg(l, g.nsplit, bounds, null);
+    try pinned.append(std.heap.page_allocator, .{ .key = key, .cfgs = .{ .cfg = cfg, .finish = finish } });
+    return pinned.items[pinned.items.len - 1].cfgs;
+}
+
+/// `tmpl_rows`: the ROWS the kernel is compiled at (null: `l.rows`); a dynamic-rows kernel takes the cap's.
+fn buildRowsCfg(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, pend: Pending, tmpl_rows: ?c_int) !mlx.mlx_fast_metal_kernel_config {
     const fold = rowsFolds(g);
-    const bounds = seg_bounds orelse @as([3]c_int, @splat(out_dim));
-    const key = RowsKey{ .in_dim = in_dim, .out_dim = out_dim, .rows = rows, .groups = groups, .n = rate.n, .out_dt = out_dt, .bounds = bounds, .geom = g };
-    const cfg = rows_cfgs.get(key) orelse blk: {
-        const c = mlx.mlx_fast_metal_kernel_config_new();
-        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        const sgs = g.tgrp * g.kph;
-        const out_shape = [_]c_int{ groups * if (fold) rows else rows * g.nsplit, out_dim };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &out_shape, 2, if (fold) out_dt else .float32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", out_dt));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(out_tiles, 2 * g.tgrp) * sgs * 32, g.nsplit, groups));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, sgs * 32, 1, 1));
-        inline for (.{ "IDIM", "ODIM", "ROWS", "GROUPS", "TGRP", "KPH", "NSPLIT", "CHUNK", "FOLD" }, .{ in_dim, out_dim, rows, groups, g.tgrp, g.kph, g.nsplit, g.chunk, @as(c_int, @intFromBool(fold)) }) |name, v|
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, v));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(rate.n)));
-        inline for (.{ "SB1", "SB2", "SB3" }, 0..) |name, i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, bounds[i]));
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const sgs = g.tgrp * g.kph;
+    const out_shape = [_]c_int{ l.groups * if (fold) l.rows else l.rows * g.nsplit, l.out_dim };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &out_shape, 2, if (fold) l.out_dt else .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", l.out_dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(@divExact(l.out_dim, 16), 2 * g.tgrp) * sgs * 32, g.nsplit, l.groups));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, sgs * 32, 1, 1));
+    inline for (.{ "IDIM", "ODIM", "ROWS", "GROUPS", "TGRP", "KPH", "NSPLIT", "CHUNK", "FOLD" }, .{ l.in_dim, l.out_dim, tmpl_rows orelse l.rows, l.groups, g.tgrp, g.kph, g.nsplit, g.chunk, @as(c_int, @intFromBool(fold)) }) |name, v|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, v));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(l.n)));
+    if (g.nax) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "UNR", g.unr));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "R32", @intFromBool(g.r32)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "SW", @intFromBool(g.sw)));
+    }
+    inline for (.{ "SB1", "SB2", "SB3" }, 0..) |name, i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, bounds[i]));
+    if (pend.xsplit > 0) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "XSPLIT", pend.xsplit));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "XODIM", pend.xodim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "XT", pend.xdt));
+    }
+    return c;
+}
+
+/// `projectRowsWith` for operands whose shapes the caller holds already (`l`), with configs it may have pinned.
+pub fn launchRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, seg_bounds: ?[3]c_int, pin: ?PinnedCfg) !mlx.mlx_array {
+    const fold = rowsFolds(g);
+    const bounds = seg_bounds orelse @as([3]c_int, @splat(l.out_dim));
+    if (dyn_rows and g.nax) return launchRowsDyn(s, x, trellis, suh, svh, l, g, bounds);
+    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g };
+    const cfg = if (pin) |p| p.cfg else rows_cfgs.get(key) orelse blk: {
+        const c = try buildRowsCfg(l, g, bounds, .{}, null);
         rows_cfgs.put(key, c);
         break :blk c;
     };
     const ov = try kernels.applyOuts(s, kernel, &.{ x, trellis, suh, svh }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
+    // One owner: the fold hands `y` out and leaves the defer an empty handle.
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
+    if (fold) {
+        const whole = y;
+        y = mlx.mlx_array_new();
+        return whole;
+    }
+    return rowsFinish(s, y, svh, l, g.nsplit, bounds, if (pin) |p| p.finish else null);
+}
+
+/// The first columns of a stacked launch's output to leave rms-normed: `w` `[cols]` in the output's dtype, `eps` an
+/// f32 array whose first value is the norm's epsilon.
+pub const Norm = struct { w: mlx.mlx_array, eps: mlx.mlx_array, cols: c_int };
+
+/// Whether `launchRowsNormed` serves `l` under `g` with `bounds` and `norm`: a one-bank launch with a finish, its row
+/// one threadgroup wide, the normed columns its first segment, in `w`'s dtype.
+pub fn normedFits(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, norm: Norm) bool {
+    return l.groups == 1 and !rowsFolds(g) and l.out_dim <= 4096 and norm.cols >= 128 and @rem(norm.cols, 128) == 0 and norm.cols <= bounds[0] and
+        mlx.mlx_array_dtype(norm.w) == l.out_dt and mlx.mlx_array_size(norm.w) == @as(usize, @intCast(norm.cols)) and norm.cols == @min(bounds[0], l.out_dim);
+}
+
+/// `launchRows` of a stacked launch with `mlx_fast_rms_norm(first segment, norm.w, eps)` in place of the first
+/// segment: the bytes of the launch, its finish and the norm, in one dispatch fewer.
+pub fn launchRowsNormed(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, bounds: [3]c_int, pin: ?PinnedCfg, norm: Norm) !mlx.mlx_array {
+    if (!normedFits(l, g, bounds, norm)) return error.BadExl3Shape;
+    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = 1, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g };
+    const cfg = if (pin) |p| p.cfg else rows_cfgs.get(key) orelse blk: {
+        const c = try buildRowsCfg(l, g, bounds, .{}, null);
+        rows_cfgs.put(key, c);
+        break :blk c;
+    };
+    const pv = try kernels.applyOuts(s, kernel, &.{ x, trellis, suh, svh }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(pv);
+    var part = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(part);
+    try mlx.check(mlx.mlx_vector_array_get(&part, pv, 0));
+    const fkey = RowsFinishRmsKey{ .out_dim = l.out_dim, .rows = l.rows, .nsplit = g.nsplit, .out_dt = l.out_dt, .bounds = bounds, .norm = norm.cols };
+    const fcfg = rows_finish_rms_cfgs.get(fkey) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const threads = @divExact(l.out_dim, 4);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ l.rows, l.out_dim }, 2, l.out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", l.out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, threads, l.rows, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, threads, 1, 1));
+        inline for (.{ "ODIM", "ROWS", "NSPLIT", "NORM" }, .{ l.out_dim, l.rows, g.nsplit, norm.cols }) |name, v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, v));
+        inline for (.{ "SB1", "SB2", "SB3" }, 0..) |name, i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, bounds[i]));
+        rows_finish_rms_cfgs.put(fkey, c);
+        break :blk c;
+    };
+    const fk = try kernels.getNamedKernel(&rows_finish_rms_kernel, "sushi_exl3_rows_finish_rms", &.{ "part", "svh", "w", "eps" }, &.{"y"}, ROWS_FINISH_RMS_SOURCE, ROWS_HELPERS);
+    const ov = try kernels.applyOuts(s, fk, &.{ part, svh, norm.w, norm.eps }, fcfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
     var y = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(y);
     try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
-    if (fold) return y;
-    defer _ = mlx.mlx_array_free(y);
-    return rowsFinish(s, y, svh, out_dim, rows, groups, g.nsplit, out_dt, bounds);
+    return y;
 }
 
-fn rowsFinish(s: mlx.mlx_stream, part: mlx.mlx_array, svh: mlx.mlx_array, out_dim: c_int, rows: c_int, groups: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, bounds: [3]c_int) !mlx.mlx_array {
-    const key = RowsFinishKey{ .out_dim = out_dim, .rows = rows, .groups = groups, .nsplit = nsplit, .out_dt = out_dt, .bounds = bounds };
-    const cfg = rows_finish_cfgs.get(key) orelse blk: {
+/// `launchRows` without its finish, for a launch that has one (`g` does not fold): the k-split partials
+/// `[groups * rows * nsplit, out]` in f32, which `launchRowsFrom` reads.
+pub fn launchRowsParts(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom) !mlx.mlx_array {
+    if (rowsFolds(g)) return error.BadExl3Shape;
+    const bounds: [3]c_int = @splat(l.out_dim);
+    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g };
+    const cfg = rows_cfgs.get(key) orelse blk: {
+        const c = try buildRowsCfg(l, g, bounds, .{}, null);
+        rows_cfgs.put(key, c);
+        break :blk c;
+    };
+    const ov = try kernels.applyOuts(s, try rowsKernel(g), &.{ x, trellis, suh, svh }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var part = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(part);
+    try mlx.check(mlx.mlx_vector_array_get(&part, ov, 0));
+    return part;
+}
+
+/// `launchRows` whose input rows are `part`, the partials `launchRowsParts` made under `pend` (`xsvh` that launch's
+/// svh): input column `g * pend.xodim + c` of row r is that launch's finished `[g, r, c]`. The bytes of the two launches
+/// with a finish between them, one dispatch fewer. With `expand` (fitted to `l` and `g`) the finish expands the rows into it.
+pub fn launchRowsFrom(s: mlx.mlx_stream, part: mlx.mlx_array, xsvh: mlx.mlx_array, pend: Pending, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, expand: ?Fitted) !mlx.mlx_array {
+    if (pend.xsplit < 1 or l.groups != 1 or @rem(pend.xodim, 128) != 0 or @rem(l.in_dim, pend.xodim) != 0) return error.BadExl3Shape;
+    const fold = rowsFolds(g);
+    const bounds: [3]c_int = @splat(l.out_dim);
+    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = 1, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g, .pend = pend };
+    const cfg = rows_cfgs.get(key) orelse blk: {
+        const c = try buildRowsCfg(l, g, bounds, pend, null);
+        rows_cfgs.put(key, c);
+        break :blk c;
+    };
+    const ov = try kernels.applyOuts(s, try rowsPendKernel(g), &.{ part, trellis, suh, svh, xsvh }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
+    if (fold) {
+        const whole = y;
+        y = mlx.mlx_array_new();
+        return whole;
+    }
+    if (expand) |e| return rowsFinishExpand(s, y, svh, l, g.nsplit, e);
+    return rowsFinish(s, y, svh, l, g.nsplit, bounds, null);
+}
+
+/// The streams a one-bank launch's row is expanded into by its finish: `x` `[rows, hc, out]` in the output's dtype,
+/// `post` `[rows, hc]` and `comb` `[rows, hc, hc]` in f32. The launch then gives `[rows, hc, out]`.
+pub const Expand = struct { x: mlx.mlx_array, post: mlx.mlx_array, comb: mlx.mlx_array };
+
+/// Most streams a finish expands into.
+pub const EXPAND_MAX_HC: c_int = 8;
+
+/// The partials `part` of a bank launch that has a finish (`launchRowsParts`), finished with the banks side by side in
+/// each row: `[rows, groups * out]`, the transpose of the bank-major rows without its copy.
+pub fn rowsFinishRowMajor(s: mlx.mlx_stream, part: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, nsplit: c_int) !mlx.mlx_array {
+    const bounds: [3]c_int = @splat(l.out_dim);
+    const key = RowsFinishKey{ .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .nsplit = nsplit, .out_dt = l.out_dt, .bounds = bounds };
+    const cfg = rows_finish_row_major_cfgs.get(key) orelse blk: {
+        const c = try buildFinishCfg(l, nsplit, bounds, null);
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "GRP", l.groups));
+        rows_finish_row_major_cfgs.put(key, c);
+        break :blk c;
+    };
+    const kernel = try kernels.getNamedKernel(&rows_finish_row_major_kernel, "sushi_exl3_rows_finish_row_major", &.{ "part", "svh" }, &.{"y"}, ROWS_FINISH_ROW_MAJOR_SOURCE, ROWS_HELPERS);
+    const ov = try kernels.applyOuts(s, kernel, &.{ part, svh }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_vector_array_get(&flat, ov, 0));
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_reshape(&y, flat, &[_]c_int{ l.rows, l.groups * l.out_dim }, 2, s));
+    return y;
+}
+
+/// An expand a launch's finish serves; only `fitExpand` makes one.
+pub const Fitted = struct { e: Expand, hc: c_int };
+
+/// `e` as the finish of `l` under `g` expands into it, or null where it cannot: a one-bank launch with a finish, in
+/// the streams' dtype and shape.
+pub fn fitExpand(l: RowsLaunch, g: RowsGeom, e: Expand) ?Fitted {
+    const xs = mlx.getShape(e.x);
+    if (l.groups != 1 or rowsFolds(g) or xs.len != 3 or xs[0] != l.rows or xs[1] < 1 or xs[1] > EXPAND_MAX_HC or xs[2] != l.out_dim or mlx.mlx_array_dtype(e.x) != l.out_dt) return null;
+    return .{ .e = e, .hc = xs[1] };
+}
+
+/// The partials `part` of the launch `f` was fitted to, finished into its streams.
+pub fn rowsFinishExpand(s: mlx.mlx_stream, part: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, nsplit: c_int, f: Fitted) !mlx.mlx_array {
+    const hc = f.hc;
+    const e = f.e;
+    const key = RowsFinishExpandKey{ .out_dim = l.out_dim, .rows = l.rows, .nsplit = nsplit, .out_dt = l.out_dt, .hc = hc };
+    const cfg = rows_finish_expand_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ groups * rows, out_dim }, 2, out_dt));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", out_dt));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(out_dim, 128) * 32, rows, groups));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ l.rows, hc, l.out_dim }, 3, l.out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", l.out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(l.out_dim, 128) * 32, l.rows, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ROWS", rows));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", l.out_dim));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NSPLIT", nsplit));
-        inline for (.{ "SB1", "SB2", "SB3" }, 0..) |name, i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, bounds[i]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "HC", hc));
+        rows_finish_expand_cfgs.put(key, c);
+        break :blk c;
+    };
+    const kernel = try kernels.getNamedKernel(&rows_finish_expand_kernel, "sushi_exl3_rows_finish_expand", &.{ "part", "svh", "x", "post", "comb" }, &.{"y"}, ROWS_FINISH_EXPAND_SOURCE, ROWS_HELPERS);
+    const ov = try kernels.applyOuts(s, kernel, &.{ part, svh, e.x, e.post, e.comb }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
+    return y;
+}
+
+/// Whether `g`'s launch leaves partials a finish sums (`launchRowsParts` serves it).
+pub fn hasFinish(g: RowsGeom) bool {
+    return !rowsFolds(g);
+}
+
+fn buildFinishCfg(l: RowsLaunch, nsplit: c_int, bounds: [3]c_int, tmpl_rows: ?c_int) !mlx.mlx_fast_metal_kernel_config {
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ l.groups * l.rows, l.out_dim }, 2, l.out_dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", l.out_dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(l.out_dim, 128) * 32, l.rows, l.groups));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", l.out_dim));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ROWS", tmpl_rows orelse l.rows));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NSPLIT", nsplit));
+    inline for (.{ "SB1", "SB2", "SB3" }, 0..) |name, i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, bounds[i]));
+    return c;
+}
+
+fn rowsFinish(s: mlx.mlx_stream, part: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, nsplit: c_int, bounds: [3]c_int, pin: ?mlx.mlx_fast_metal_kernel_config) !mlx.mlx_array {
+    const key = RowsFinishKey{ .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .nsplit = nsplit, .out_dt = l.out_dt, .bounds = bounds };
+    const cfg = pin orelse rows_finish_cfgs.get(key) orelse blk: {
+        const c = try buildFinishCfg(l, nsplit, bounds, null);
         rows_finish_cfgs.put(key, c);
         break :blk c;
     };
@@ -533,7 +1145,7 @@ const RowsRig = struct {
             const mag = std.math.exp2(rnd.float(f32) * 4 - 2);
             e.* = exl3.f32ToF16Bits(if (rnd.boolean()) mag else -mag);
         };
-        const xh = try alloc.alloc(u16, groups * @as(usize, @intCast(PROJECT_ROWS_MAX)) * in);
+        const xh = try alloc.alloc(u16, groups * @as(usize, @intCast(NAX_ROWS_MAX)) * in);
         for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
         return .{ .in = in, .out = out, .groups = groups, .n = n, .tr = tr, .suh = suh, .svh = svh, .xh = xh };
     }
@@ -541,17 +1153,17 @@ const RowsRig = struct {
     /// Rows `first..first + rows` of every group through `kernel` under `geom`.
     fn run(self: RowsRig, alloc: std.mem.Allocator, first: usize, rows: usize, geom: RowsGeom, kernel: mlx.mlx_fast_metal_kernel) ![]const u16 {
         const s = mlx.gpuStream();
-        const pool: usize = @intCast(PROJECT_ROWS_MAX);
+        const pool: usize = @intCast(NAX_ROWS_MAX);
         const xs = try alloc.alloc(u16, self.groups * rows * self.in);
         for (0..self.groups) |g| @memcpy(xs[g * rows * self.in ..][0 .. rows * self.in], self.xh[(g * pool + first) * self.in ..][0 .. rows * self.in]);
         const rate: exl3.Rate = .{ .n = self.n };
-        const x = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ @intCast(self.groups * rows), @intCast(self.in) }, 2, .float16);
+        const x = try host_side.made(mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ @intCast(self.groups * rows), @intCast(self.in) }, 2, .float16));
         defer _ = mlx.mlx_array_free(x);
-        const tr = mlx.mlx_array_new_data(self.tr.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.in / 16), @intCast(self.out / 16), @intCast(rate.halfwords()) }, 4, .uint16);
+        const tr = try host_side.made(mlx.mlx_array_new_data(self.tr.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.in / 16), @intCast(self.out / 16), @intCast(rate.halfwords()) }, 4, .uint16));
         defer _ = mlx.mlx_array_free(tr);
-        const suh = mlx.mlx_array_new_data(self.suh.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.in) }, 2, .float16);
+        const suh = try host_side.made(mlx.mlx_array_new_data(self.suh.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.in) }, 2, .float16));
         defer _ = mlx.mlx_array_free(suh);
-        const svh = mlx.mlx_array_new_data(self.svh.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.out) }, 2, .float16);
+        const svh = try host_side.made(mlx.mlx_array_new_data(self.svh.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.out) }, 2, .float16));
         defer _ = mlx.mlx_array_free(svh);
         const y = try projectRowsWith(s, x, tr, suh, svh, geom, kernel, null);
         defer _ = mlx.mlx_array_free(y);
@@ -559,6 +1171,30 @@ const RowsRig = struct {
         defer _ = mlx.mlx_array_free(yc);
         const got = try kernels.evalF16(s, y, &yc);
         return alloc.dupe(u16, @as([*]const u16, @ptrCast(got))[0 .. self.groups * rows * self.out]);
+    }
+
+    /// Rows `first..first + rows` of a one-bank rig through `projectRows` in `mode`, on the stream `s`.
+    fn project(self: RowsRig, alloc: std.mem.Allocator, s: mlx.mlx_stream, first: usize, rows: usize, mode: Mode) ![]const u16 {
+        var held: [4]mlx.mlx_array = undefined;
+        {
+            const host = mlx.engine.enter(s);
+            defer host.end();
+            held = .{
+                try host_side.made(mlx.mlx_array_new_data(self.xh[first * self.in ..].ptr, &[_]c_int{ @intCast(rows), @intCast(self.in) }, 2, .float16)),
+                try host_side.made(mlx.mlx_array_new_data(self.tr.ptr, &[_]c_int{ 1, @intCast(self.in / 16), @intCast(self.out / 16), @intCast(self.n) }, 4, .uint16)),
+                try host_side.made(mlx.mlx_array_new_data(self.suh.ptr, &[_]c_int{ 1, @intCast(self.in) }, 2, .float16)),
+                try host_side.made(mlx.mlx_array_new_data(self.svh.ptr, &[_]c_int{ 1, @intCast(self.out) }, 2, .float16)),
+            };
+        }
+        defer for (held) |h| {
+            _ = mlx.mlx_array_free(h);
+        };
+        const y = try projectRows(s, held[0], held[1], held[2], held[3], mode);
+        defer _ = mlx.mlx_array_free(y);
+        var yc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(yc);
+        const got = try kernels.evalF16(s, y, &yc);
+        return alloc.dupe(u16, @as([*]const u16, @ptrCast(got))[0 .. rows * self.out]);
     }
 };
 
@@ -568,19 +1204,14 @@ const SIMD_ROWS_DECODES = [_]struct { dec: exl3.Decode, n: u32 }{
     .{ .dec = .{ .codebook = .mcg, .window = .w15 }, .n = 48 },
 };
 
-fn rowsBaselineKernel() !mlx.mlx_fast_metal_kernel {
-    return kernel_src.codebookKernelWith(&kernels.rows_baseline_kernel, "sushi_exl3_rows_baseline", &ROWS_INS, &.{"y"}, kernels.ROWS_BASELINE_SOURCE, ROWS_HELPERS);
-}
-
 test "exl3 multi-row projection matches projectIndexed per row against the f64 projection" {
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
     const shapes = [_][2]usize{ .{ 512, 640 }, .{ 6144, 384 } };
-    for (0..kernels.PARITY_SEEDS) |i| {
-        for ([_]u32{ 40, 64, 112 }) |n| {
-            for (shapes) |sh| {
-                for (1..5) |rows| {
-                    try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = sh[0], .in_dim = sh[1], .rows = rows, .seed = 1301 + i }));
-                }
+    // One row takes the one-row arm, three the multi-row arm.
+    for ([_]u32{ 40, 64, 112 }) |n| {
+        for (shapes) |sh| {
+            for ([_]usize{ 1, 3 }) |rows| {
+                try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = sh[0], .in_dim = sh[1], .rows = rows, .seed = 1301 }));
             }
         }
     }
@@ -588,22 +1219,23 @@ test "exl3 multi-row projection matches projectIndexed per row against the f64 p
 
 test "exl3 multi-row projection holds the bar on every launch geometry and at eight rows" {
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    // The launch classes `rowsGeometryFor` serves: SIMD folded (lm_head-wide), one-row and multi-row k splits; NAX at one
+    // simdgroup per pair folded and split, and at sliced k folded and split, each with its served fragment reader.
     const geoms = [_]RowsGeom{
-        .{ .tgrp = 4, .kph = 4, .nsplit = 1, .chunk = 256 },
         .{ .tgrp = 4, .kph = 2, .nsplit = 1, .chunk = 768 },
-        .{ .tgrp = 4, .kph = 1, .nsplit = 2, .chunk = 384 },
         .{ .tgrp = 1, .kph = 4, .nsplit = 3, .chunk = 128 },
-        .{ .tgrp = 2, .kph = 1, .nsplit = 6, .chunk = 128 },
-        .{ .tgrp = 4, .kph = 1, .nsplit = 1, .chunk = 256, .nax = true },
-        .{ .tgrp = 4, .kph = 1, .nsplit = 3, .chunk = 256, .nax = true },
-        .{ .tgrp = 4, .kph = 4, .nsplit = 1, .chunk = 256, .nax = true },
-        .{ .tgrp = 4, .kph = 2, .nsplit = 3, .chunk = 256, .nax = true },
-        .{ .tgrp = 4, .kph = 3, .nsplit = 2, .chunk = 384, .nax = true },
-        .{ .tgrp = 4, .kph = 8, .nsplit = 1, .chunk = 256, .nax = true },
+        .{ .tgrp = 2, .kph = 4, .nsplit = 2, .chunk = 384 },
+        .{ .tgrp = 4, .kph = 1, .nsplit = 1, .chunk = 0, .nax = true, .unr = 2, .r32 = true, .sw = true },
+        .{ .tgrp = 4, .kph = 1, .nsplit = 3, .chunk = 0, .nax = true, .unr = 2, .r32 = true, .sw = true },
+        .{ .tgrp = 4, .kph = 4, .nsplit = 1, .chunk = 0, .nax = true, .r32 = true, .sw = true },
+        .{ .tgrp = 4, .kph = 2, .nsplit = 3, .chunk = 0, .nax = true, .r32 = true, .sw = true },
     };
-    for (geoms, 0..) |g, gi| {
-        if (g.nax and !kernels.gemmNaxOn()) continue;
-        for ([_]usize{ 1, 3, 8 }) |rows| {
+    for (geoms, 0..) |g0, gi| {
+        if (g0.nax and !kernels.gemmNaxOn()) continue;
+        for ([_]usize{ 1, 8 }) |rows| {
+            var g = g0;
+            if (g.nax) g.chunk = rowsChunk(768, @intCast(rows), g.nsplit);
+            // n48 and n128 take the 64-bit reader, n96 the 32-bit one with its four-word read.
             for ([_]u32{ 48, 96, 128 }) |n| {
                 try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = 1024, .in_dim = 768, .rows = rows, .seed = 1401 + gi, .geom = g }));
             }
@@ -613,9 +1245,11 @@ test "exl3 multi-row projection holds the bar on every launch geometry and at ei
 
 test "exl3 multi-row projection holds the bar at every admitted rate on both kernels" {
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    const nax = rowsGeometryFor(256, 256, 3, 1, 0, true);
     var n: u32 = exl3.Rate.min_n;
     while (n <= exl3.Rate.max_n) : (n += 2) {
         try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = 256, .in_dim = 256, .rows = 3, .seed = 1601 + n, .geom = .{ .tgrp = 1, .kph = 4, .nsplit = 2, .chunk = 128 } }));
+        if (kernels.gemmNaxOn()) try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = 256, .in_dim = 256, .rows = 3, .seed = 1601 + n, .geom = nax }));
     }
 }
 
@@ -639,102 +1273,119 @@ test "exl3 SIMD multi-row: every row equals the one-row launch bit for bit" {
     defer arena.deinit();
     const alloc = arena.allocator();
     defer kernels.setDecodeParams(.mul1);
-    for (SIMD_ROWS_DECODES) |d| {
-        try d.dec.requireTable();
-        kernels.setDecodeParams(d.dec);
-        for ([_][3]usize{ .{ 1024, 512, 1 }, .{ 384, 256, 2 }, .{ 2304, 640, 1 } }) |sh| {
-            const rig = try RowsRig.init(alloc, 0x51d0 + sh[0], sh[0], sh[1], sh[2], d.n);
-            const g1 = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), false);
-            for (1..@as(usize, @intCast(PROJECT_ROWS_MAX)) + 1) |rows| {
-                const g = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), false);
-                const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
-                for (0..rows) |r| {
-                    const one = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
-                    for (0..sh[2]) |grp| try std.testing.expectEqualSlices(u16, one[grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
-                }
-            }
+    // A two-bank launch; linear.zig's exact-rows test holds one-bank launches under the SIMD profile.
+    const d = SIMD_ROWS_DECODES[2];
+    kernels.setDecodeParams(d.dec);
+    const sh = [3]usize{ 384, 256, 2 };
+    const rig = try RowsRig.init(alloc, 0x51d0 + sh[0], sh[0], sh[1], sh[2], d.n);
+    const g1 = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), @intCast(d.n), false);
+    var alone: [@as(usize, @intCast(PROJECT_ROWS_MAX))][]const u16 = undefined;
+    for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
+    for ([_]usize{ 2, @intCast(PROJECT_ROWS_MAX) }) |rows| {
+        const g = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), @intCast(d.n), false);
+        const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
+        for (0..rows) |r| {
+            for (0..sh[2]) |grp| try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
         }
     }
 }
 
-// A NAX multi-row launch sums a row in an order set by its k slicing alone, so a verify row has the same bytes at every
-// width from two up; the served geometry may not read the row count.
-test "exl3 NAX multi-row: a row has the same bytes at widths 2 to 8 under every k slicing" {
+// In exact mode the lm_head keeps the SIMD arm, whose launch holds eight rows, while a wide verify brings up to
+// sixteen: its head rows go eight or fewer at a time, each still its one-row launch.
+test "exl3 multi-row mode: at the lm_head's shape a wide exact verify of 9 to 16 rows gives each row its one-row launch's bits, on MLX's stream and on the engine's" {
+    try mlx.requireGpu();
+    if (rowsMax(.{ .exact = true, .wide = true }) < NAX_ROWS_MAX) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    defer kernels.setDecodeParams(.mul1);
+    const d = SIMD_ROWS_DECODES[1];
+    try d.dec.requireTable();
+    kernels.setDecodeParams(d.dec);
+    const out: usize = 129280;
+    const rig = try RowsRig.init(alloc, 0x1ead, 5120, out, 1, d.n);
+    try std.testing.expect(!rowsGeometry(5120, 129280, 9, 1, 64, .{ .exact = true, .wide = true }).nax);
+    const was = mlx.engine.enabled;
+    defer mlx.engine.enabled = was;
+    for ([_]bool{ false, true }) |on_engine| {
+        mlx.engine.enabled = on_engine;
+        const s = if (on_engine) mlx.engine.stream() else mlx.gpuStream();
+        const pool: usize = @intCast(NAX_ROWS_MAX);
+        const ones = try alloc.alloc(u16, pool * out);
+        for (0..pool) |r| @memcpy(ones[r * out ..][0..out], try rig.project(alloc, s, r, 1, .{ .exact = true }));
+        for ([_]usize{ 9, 13, 16 }) |rows| {
+            const many = try rig.project(alloc, s, 0, rows, .{ .exact = true, .wide = true });
+            try std.testing.expectEqualSlices(u16, ones[0 .. rows * out], many);
+        }
+    }
+}
+
+// Past eight rows the NAX arm feeds the tile's second eight rows, which were zero; a row's sums never see another row's,
+// so a 9- to 16-row verify row keeps the bytes of its one-row decode tick.
+test "exl3 NAX multi-row: at 9 to 16 rows every row equals the one-row launch bit for bit" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s) or !kernels.gemmNaxOn()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     defer kernels.setDecodeParams(.mul1);
-    var failed: usize = 0;
-    for (SIMD_ROWS_DECODES) |d| {
-        try d.dec.requireTable();
-        kernels.setDecodeParams(d.dec);
-        for ([_][3]usize{ .{ 1280, 512, 1 }, .{ 1024, 256, 2 } }) |sh| {
-            const rig = try RowsRig.init(alloc, 0x4a58 + sh[0], sh[0], sh[1], sh[2], d.n);
-            const in: c_int = @intCast(sh[0]);
-            var served: [2]RowsGeom = undefined;
-            for ([_]c_int{ 2, 8 }, &served) |rows, *g| g.* = rowsGeometry(in, @intCast(sh[1]), rows, @intCast(sh[2]));
-            try std.testing.expectEqual(served[0].kph, served[1].kph);
-            try std.testing.expectEqual(served[0].nsplit, served[1].nsplit);
-            const blocks = @divExact(in, 128);
-            for ([_]c_int{ 1, 2, 3, 4, 8 }) |kph| for ([_]c_int{ 1, 2, 4, 5 }) |nsplit| {
-                if (@rem(blocks, nsplit) != 0) continue;
-                const at = RowsGeom{ .tgrp = 4, .kph = kph, .nsplit = nsplit, .chunk = rowsChunk(in, 8, nsplit), .nax = true };
-                const ref = try rig.run(alloc, 0, 8, at, try rowsKernel(at));
-                for (2..8) |rows| {
-                    const g = RowsGeom{ .tgrp = 4, .kph = kph, .nsplit = nsplit, .chunk = rowsChunk(in, @intCast(rows), nsplit), .nax = true };
-                    const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
-                    for (0..sh[2]) |grp| for (0..rows) |r| {
-                        if (std.mem.eql(u16, ref[(grp * 8 + r) * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]])) continue;
-                        std.debug.print("NAX rows differ: n{d} {d}x{d} g{d} kph {d} nsplit {d} rows {d} row {d}\n", .{ d.n, sh[0], sh[1], sh[2], kph, nsplit, rows, r });
-                        failed += 1;
-                    };
-                }
-            };
+    const exact: Mode = .{ .exact = true };
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    const n: u32 = 96;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    // A bank and a deep k split; trunk.zig's wide verify test holds a one-bank launch.
+    for ([_][3]usize{ .{ 1024, 256, 2 }, .{ 131072, 256, 1 } }) |sh| {
+        const rig = try RowsRig.init(alloc, 0x9a16 + sh[0] + n, sh[0], sh[1], sh[2], n);
+        const g1 = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), @intCast(n), exact);
+        var alone: [@as(usize, @intCast(NAX_ROWS_MAX))][]const u16 = undefined;
+        for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
+        // 9 and 16 rows stage the two chunk widths `rowsChunk` gives past eight.
+        for ([_]usize{ 9, @intCast(NAX_ROWS_MAX) }) |rows| {
+            const g = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), @intCast(n), exact);
+            const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
+            for (0..sh[2]) |grp| for (0..rows) |r|
+                try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
         }
     }
-    try std.testing.expectEqual(@as(usize, 0), failed);
 }
 
-test "exl3 SIMD multi-row: the split row loops and the launch policy leave every output byte unchanged" {
+test "exl3 NAX joined rows: one launch at every row total gives each row its one-row launch's bits, folded and k-split" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsGpu(s) or !kernels.gemmNaxOn()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     defer kernels.setDecodeParams(.mul1);
-    const geoms = [_]RowsGeom{
-        .{ .tgrp = 4, .kph = 4, .nsplit = 1, .chunk = 256 },
-        .{ .tgrp = 4, .kph = 2, .nsplit = 1, .chunk = 768 },
-        .{ .tgrp = 4, .kph = 1, .nsplit = 2, .chunk = 384 },
-        .{ .tgrp = 1, .kph = 4, .nsplit = 3, .chunk = 128 },
-        .{ .tgrp = 2, .kph = 4, .nsplit = 2, .chunk = 384 },
-        .{ .tgrp = 2, .kph = 1, .nsplit = 6, .chunk = 128 },
-    };
-    for (SIMD_ROWS_DECODES) |d| {
-        try d.dec.requireTable();
-        kernels.setDecodeParams(d.dec);
-        for ([_]usize{ 1, 2 }) |groups| {
-            const rig = try RowsRig.init(alloc, 0x5b17 + groups, 768, 1024, groups, d.n);
-            for (geoms) |g| for ([_]usize{ 1, 3, 5, 8 }) |rows| {
-                const want = try rig.run(alloc, 0, rows, g, try rowsBaselineKernel());
-                const got = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
-                try std.testing.expectEqualSlices(u16, want, got);
+    const exact: Mode = .{ .exact = true };
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    const n: u32 = 96;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    defer dyn_rows = false;
+    // A bank on the folded launch and a deep k split through the finish.
+    for ([_][3]usize{ .{ 1024, 256, 2 }, .{ 131072, 256, 1 } }) |sh| {
+        const rig = try RowsRig.init(alloc, 0x70a1 + sh[0] + n, sh[0], sh[1], sh[2], n);
+        const g1 = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), @intCast(n), exact);
+        dyn_rows = false;
+        var alone: [@as(usize, @intCast(NAX_ROWS_MAX))][]const u16 = undefined;
+        for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
+        dyn_rows = true;
+        for (1..@as(usize, @intCast(NAX_ROWS_MAX)) + 1) |rows| {
+            const g = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), @intCast(n), exact);
+            const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
+            for (0..sh[2]) |grp| for (0..rows) |r| {
+                errdefer std.debug.print("joined rows: {d}x{d} bank of {d}, {d} rows, row {d} of group {d}\n", .{ sh[0], sh[1], sh[2], rows, r, grp });
+                try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
             };
         }
-        for ([_][3]usize{ .{ 1024, 512, 1 }, .{ 2304, 640, 1 }, .{ 4096, 1024, 8 }, .{ 128, 131072, 1 } }) |sh| {
-            const rig = try RowsRig.init(alloc, 0x5b99 + sh[0], sh[0], sh[1], sh[2], d.n);
-            for (1..@as(usize, @intCast(PROJECT_ROWS_MAX)) + 1) |rows| {
-                const g = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), false);
-                var before = g;
-                if (g.nsplit > 1) before.tgrp = 1;
-                const want = try rig.run(alloc, 0, rows, before, try rowsBaselineKernel());
-                const got = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
-                try std.testing.expectEqualSlices(u16, want, got);
-            }
-        }
+        // Every total ran one template set a cap: eight rows' and the cap's.
+        try std.testing.expectEqual(@as(usize, 2), try dynTemplates(@intCast(sh[0]), @intCast(sh[1]), @intCast(sh[2]), n, exact, .{ .kph = g1.kph, .nsplit = g1.nsplit }));
     }
+    const profile = device.withProfile(device.Profile.from("g17d", .{ .major = 26, .minor = 2 }, false));
+    defer profile.end();
+    try std.testing.expectEqual(@as(usize, 2), try dynTemplates(8192, 5120, 1, 80, exact, .{ .kph = 2, .nsplit = 8 }));
+    try std.testing.expectEqual(@as(usize, 2), try dynTemplates(8192, 5120, 1, 64, exact, .{ .kph = 2, .nsplit = 4 }));
 }
 
 test "exl3 multi-row projection is one dispatch on an lm_head-wide output and two on a narrower one" {
@@ -759,9 +1410,22 @@ test "exl3 multi-row projection is one dispatch on an lm_head-wide output and tw
         const svh = mlx.mlx_array_new_data(ones.ptr, &[_]c_int{c[0]}, 1, .float16);
         defer _ = mlx.mlx_array_free(svh);
         kernels.resetFusedDispatchCount();
-        const y = try projectRows(s, x, tr, suh, svh);
+        const y = try projectRows(s, x, tr, suh, svh, .{});
         defer _ = mlx.mlx_array_free(y);
         try t.expectEqual(@as(u32, @intCast(c[2])), kernels.fusedDispatchCount());
         try t.expectEqualSlices(c_int, &.{ 4, c[0] }, mlx.getShape(y));
     }
+}
+
+test "exl3 multi-row mode: exact puts every width but the lm_head's on the NAX arm, and wide lifts the row ceiling only with exact on NAX" {
+    try mlx.requireGpu();
+    const nax = kernels.gemmNaxOn();
+    try std.testing.expectEqual(PROJECT_ROWS_MAX, rowsMax(.{}));
+    try std.testing.expect(!rowsGeometry(2560, 12288, 1, 1, 64, .{}).nax);
+    try std.testing.expectEqual(nax, rowsGeometry(2560, 12288, 2, 1, 64, .{}).nax);
+    try std.testing.expectEqual(PROJECT_ROWS_MAX, rowsMax(.{ .wide = true }));
+    try std.testing.expectEqual(if (nax) NAX_ROWS_MAX else PROJECT_ROWS_MAX, rowsMax(.{ .exact = true, .wide = true }));
+    try std.testing.expectEqual(nax, rowsGeometry(2560, 12288, 1, 1, 64, .{ .exact = true }).nax);
+    try std.testing.expect(!rowsGeometry(5120, 129280, 1, 1, 64, .{ .exact = true }).nax);
+    try std.testing.expectEqual(PROJECT_ROWS_MAX, rowsMax(.{ .exact = true }));
 }

@@ -8,6 +8,7 @@ const dsv41_config = @import("dsv41/dsv41_config.zig");
 
 /// The fields the vision tower reads of sushi's `ModelConfig`.
 pub const ModelConfig = struct {
+    model_type: []const u8 = "",
     dsv41: ?dsv41_config.Config = null,
     qv_heads: u32 = 0,
     qv_hidden: u32 = 0,
@@ -91,6 +92,11 @@ pub const TensorArray = struct {
 
 /// below it, the scratch copy into a fresh MLX buffer costs less than a page per tensor.
 pub var import_min_bytes: usize = 1 << 20;
+
+/// The size from which the load maps a weight: every weight when the engine holds the weights; `import_min_bytes` on MLX.
+pub fn importFloor(engine_weights: bool) usize {
+    return if (engine_weights) 1 else import_min_bytes;
+}
 
 /// `len` bytes at `offset` as a `shape`/`dtype` array, read around the file cache with the read
 /// and copy of its chunks spread over several threads (`expert_io.ParallelReader`). A large tensor
@@ -197,7 +203,9 @@ fn wrapRegion(region: *MappedRegion, shape: []const c_int, dtype: mlx.mlx_dtype)
 
 /// `region` as an evaluated `shape`/`dtype` array whose buffer is the region itself; the region goes with the array.
 /// A mapping Metal refuses is copied by MLX into its own allocator, which is `error.OwnedImportCopied`.
-pub fn wrapOwned(region: *MappedRegion, shape: []const c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
+pub fn wrapOwned(held: *?*MappedRegion, shape: []const c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    const region = held.*.?;
+    held.* = null;
     const wrapped = try wrapRegion(region, shape, dtype);
     if (wrapped.aliased) return wrapped.array;
     _ = refused_imports.fetchAdd(1, .monotonic);

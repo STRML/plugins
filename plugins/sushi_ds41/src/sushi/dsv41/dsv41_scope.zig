@@ -2,6 +2,7 @@
 //! so a layer's graph is built with `try sc.op(...)` and no per-array bookkeeping.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const exl3 = @import("sushi_exl3");
 
 pub const A = mlx.mlx_array;
 pub const S = mlx.mlx_stream;
@@ -21,9 +22,18 @@ pub const Scope = struct {
     a: std.mem.Allocator,
     s: S,
     items: std.ArrayList(A) = .empty,
+    /// How the trellis linears built through this scope launch.
+    rows: exl3.project_rows.Mode = .{},
 
-    pub fn init(a: std.mem.Allocator, s: S) Scope {
+    /// A scope with the default launch mode, for tests, probes and code outside a pass. A scope inside a pass comes
+    /// from `Model.scope()` or `child()`, or it drops the pass's exact rows.
+    pub fn plain(a: std.mem.Allocator, s: S) Scope {
         return .{ .a = a, .s = s };
+    }
+
+    /// A scope of its own over the same allocator, stream and launch mode.
+    pub fn child(self: *const Scope) Scope {
+        return .{ .a = self.a, .s = self.s, .rows = self.rows };
     }
 
     pub fn deinit(self: *Scope) void {
@@ -45,6 +55,13 @@ pub const Scope = struct {
             return e;
         };
         return self.keep(o.*);
+    }
+
+    /// The scope's own handle on `x`, for an op that makes nothing new: like every op's result it stays valid
+    /// after the caller frees `x`.
+    pub fn share(sc: *Scope, x: A) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_array_set(&o, x), &o);
     }
 
     /// A handle on `x` that outlives the scope (the caller frees it).
@@ -92,26 +109,36 @@ pub const Scope = struct {
         return sc.op2(mlx.mlx_greater_equal, x, y);
     }
 
+    // A scalar or a host array has no stream of its own: it is made on the side of the scope's.
+
     /// An f32 scalar: it promotes bf16 operands, so use `fl` where the operand's dtype must survive.
     pub fn f(sc: *Scope, v: f32) !A {
-        return sc.keep(mlx.mlx_array_new_float(v));
+        const host = mlx.engine.enter(sc.s);
+        defer host.end();
+        return sc.keep(try mlx.newFloat(v));
     }
     /// A scalar of `dt`.
     pub fn fl(sc: *Scope, v: f32, dt: mlx.mlx_dtype) !A {
         return sc.astype(try sc.f(v), dt);
     }
     pub fn i(sc: *Scope, v: i32) !A {
-        return sc.keep(mlx.mlx_array_new_int(v));
+        const host = mlx.engine.enter(sc.s);
+        defer host.end();
+        return sc.keep(try mlx.newInt(v));
     }
     pub fn ints(sc: *Scope, data: []const i32, shape: []const c_int) !A {
-        return sc.keep(mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .int32));
+        const host = mlx.engine.enter(sc.s);
+        defer host.end();
+        return sc.keep(try mlx.newData(data.ptr, shape, .int32));
     }
     pub fn floats(sc: *Scope, data: []const f32, shape: []const c_int) !A {
-        return sc.keep(mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32));
+        const host = mlx.engine.enter(sc.s);
+        defer host.end();
+        return sc.keep(try mlx.newData(data.ptr, shape, .float32));
     }
 
     pub fn astype(sc: *Scope, x: A, dt: mlx.mlx_dtype) !A {
-        if (mlx.mlx_array_dtype(x) == dt) return x;
+        if (mlx.mlx_array_dtype(x) == dt) return sc.share(x);
         var o = mlx.mlx_array_new();
         return sc.res(mlx.mlx_astype(&o, x, dt, sc.s), &o);
     }
@@ -157,7 +184,7 @@ pub const Scope = struct {
         return sc.res(mlx.mlx_slice(&o, x, &start, sh.len, &stop, sh.len, &st, sh.len, sc.s), &o);
     }
     pub fn concat(sc: *Scope, xs: []const A, axis: c_int) !A {
-        if (xs.len == 1) return xs[0];
+        if (xs.len == 1) return sc.share(xs[0]);
         const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
         defer _ = mlx.mlx_vector_array_free(vec);
         var o = mlx.mlx_array_new();
@@ -248,4 +275,22 @@ pub fn hostI32(a: A) ![]const i32 {
     try mlx.check(mlx.mlx_array_eval(a));
     const p = mlx.mlx_array_data_int32(a) orelse return error.HostRead;
     return p[0..mlx.mlx_array_size(a)];
+}
+
+test "a scope's concat of one part and astype to the same dtype give a handle of the scope's own: the input freed and its box reused, the result keeps its bytes" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    const want = [_]f32{ 1, 2, 3, 4 };
+    for (0..2) |case| {
+        var sc = Scope.plain(std.testing.allocator, mlx.engine.stream());
+        defer sc.deinit();
+        const part = sc.out(try sc.floats(&want, &.{4}));
+        const got = if (case == 0) try sc.concat(&.{part}, 0) else try sc.astype(part, .float32);
+        _ = mlx.mlx_array_free(part);
+        _ = try sc.floats(&.{ 9, 9, 9, 9 }, &.{4});
+        try mlx.check(mlx.mlx_array_eval(got));
+        try std.testing.expectEqualSlices(f32, &want, mlx.mlx_array_data_float32(got).?[0..4]);
+    }
 }

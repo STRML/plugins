@@ -19,8 +19,14 @@ const common = @import("../vision_common.zig");
 const cfg_mod = @import("dsv41_config.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const log = @import("../log.zig");
-const transient_peak = @import("transient_peak.zig");
+const transient_peak = @import("../transient_peak.zig");
 const dflash = @import("../dflash.zig");
+const dsv41_borrow = @import("dsv41_borrow.zig");
+const cooler_pipelines = @import("../arch/cooler_pipelines.zig");
+const matmul = @import("../tensor/matmul.zig");
+const attention_plan = @import("../tensor/attention.zig");
+const metal = @import("../metal.zig");
+const manifest = @import("../pipeline_manifest.zig");
 const io_util = @import("../io_util.zig");
 
 const A = sc_mod.A;
@@ -214,6 +220,54 @@ pub fn quantizedBytes(out: u64, in: u64) u64 {
     return common.quantizedBytes(out, in, QUANT_GROUP);
 }
 
+pub fn quantizedHeldBytes(out: u64, in: u64, engine: bool) u64 {
+    return common.quantizedHeldBytes(out, in, QUANT_GROUP, engine);
+}
+
+/// The rows the tower sees for the images a processor admits: ViT patches (every ViT linear's rows, and the keys of
+/// every attention call) and aligner cells (the aligner's rows). Read off `planGrid` over image sizes from 1 px to
+/// 16,384 px a side: a geometric grid on both axes (`step`), and every width under 128 px (and every height) against a
+/// geometric grid of the other side, where the thin canvases are. A sample cannot undercut the true minimum; it can
+/// miss it.
+pub const Reach = struct { min_patches: u64, max_patches: u64, min_cells: u64, max_cells: u64 };
+
+fn grow(r: *?Reach, p: Processor, w: u32, h: u32) void {
+    const plan = planGrid(w, h, p) orelse return;
+    const patches = @as(u64, plan.vit_h) * plan.vit_w;
+    const cells = @as(u64, plan.llm_h) * plan.llm_w;
+    r.* = if (r.*) |x|
+        .{ .min_patches = @min(x.min_patches, patches), .max_patches = @max(x.max_patches, patches), .min_cells = @min(x.min_cells, cells), .max_cells = @max(x.max_cells, cells) }
+    else
+        .{ .min_patches = patches, .max_patches = patches, .min_cells = cells, .max_cells = cells };
+}
+
+pub fn reachOf(p: Processor, step: f64) ?Reach {
+    var out: ?Reach = null;
+    var a: f64 = 1;
+    while (a <= 16384) : (a = @max(a + 1, a * step)) {
+        var b: f64 = 1;
+        while (b <= 16384) : (b = @max(b + 1, b * step)) grow(&out, p, @intFromFloat(a), @intFromFloat(b));
+        for (1..128) |thin| {
+            grow(&out, p, @intCast(thin), @intFromFloat(a));
+            grow(&out, p, @intFromFloat(a), @intCast(thin));
+        }
+    }
+    return out;
+}
+
+/// An image the engine's tower would have to refuse: the plan MLX takes for it and the engine lacks.
+pub const Gap = struct { what: []const u8, rows: u64 };
+
+/// The first shape an admissible image can give the attention that the engine does not port, else null. Decided at
+/// the load, so no request meets a refusal MLX would not give. Every plan MLX picks for a quantized linear is ported.
+pub fn engineGap(v: cfg_mod.Vision) ?Gap {
+    if (v.headDim() != 64) return .{ .what = "attention head dimension other than 64", .rows = 0 };
+    const r = reachOf(Processor.of(v), 1.06) orelse return .{ .what = "no admissible image", .rows = 0 };
+    // The last chunk of a query is at most as long as the keys.
+    if (r.min_patches < 8) return .{ .what = "fewer keys than a vector attention chunk", .rows = r.min_patches };
+    return null;
+}
+
 /// A linear: `w` is a bf16 `[out, in]`, or `q` holds it as MLX affine codes.
 const Lin = struct {
     w: A = none,
@@ -271,6 +325,11 @@ fn lin(ld: *Load, comptime fmt: []const u8, args: anytype, out_dim: usize, in_di
         ld.bf16_bytes += 2 * out_dim * in_dim;
         return l;
     }
+    if (mlx.engine.isStream(ld.s)) {
+        // The codes, scales and biases outlive every forward: the pool's cap rises by them.
+        const groups = 2 * out_dim * (in_dim / QUANT_GROUP);
+        mlx.engine.room(&.{ out_dim * in_dim * common.QUANT_BITS / 8, groups, groups });
+    }
     // The bf16 copy goes as soon as its codes exist: the load holds one linear's worth of both.
     const q = try common.requantize(l.w, QUANT_GROUP, ld.s);
     _ = mlx.mlx_array_free(ld.weights.take(name).?);
@@ -284,7 +343,10 @@ fn lin(ld: *Load, comptime fmt: []const u8, args: anytype, out_dim: usize, in_di
 
 pub const Dsv41Vision = struct {
     allocator: std.mem.Allocator,
+    /// MLX's stream: the whole forward runs on it when `own` is off, and so does that load's requantization.
     s: mlx.mlx_stream,
+    /// The forward runs on the engine of our own, on its stream and with its ops: set at the load that serves on the engine.
+    own: bool = false,
     v: cfg_mod.Vision,
     /// The text width an aligner row and a delimiter take.
     out_dim: u32,
@@ -300,11 +362,68 @@ pub const Dsv41Vision = struct {
     /// The serving tower: its block and aligner matrices are requantized to affine 8-bit and their bf16 copies leave
     /// `weights`. The tower's other handles are borrowed from `weights`, which outlives it.
     pub fn init(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights) !Dsv41Vision {
-        return initWith(allocator, config, weights, !common.vision_bf16);
+        const quantize_at_load = !common.vision_bf16;
+        const c = config.dsv41 orelse return error.MissingVisionWeights;
+        const v = c.vision orelse return error.MissingVisionWeights;
+        var own = false;
+        if (@import("../cooler_side.zig").onEngine(&config)) {
+            // Decided here, once: a Cooler load runs nothing on MLX, so a tower the engine cannot run refuses the load.
+            if (engineGap(v)) |g| {
+                log.err("[vision] the engine does not port this tower: an image of {d} rows reaches {s}; --ds41-mlx-engine serves it\n", .{ g.rows, g.what });
+                return error.VisionTowerNotPorted;
+            }
+            if (!mlx.engine.enabled) return error.EngineNotEnabled;
+            own = true;
+        }
+        // The requantization's kernel is this load's to make, as the warm's are.
+        const making = @import("../arch/cooler.zig").making(own);
+        defer if (making) |seal| seal.end();
+        var self = try load(allocator, config, weights, quantize_at_load, own);
+        errdefer self.deinit();
+        if (own) try self.useEngine();
+        return self;
+    }
+
+    /// From here the forward runs on the engine of our own, after a run of every pipeline an image can reach.
+    pub fn useEngine(self: *Dsv41Vision) !void {
+        if (!mlx.engine.enabled) return error.EngineNotEnabled;
+        self.own = true;
+        errdefer self.own = false;
+        try self.warmEngine();
+    }
+
+    fn stream(self: *const Dsv41Vision) mlx.mlx_stream {
+        return if (self.own) mlx.engine.stream() else self.s;
+    }
+
+    /// The engine's stream when the tower runs there: where its caller makes patch arrays and joins spans.
+    pub fn ownStream(self: *const Dsv41Vision) ?mlx.mlx_stream {
+        return if (self.own) mlx.engine.stream() else null;
+    }
+
+    /// The engine runs this pass: its ops take over, an MLX stream among them is refused by name, and its pool may
+    /// hold the pass's scratch, or the encode's bill when one is installed. A no-op on MLX's side.
+    const Run = struct {
+        makers: ?mlx.engine.Makers,
+
+        fn end(r: Run) void {
+            if (r.makers) |made| made.end();
+        }
+    };
+
+    fn engage(self: *const Dsv41Vision, patches: usize) !Run {
+        if (!self.own) return .{ .makers = null };
+        if (!dsv41_borrow.visionBilled()) try mlx.engine.budget(scratchOf(self.v, self.out_dim, patches));
+        return .{ .makers = mlx.engine.makers(true) };
     }
 
     /// `quantize` false keeps every linear bf16 (the reference-parity tests).
     pub fn initWith(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights, quantize: bool) !Dsv41Vision {
+        return load(allocator, config, weights, quantize, false);
+    }
+
+    /// `own`: the requantization runs on the engine of our own, which then holds the codes.
+    fn load(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights, quantize: bool, own: bool) !Dsv41Vision {
         const c = config.dsv41 orelse return error.MissingVisionWeights;
         const v = c.vision orelse return error.MissingVisionWeights;
         const d = v.hidden;
@@ -315,7 +434,7 @@ pub const Dsv41Vision = struct {
         for (blocks) |*b| b.* = .{};
         var self: Dsv41Vision = .{
             .allocator = allocator,
-            .s = mlx.mlx_default_gpu_stream_new(),
+            .s = if (own) mlx.engine.stream() else mlx.mlx_default_gpu_stream_new(),
             .v = v,
             .out_dim = c.dim,
             .patch = .{},
@@ -331,7 +450,7 @@ pub const Dsv41Vision = struct {
             self.release();
             _ = mlx.mlx_stream_free(self.s);
         }
-        var ld: Load = .{ .weights = weights, .s = self.s, .quantize = quantize };
+        var ld: Load = .{ .weights = weights, .s = if (own) mlx.engine.stream() else self.s, .quantize = quantize };
         var clock = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
         self.patch = try lin(&ld, "vision.patch_embed.proj", .{}, d, feat, true);
         for (blocks, 0..) |*b, i| {
@@ -377,17 +496,77 @@ pub const Dsv41Vision = struct {
     /// Encode one image: `patches` is `[grid_h * grid_w, 3 * p * p]`. Returns the trunk's whole span,
     /// `[1, spanRows, out_dim]`, evaluated.
     pub fn forward(self: *Dsv41Vision, patches: A, grid_h: u32, grid_w: u32) !A {
+        const out = try self.encode(patches, grid_h, grid_w);
+        // The pass's scratch leaves the pool; the span stays.
+        if (self.own) mlx.engine.trim();
+        return out;
+    }
+
+    fn encode(self: *Dsv41Vision, patches: A, grid_h: u32, grid_w: u32) !A {
         transient_peak.begin();
+        defer transient_peak.end(.vision_encode, grid_h * grid_w, null);
+        const run = try self.engage(@as(usize, grid_h) * grid_w);
+        defer run.end();
         const hidden = try self.towerHidden(patches, grid_h, grid_w);
         defer _ = mlx.mlx_array_free(hidden);
-        var sc = Scope.init(self.allocator, self.s);
+        return self.tail(hidden, grid_h, grid_w);
+    }
+
+    /// The aligner and the span of a tower output `hidden`, evaluated.
+    fn tail(self: *Dsv41Vision, hidden: A, grid_h: u32, grid_w: u32) !A {
+        var sc = Scope.plain(self.allocator, self.stream());
         defer sc.deinit();
         const feats = try self.aligner(&sc, hidden, grid_h, grid_w);
         const out = sc.out(try self.span(&sc, feats, grid_h, grid_w));
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_eval(out));
-        transient_peak.end(.vision_encode, grid_h * grid_w);
         return out;
+    }
+
+    /// Patch counts whose one-block runs between them reach every pipeline of an image under the release's
+    /// geometry: query chunks whole or short of a 64, key counts whole 32s or not, and a last chunk of 1 to 4 and
+    /// of 5 to 8 rows (the vector attention kernels), over at most 8,192 keys and over more (their blocks on a Max
+    /// and an Ultra).
+    const warm_patches = [_]usize{ 1536, 1509, 1632, 1537, 1544, 8200, 8193 };
+
+    /// Warms that ran in this process: tests read it to see that a load from a manifest ran none.
+    pub var warms: u32 = 0;
+
+    fn warmEngine(self: *Dsv41Vision) !void {
+        var key_buf: [96]u8 = undefined;
+        const v = self.v;
+        const key = std.fmt.bufPrint(&key_buf, "{s}/{d}.{d}.{d}.{d}.{d}.{d}/w1", .{ if (self.blocks[0].wqkv.q != null) "q8" else "bf16", v.hidden, v.heads, v.inter, v.patch, v.downsample, self.out_dim }) catch return error.TensorShape;
+        // A manifest of this load's key that holds the warm: its pipelines are made, so the run would find them all.
+        if (mlx.engine.pipeline_registry.takeMarker(key)) {
+            log.info("[vision] engine tower: pipelines made from the manifest, no warm\n", .{});
+            return;
+        }
+        warms += 1;
+        const making = @import("../arch/cooler.zig").making(true).?;
+        defer making.end();
+        var clock = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
+        const made_before = mlx.engine.pipelinesMade().count;
+        const feat: usize = 3 * self.v.patch * self.v.patch;
+        for (warm_patches) |n| {
+            const zeros = try self.allocator.alloc(f32, n * feat);
+            defer self.allocator.free(zeros);
+            @memset(zeros, 0);
+            // The engine's own array, made between forwards: the pool's cap rises by it until the pass's cap replaces it.
+            mlx.engine.room(&.{zeros.len * @sizeOf(f32)});
+            const scope = mlx.engine.enter(self.stream());
+            const patches = try mlx.newData(zeros.ptr, &[_]c_int{ ci(n), ci(feat) }, .float32);
+            scope.end();
+            defer _ = mlx.mlx_array_free(patches);
+            const run = try self.engage(n);
+            defer run.end();
+            const hidden = try self.towerAfter(patches, 1, @intCast(n), 1);
+            defer _ = mlx.mlx_array_free(hidden);
+            _ = mlx.mlx_array_free(try self.tail(hidden, 1, @intCast(n)));
+        }
+        mlx.engine.trim();
+        log.info("[vision] engine tower warmed: {d} pipelines, {d} ms\n", .{ mlx.engine.pipelinesMade().count - made_before, clock.read() / std.time.ns_per_ms });
+        mlx.engine.pipeline_registry.recordMarker("vision tower", key);
+        cooler_pipelines.rewriteLate();
     }
 
     /// The ViT through its final norm: `[grid_h * grid_w, hidden]`, evaluated; the caller frees it.
@@ -401,8 +580,10 @@ pub const Dsv41Vision = struct {
         const n: usize = @as(usize, grid_h) * grid_w;
         const shape = mlx.getShape(patches);
         if (n == 0 or shape.len != 2 or shape[0] != ci(n) or shape[1] != ci(3 * v.patch * v.patch)) return error.InvalidPatchGrid;
+        const run = try self.engage(n);
+        defer run.end();
         var x: A = blk: {
-            var sc = Scope.init(self.allocator, self.s);
+            var sc = Scope.plain(self.allocator, self.stream());
             defer sc.deinit();
             const e = sc.out(try self.patch.apply(&sc, try sc.astype(patches, .bfloat16)));
             errdefer _ = mlx.mlx_array_free(e);
@@ -410,11 +591,11 @@ pub const Dsv41Vision = struct {
             break :blk e;
         };
         defer _ = mlx.mlx_array_free(x);
-        var rope_sc = Scope.init(self.allocator, self.s);
+        var rope_sc = Scope.plain(self.allocator, self.stream());
         defer rope_sc.deinit();
         const rope = try ropeTables(&rope_sc, v, grid_h, grid_w);
         for (self.blocks[0..n_blocks]) |*b| {
-            var sc = Scope.init(self.allocator, self.s);
+            var sc = Scope.plain(self.allocator, self.stream());
             defer sc.deinit();
             const attn = try self.attention(&sc, try sc.rms(x, b.norm1, EPS), b, rope);
             const mid = try sc.add(x, attn);
@@ -429,7 +610,7 @@ pub const Dsv41Vision = struct {
             _ = mlx.mlx_array_set(&partial, x);
             return partial;
         }
-        var sc = Scope.init(self.allocator, self.s);
+        var sc = Scope.plain(self.allocator, self.stream());
         defer sc.deinit();
         const out = sc.out(try sc.rms(x, self.norm, EPS));
         errdefer _ = mlx.mlx_array_free(out);
@@ -466,7 +647,7 @@ pub const Dsv41Vision = struct {
             }
         };
         const shape = [_]c_int{ ci(n), 1, ci(half) };
-        return .{ .cos = try sc.keep(mlx.mlx_array_new_data(cos.ptr, &shape, 3, .float32)), .sin = try sc.keep(mlx.mlx_array_new_data(sin.ptr, &shape, 3, .float32)) };
+        return .{ .cos = try sc.keep(try mlx.newData(cos.ptr, &shape, .float32)), .sin = try sc.keep(try mlx.newData(sin.ptr, &shape, .float32)) };
     }
 
     /// `x [n, heads, head_dim]` rotated in f32, back in its dtype.
@@ -501,7 +682,7 @@ pub const Dsv41Vision = struct {
         while (lo < n) : (lo += QUERY_CHUNK) {
             const hi = @min(n, lo + QUERY_CHUNK);
             var o = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, try sc.slice(q, 2, lo, hi), k, val, scale, "", none, none, false, self.s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, try sc.slice(q, 2, lo, hi), k, val, scale, "", none, none, false, sc.s));
             const piece = try sc.keep(o);
             try mlx.check(mlx.mlx_array_eval(piece));
             try pieces.append(self.allocator, piece);
@@ -529,7 +710,7 @@ pub const Dsv41Vision = struct {
         var x = try sc.reshape(hidden, &.{ ci(grid_h), ci(grid_w), ci(c) });
         if (lh * r != grid_h or lw * r != grid_w) {
             var padded = mlx.mlx_array_new();
-            const zero = try sc.keep(mlx.mlx_array_new_float(0.0));
+            const zero = try sc.keep(try mlx.newFloat(0.0));
             x = try sc.res(mlx.mlx_pad(&padded, x, &[_]c_int{ 0, 1 }, 2, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(lh * r - grid_h), ci(lw * r - grid_w) }, 2, zero, "constant", sc.s), &padded);
         }
         // [lh, r, lw, r, C] -> [lh, lw, C, r, r]: torch's unfold orders a block's features (c, ky, kx).
@@ -564,9 +745,17 @@ fn gelu(sc: *Scope, x: A) !A {
 /// GPU bytes one encode of `patches` ViT patches peaks at: activations per block, the query-chunked score
 /// sheet and the aligner. A bound, not a measurement.
 pub fn encodeScratchBytes(cfg: *const model.ModelConfig, patches: u64) u64 {
-    const scores = 4 * @as(u64, cfg.qv_heads) * @min(patches, @as(u64, QUERY_CHUNK)) * patches;
-    const activations = 4 * patches * (12 * @as(u64, cfg.qv_hidden) + 6 * @as(u64, cfg.qv_intermediate));
-    const aligner = 4 * (patches / @max(@as(u64, cfg.qv_merge) * cfg.qv_merge, 1)) * (@as(u64, cfg.qv_hidden) * cfg.qv_merge * cfg.qv_merge + 4 * @as(u64, cfg.qv_out_hidden));
+    return scratchBound(cfg.qv_heads, cfg.qv_hidden, cfg.qv_intermediate, cfg.qv_out_hidden, cfg.qv_merge, patches);
+}
+
+fn scratchOf(v: cfg_mod.Vision, out_hidden: u32, patches: usize) u64 {
+    return scratchBound(v.heads, v.hidden, v.inter, out_hidden, v.downsample, patches);
+}
+
+fn scratchBound(heads: u64, hidden: u64, inter: u64, out_hidden: u64, merge: u64, patches: u64) u64 {
+    const scores = 4 * heads * @min(patches, @as(u64, QUERY_CHUNK)) * patches;
+    const activations = 4 * patches * (12 * hidden + 6 * inter);
+    const aligner = 4 * (patches / @max(merge * merge, 1)) * (hidden * merge * merge + 4 * out_hidden);
     return (64 << 20) + scores * 13 / 10 + @max(activations, aligner);
 }
 
@@ -815,14 +1004,18 @@ const tiny_dim: u32 = 128;
 
 /// A synthetic tower of the release's structure at widths of whole 128-groups.
 fn tinyTower() !model.Weights {
-    const v = tiny_vision;
+    return towerOf(tiny_vision, tiny_dim);
+}
+
+fn towerOf(v: cfg_mod.Vision, dim: u32) !model.Weights {
     const d: c_int = @intCast(v.hidden);
     const inter: c_int = @intCast(v.inter);
     var w = model.Weights.init(testing.allocator);
     errdefer w.deinit();
     var buf: [96]u8 = undefined;
     var seed: u64 = 1;
-    try putBf16(&w, "vision.patch_embed.proj.weight", &.{ d, 48 }, 1, 0.1, 0);
+    const feat: c_int = @intCast(3 * v.patch * v.patch);
+    try putBf16(&w, "vision.patch_embed.proj.weight", &.{ d, feat }, 1, 0.1, 0);
     try putBf16(&w, "vision.patch_embed.proj.bias", &.{d}, 2, 0.05, 0);
     for (0..v.layers) |i| {
         const Part = struct { name: []const u8, shape: [2]c_int, rank: u2 };
@@ -843,8 +1036,8 @@ fn tinyTower() !model.Weights {
         }
     }
     try putBf16(&w, "vision.norm.weight", &.{d}, 80, 0.1, 1);
-    const out: c_int = @intCast(tiny_dim);
-    try putBf16(&w, "aligner.w1.weight", &.{ out, d * 4 }, 81, 0.1, 0);
+    const out: c_int = @intCast(dim);
+    try putBf16(&w, "aligner.w1.weight", &.{ out, d * @as(c_int, @intCast(v.downsample * v.downsample)) }, 81, 0.1, 0);
     try putBf16(&w, "aligner.w1.bias", &.{out}, 82, 0.05, 0);
     try putBf16(&w, "aligner.w2.weight", &.{ out, out }, 83, 0.1, 0);
     try putBf16(&w, "aligner.w2.bias", &.{out}, 84, 0.05, 0);
@@ -853,8 +1046,12 @@ fn tinyTower() !model.Weights {
 }
 
 fn tinyConfig() model.ModelConfig {
-    var cfg: model.ModelConfig = .{};
-    cfg.dsv41 = .{ .dim = tiny_dim, .vision = tiny_vision };
+    return configOf(tiny_vision, tiny_dim);
+}
+
+fn configOf(v: cfg_mod.Vision, dim: u32) model.ModelConfig {
+    var cfg: model.ModelConfig = .{ .model_type = "deepseek_v41" };
+    cfg.dsv41 = .{ .dim = dim, .vision = v };
     return cfg;
 }
 
@@ -937,6 +1134,415 @@ test "dsv41 vision: --vision-bf16 keeps bf16 linears and matches the bf16 arm by
     defer _ = mlx.mlx_array_free(want);
     const g = try common.gap(got, want, dk.s);
     try testing.expectEqual(@as(f64, 0), g.max_abs);
+}
+
+/// Every linear's inner width is one group, so MLX's quantized matmul never splits K for these rows.
+const engine_vision: cfg_mod.Vision = .{ .layers = 2, .hidden = 128, .heads = 2, .inter = 128, .patch = 4, .rope_theta = 10000, .downsample = 1, .max_tokens = 4096, .min_pixels = 0, .max_wh_ratio = 0 };
+
+test "dsv41 vision: the tower on the engine's stream asks no MLX op, lends nothing and makes no pipeline after the warm" {
+    try mlx.requireGpu();
+    // A failed engine warm leaves its raise latched; taking it keeps it from failing a later test that reads the latch.
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was_enabled;
+    var we = try towerOf(engine_vision, tiny_dim);
+    defer we.deinit();
+    var on_engine = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &we);
+    defer on_engine.deinit();
+    try on_engine.useEngine();
+    defer mlx.engine.seal(false);
+    // A pass leaves its pool budget in place, as a forward does; a later test sees no limit.
+    defer mlx.engine.budget(1 << 62) catch {};
+
+    // 36 x 44: chunks of 512 and a last of 48; 1 x 1544: a last chunk of 8 rows, the vector kernels.
+    for ([_][2]u32{ .{ 36, 44 }, .{ 1, 1544 } }) |grid| {
+        const n: usize = @as(usize, grid[0]) * grid[1];
+        const px = try testing.allocator.alloc(f32, n * 48);
+        defer testing.allocator.free(px);
+        var prng = std.Random.DefaultPrng.init(n);
+        for (px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+        const patches = mlx.mlx_array_new_data(px.ptr, &[_]c_int{ ci(n), 48 }, 2, .float32);
+        defer _ = mlx.mlx_array_free(patches);
+
+        const ops_before = mlx.engine.mlx_ops;
+        const lends_before = mlx.engine.stats().lends;
+        const made_before = mlx.engine.pipelinesMade().count;
+        const got = try on_engine.forward(patches, grid[0], grid[1]);
+        defer _ = mlx.mlx_array_free(got);
+        try testing.expectEqual(ops_before, mlx.engine.mlx_ops);
+        try testing.expectEqual(lends_before, mlx.engine.stats().lends);
+        try testing.expectEqual(made_before, mlx.engine.pipelinesMade().count);
+
+        try testing.expect(mlx.engine.isOurs(got));
+        try testing.expectEqual(@as(c_int, @intCast(spanRows(grid[0], grid[1], engine_vision.downsample))), mlx.getShape(got)[1]);
+        try mlx.check(mlx.mlx_array_eval(got));
+    }
+}
+
+/// `towerOf` with every weight the engine's own tensor, as a Cooler load holds them.
+fn ownTowerOf(v: cfg_mod.Vision, dim: u32) !model.Weights {
+    var w = try towerOf(v, dim);
+    errdefer w.deinit();
+    var it = w.map.valueIterator();
+    while (it.next()) |a| {
+        const shape = mlx.getShape(a.*);
+        const ours = mlx.engine.mlx_array_new_data(mlx.mlx_array_data_uint8(a.*).?, shape.ptr, @intCast(shape.len), mlx.mlx_array_dtype(a.*));
+        if (ours.ctx == null) return error.OutOfMemory;
+        _ = mlx.mlx_array_free(a.*);
+        a.* = ours;
+    }
+    return w;
+}
+
+/// Whether one of the warm's runs takes the attention pipeline a query chunk of `rows` over `keys` takes on `g`.
+fn warmTakes(g: matmul.Gpu, rows: usize, keys: usize) bool {
+    const want = attention_plan.planOf(g, .bfloat16, rows, keys, 1, 64);
+    for (Dsv41Vision.warm_patches) |w| {
+        var lo: usize = 0;
+        while (lo < w) : (lo += QUERY_CHUNK) {
+            if (std.meta.eql(want, attention_plan.planOf(g, .bfloat16, @min(w - lo, QUERY_CHUNK), w, 1, 64))) return true;
+        }
+    }
+    return false;
+}
+
+test "dsv41 vision: the warm reaches every attention pipeline an admissible image's chunks take, on every GPU class and both tile arms" {
+    const r = reachOf(Processor.of(try releaseVision()), 1.06).?;
+    for (std.enums.values(@FieldType(matmul.Gpu, "class"))) |class| for ([_]bool{ true, false }) |nax| {
+        const g: matmul.Gpu = .{ .class = class, .gen = 17, .nax = nax, .tf32 = true };
+        var n: usize = @intCast(r.min_patches);
+        while (n <= r.max_patches) : (n += 1) {
+            const last = n % QUERY_CHUNK;
+            const whole = n >= QUERY_CHUNK and warmTakes(g, QUERY_CHUNK, n);
+            if (!(n < QUERY_CHUNK or whole) or !(last == 0 or warmTakes(g, last, n))) {
+                std.debug.print("{s} nax {}: {d} patches, a last chunk of {d} rows, takes a pipeline the warm does not\n", .{ @tagName(class), nax, n, last });
+                return error.TestUnexpectedResult;
+            }
+        }
+    };
+}
+
+test "dsv41 vision: a Cooler encode of large images and a small last one joins their spans under the encode's bill" {
+    try mlx.requireGpu();
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was_enabled;
+    // A wide trunk gives large spans from a cheap tower: eight of them outgrow a small image's pass cap.
+    const v: cfg_mod.Vision = .{ .layers = 2, .hidden = 128, .heads = 2, .inter = 128, .patch = 4, .rope_theta = 10000, .downsample = 3, .max_tokens = 4096, .min_pixels = 0, .max_wh_ratio = 0 };
+    const dim: u32 = 4096;
+    var w = try towerOf(v, dim);
+    defer w.deinit();
+    var config = configOf(v, dim);
+    config.model_type = "deepseek_v41";
+    var t = try Dsv41Vision.init(testing.allocator, config, &w);
+    defer t.deinit();
+    // On the engine without the warm, which is not this test's subject.
+    t.own = true;
+    defer mlx.engine.budget(1 << 62) catch {};
+    // The request's end closes the pass the join left open, as `endRequestMlx` does.
+    defer mlx.engine.close();
+    // The encode's caps follow a pack that decodes on the engine.
+    config.cooler_for_test = true;
+    const ram_cap = dsv41_borrow.pool_ram_cap;
+    dsv41_borrow.pool_ram_cap = 8 << 30;
+    defer dsv41_borrow.pool_ram_cap = ram_cap;
+
+    const large = [2]u32{ 126, 126 };
+    const grids = [_][2]u32{ large, large, large, large, large, large, large, large, .{ 48, 48 } };
+    // The bill `request_media.visionEncodeBill` gives these images: the worst pass, the inputs and three outputs.
+    var rows: u64 = 0;
+    var inputs: u64 = 0;
+    for (grids) |g| {
+        rows += spanRows(g[0], g[1], v.downsample);
+        inputs += @as(u64, g[0]) * g[1] * 48 * 4;
+    }
+    const bill = scratchOf(v, dim, large[0] * large[1]) + inputs + 3 * rows * dim * 2;
+    dsv41_borrow.enterVisionMlx(bill, &config);
+    defer dsv41_borrow.leaveVisionMlx(&config);
+
+    var spans: std.ArrayList(A) = .empty;
+    defer {
+        for (spans.items) |a| _ = mlx.mlx_array_free(a);
+        spans.deinit(testing.allocator);
+    }
+    for (grids) |g| {
+        const n: usize = @as(usize, g[0]) * g[1];
+        const px = try testing.allocator.alloc(f32, n * 48);
+        defer testing.allocator.free(px);
+        @memset(px, 0.25);
+        // The queue makes each image's patches on the engine between the tower's passes.
+        const patches = blk: {
+            const host = mlx.engine.enter(mlx.engine.stream());
+            defer host.end();
+            break :blk mlx.mlx_array_new_data(px.ptr, &[_]c_int{ ci(n), 48 }, 2, .float32);
+        };
+        defer _ = mlx.mlx_array_free(patches);
+        try spans.append(testing.allocator, try t.forward(patches, g[0], g[1]));
+    }
+    // The queue's join (`vision_queue.runVisionEncode`).
+    const host = mlx.engine.enter(mlx.engine.stream());
+    defer host.end();
+    const vec = mlx.mlx_vector_array_new_data(spans.items.ptr, spans.items.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var joined = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(joined);
+    try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 1, mlx.engine.stream()));
+    try testing.expectEqual(@as(c_int, @intCast(rows)), mlx.getShape(joined)[1]);
+}
+
+test "dsv41 vision: an image under every generation's vector limit runs its linears on the engine's vector kernels with no op on MLX" {
+    try mlx.requireGpu();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was_enabled;
+    var we = try towerOf(engine_vision, tiny_dim);
+    defer we.deinit();
+    var on_engine = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &we);
+    defer on_engine.deinit();
+    on_engine.own = true;
+    defer mlx.engine.budget(1 << 62) catch {};
+    // Four patches: under the vector limit of every generation (6 rows at the least).
+    var px: [2 * 2 * 48]f32 = undefined;
+    for (&px, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 17)) / 8 - 1;
+    const patches = mlx.mlx_array_new_data(&px, &[_]c_int{ 4, 48 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(patches);
+    const ops_before = mlx.engine.mlx_ops;
+    const got = try on_engine.forward(patches, 2, 2);
+    defer _ = mlx.mlx_array_free(got);
+    try testing.expectEqual(ops_before, mlx.engine.mlx_ops);
+    try testing.expect(mlx.engine.isOurs(got));
+    try mlx.check(mlx.mlx_array_eval(got));
+}
+
+// Rows the tower can see, for any image the release processor admits (`reachOf`; `planGrid` over every width under 128 px
+// and a geometric grid of sizes up to 16,384 px, and exhaustively over widths 1 to 79 and heights 1 to 200,000 below):
+//   - ViT patches, the rows of every ViT linear and the keys of every attention call: 1,084 at the fewest (a 79 x 14,281
+//     image, cut by the token cap to a 28 x 7,588 canvas; the 546 px square a tiny image scales up to has 1,521) to
+//     9,198 (`maxPatches`, 1,022 aligner cells of nine);
+//   - aligner cells, the rows of the aligner's two linears: 164 at the fewest (a 3 x 481 image) to 1,022;
+//   - an attention call's query chunk: 512 rows, and a last chunk of 1 to 512, against those keys.
+// Every plan MLX picks for the tower's quantized linears at those rows is the engine's (`tensor/quantized.zig`);
+// `engineGap` checks the attention at the load, and a pack whose vision config could reach a gap keeps its tower on
+// MLX, said in a log line.
+
+fn releaseVision() !cfg_mod.Vision {
+    return (try cfg_mod.parseText(cfg_mod.release_config)).vision.?;
+}
+
+test "dsv41 vision: every image the release processor admits gives the tower rows the engine covers" {
+    try mlx.requireGpu();
+    const v = try releaseVision();
+    const fine = reachOf(Processor.of(v), 1.013).?;
+    try testing.expect(fine.min_patches >= 1084 and fine.min_patches < 1100);
+    try testing.expect(fine.max_patches <= v.maxPatches() and fine.max_patches > 9000);
+    try testing.expect(fine.min_cells >= 164 and fine.min_cells < 170);
+    try testing.expect(fine.max_cells <= 1022 and fine.max_cells > 1000);
+    try testing.expect(engineGap(v) == null);
+
+    // A processor with no pixel floor admits a one-patch image, which no chunk of keys covers; with a floor of about
+    // forty patches the linears take MLX's vector kernels, which the engine has too.
+    var floorless = v;
+    floorless.min_pixels = 0;
+    try testing.expectEqualStrings("fewer keys than a vector attention chunk", engineGap(floorless).?.what);
+    floorless.min_pixels = 196 * 40;
+    try testing.expect(engineGap(floorless) == null);
+    var wide_head = v;
+    wide_head.hidden = 2048;
+    try testing.expectEqualStrings("attention head dimension other than 64", engineGap(wide_head).?.what);
+}
+
+test "dsv41 vision: a Cooler load refuses a tower the engine does not port by name; the MLX route loads it" {
+    try mlx.requireGpu();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was_enabled;
+    // No pixel floor: a one-patch image is admissible, and no chunk of keys covers it.
+    var w = try towerOf(engine_vision, tiny_dim);
+    defer w.deinit();
+    try testing.expect(engineGap(engine_vision) != null);
+    var cooler = configOf(engine_vision, tiny_dim);
+    cooler.cooler_for_test = true;
+    const calls = mlx.engine.mlxCalls();
+    try testing.expectError(error.VisionTowerNotPorted, Dsv41Vision.init(testing.allocator, cooler, &w));
+    try testing.expectEqual(calls, mlx.engine.mlxCalls());
+    var mlx_side = configOf(engine_vision, tiny_dim);
+    mlx_side.cooler_for_test = false;
+    var on_mlx = try Dsv41Vision.init(testing.allocator, mlx_side, &w);
+    defer on_mlx.deinit();
+    try testing.expect(!on_mlx.own and on_mlx.ownStream() == null);
+}
+
+test "dsv41 vision: the fewest patches and aligner cells any image gives the release tower, over every thin size" {
+    const p = Processor.of(try releaseVision());
+    var least: ?Reach = null;
+    for (1..80) |w| {
+        for (1..200_001) |h| grow(&least, p, @intCast(w), @intCast(h));
+    }
+    try testing.expectEqual(@as(u64, 1084), least.?.min_patches);
+    try testing.expectEqual(@as(u64, 164), least.?.min_cells);
+}
+
+test "dsv41 vision: at the release's geometry the engine's tower loads and encodes the smallest, a thin and a large image with nothing asked of MLX and no pipeline made" {
+    try mlx.requireGpu();
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was_enabled;
+    cooler_pipelines.forget();
+    var v = try releaseVision();
+    v.layers = 2;
+    var we = try ownTowerOf(v, 5120);
+    defer we.deinit();
+    defer mlx.engine.budget(1 << 62) catch {};
+    // A load that follows a forward meets that forward's cap: here a sixth of the aligner's first codes.
+    try mlx.engine.budget(8 << 20);
+    const load_ops = mlx.engine.mlx_ops;
+    const load_stats = mlx.engine.stats();
+    var cooler = configOf(v, 5120);
+    cooler.cooler_for_test = true;
+    // The model's load has sealed the engine by the time the tower loads.
+    mlx.engine.seal(true);
+    defer mlx.engine.seal(false);
+    const late = mlx.engine.latePipelines();
+    var on_engine = try Dsv41Vision.init(testing.allocator, cooler, &we);
+    defer on_engine.deinit();
+    try testing.expectEqual(late, mlx.engine.latePipelines());
+    // The Cooler load requantized on the engine: nothing asked of MLX, no weight taken from it or lent to it.
+    try testing.expect(on_engine.own and mlx.engine.isOurs(on_engine.blocks[0].wqkv.q.?.w));
+    try testing.expectEqual(load_ops, mlx.engine.mlx_ops);
+    try testing.expectEqual(load_stats.imports, mlx.engine.stats().imports);
+    try testing.expectEqual(load_stats.lends, mlx.engine.stats().lends);
+
+    // 1 x 1 scales up to the 546 px square (1,521 patches); 5000 x 50 is the thin canvas; 2000 x 1500 a large one;
+    // 561 x 2790 gives 8,200 patches, a last query chunk of 8 rows over more than 8,192 keys.
+    for ([_][2]u32{ .{ 1, 1 }, .{ 5000, 50 }, .{ 2000, 1500 }, .{ 561, 2790 } }) |size| {
+        const rgb = try testing.allocator.alloc(u8, @as(usize, size[0]) * size[1] * 3);
+        defer testing.allocator.free(rgb);
+        var prng = std.Random.DefaultPrng.init(size[0]);
+        prng.random().bytes(rgb);
+        const px = try preprocess(testing.allocator, rgb, size[1], size[0], Processor.of(v));
+        defer testing.allocator.free(px.bytes);
+        const n: usize = @as(usize, px.grid_h) * px.grid_w;
+        const patches = mlx.mlx_array_new_data(px.bytes.ptr, &[_]c_int{ ci(n), 588 }, 2, .float32);
+        defer _ = mlx.mlx_array_free(patches);
+
+        const ops_before = mlx.engine.mlx_ops;
+        const lends_before = mlx.engine.stats().lends;
+        const made_before = mlx.engine.pipelinesMade().count;
+        const calls_before = mlx.calls.load(.monotonic);
+        var named_before: std.ArrayList(mlx.NameCount) = .empty;
+        defer named_before.deinit(testing.allocator);
+        try mlx.callsByName(&named_before, testing.allocator);
+        const got = try on_engine.forward(patches, px.grid_h, px.grid_w);
+        defer _ = mlx.mlx_array_free(got);
+        try testing.expectEqual(ops_before, mlx.engine.mlx_ops);
+        try testing.expectEqual(lends_before, mlx.engine.stats().lends);
+        // One array is MLX's, this test's patches: a pass reads it 12 times (availability, bytes, buffer, shape,
+        // strides, dtype).
+        try testing.expect(mlx.calls.load(.monotonic) - calls_before < 20);
+        try expectOnlyImportReads(named_before.items);
+        // The warm covers the pipelines an image of any size reaches.
+        try testing.expectEqual(@as(c_int, @intCast(spanRows(px.grid_h, px.grid_w, v.downsample))), mlx.getShape(got)[1]);
+        try mlx.check(mlx.mlx_array_eval(got));
+        try testing.expectEqual(made_before, mlx.engine.pipelinesMade().count);
+    }
+}
+
+test "dsv41 vision: the tower's pipelines ride the manifest: a first load warms and stores them, a same-key load warms nothing" {
+    try mlx.requireGpu();
+    // A failed engine warm leaves its raise latched; taking it keeps it from failing a later test that reads the latch.
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was_enabled;
+    defer mlx.engine.seal(false);
+    defer cooler_pipelines.forget();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const key: manifest.Key = .{ .scope = "70e570e570e570e5".*, .build = "b2b2b2b2b2b2b2b2".* };
+    var w1 = try towerOf(engine_vision, tiny_dim);
+    defer w1.deinit();
+    var w2 = try towerOf(engine_vision, tiny_dim);
+    defer w2.deinit();
+    const pipelines_registry = mlx.engine.pipeline_registry;
+
+    // First load: no manifest, the load stores its own after its warm, then the tower warms and the manifest is
+    // written again with the warm's marker.
+    pipelines_registry.resetForTest();
+    var first = cooler_pipelines.begin(testing.allocator, io, tmp.dir, "", key, 0);
+    defer first.deinit();
+    try testing.expectEqual(cooler_pipelines.Case.none, first.case);
+    _ = first.settle();
+    first.store();
+    var one = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &w1);
+    defer one.deinit();
+    const warms = Dsv41Vision.warms;
+    try one.useEngine();
+    defer mlx.engine.budget(1 << 62) catch {};
+    try testing.expectEqual(warms + 1, Dsv41Vision.warms);
+    var stored = try manifest.lookup(testing.allocator, io, tmp.dir, key);
+    defer stored.deinit();
+    try testing.expect(stored == .same);
+    var markers: usize = 0;
+    for (stored.same.recipes) |r| markers += @intFromBool(r.kind == .marker and std.mem.startsWith(u8, r.key, "q8/"));
+    try testing.expectEqual(@as(usize, 1), markers);
+
+    // Same-key load, as a new process: the manifest's recipes make, the marker is trusted, and the tower runs no warm.
+    pipelines_registry.resetForTest();
+    var second = cooler_pipelines.begin(testing.allocator, io, tmp.dir, "", key, 0);
+    defer second.deinit();
+    try testing.expectEqual(cooler_pipelines.Case.same, second.case);
+    try testing.expect(second.settle());
+    var two = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &w2);
+    defer two.deinit();
+    const late = mlx.engine.latePipelines();
+    const made = mlx.engine.pipelinesMade().count;
+    try two.useEngine();
+    try testing.expectEqual(warms + 1, Dsv41Vision.warms);
+    try testing.expectEqual(late, mlx.engine.latePipelines());
+    try testing.expectEqual(made, mlx.engine.pipelinesMade().count);
+
+    // A manifest whose recipes did not all make is not trusted: its marker is dropped and the tower warms.
+    pipelines_registry.resetForTest();
+    pipelines_registry.putMarker(.{ .kind = .marker, .function = "vision tower", .key = "q8/stale" }) catch unreachable;
+    pipelines_registry.settleMarkers(false);
+    try testing.expect(!pipelines_registry.takeMarker("q8/stale"));
+}
+
+test "dsv41 vision: a stock kernel with an int function constant is made from its recipe, and a launch finds it" {
+    try mlx.requireGpu();
+    const stock = mlx.engine.stock_kernels;
+    const cache = mlx.engine.pipeline_cache;
+    const name = "sdpa_vector_2pass_1_float16_t_64_64";
+    const flags = [_]metal.Flag{ .{ .index = 20, .value = false }, .{ .index = 21, .value = false }, .{ .index = 22, .value = false }, .{ .index = 23, .value = false }, .{ .index = 24, .value = false }, .{ .index = 25, .value = false } };
+    const ints = [_]metal.IntConstant{.{ .index = 26, .value = 160 }};
+    _ = try stock.kernelConstants(name, "int_recipe_probe_made", &flags, &ints);
+    var recipe: ?manifest.Recipe = null;
+    for (mlx.engine.pipeline_registry.recipes()) |r| {
+        if (std.mem.eql(u8, r.key, "int_recipe_probe_made")) recipe = r;
+    }
+    var made = recipe orelse return error.RecipeNotRecorded;
+    try testing.expectEqual(@as(i32, 160), made.ints[0].value);
+    // Another process names the same pipeline by another key; the file carries the constants.
+    made.key = "int_recipe_probe_waiting";
+    const bytes = try manifest.encode(testing.allocator, "k", &.{made});
+    defer testing.allocator.free(bytes);
+    var loaded = try manifest.decode(testing.allocator, bytes);
+    defer loaded.deinit();
+    const report = cache.finish(try cache.start(loaded.recipes, 1));
+    try testing.expectEqual(@as(usize, 1), report.made);
+    const before = mlx.engine.pipelinesMade().count;
+    const preloaded = mlx.engine.preloadedPipelines();
+    _ = try stock.kernelConstants(name, "int_recipe_probe_waiting", &flags, &ints);
+    try testing.expectEqual(before, mlx.engine.pipelinesMade().count);
+    try testing.expectEqual(preloaded + 1, mlx.engine.preloadedPipelines());
 }
 
 // ── The requantized tower against the bf16 tower on a real image (the pack's tower, SUSHI_MODELS_DIR) ──
@@ -1047,4 +1653,37 @@ test "dsv41 vision: the requantized tower stays within bf16's drift of the bf16 
     try testing.expect(worst_cos > 0.998);
     try testing.expect(gt.cos > 0.998);
     try testing.expect(gs.cos > 0.998);
+}
+
+const request_media = @import("../request_media.zig");
+const arch_media = @import("../arch/media.zig");
+const chat_mod = @import("../chat.zig");
+
+test "a tower config without a vision block reserves the pixel-cap image, not a token budget it does not have" {
+    var cfg = arch_media.testConfig("deepseek_v41") orelse return error.SkipZigTest;
+    cfg.dsv41.?.vision = null;
+    const vp = request_media.visionPreprocFromConfig(&cfg);
+    try std.testing.expectEqual(.gemma, vp.mode);
+    const patches: u64 = common.effectivePixelBounds(vp.min_pixels, vp.max_pixels).max / (@as(u64, vp.patch) * vp.patch);
+    const img = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 0, .height = 0, .grid_h = 1, .grid_w = @intCast(patches) }};
+    const want = request_media.visionEncodeBill(&cfg, &img, &.{}, @intCast(patches / (vp.merge * vp.merge))).bytes;
+    try std.testing.expectEqual(want, request_media.largestImageEncodeBytes(&cfg));
+}
+
+/// The calls into mlx-c since `named_before` are the reads of imported weights and nothing else: no op, no eval.
+fn expectOnlyImportReads(named_before: []const mlx.NameCount) !void {
+    var now: std.ArrayList(mlx.NameCount) = .empty;
+    defer now.deinit(testing.allocator);
+    try mlx.callsByName(&now, testing.allocator);
+    const allowed = [_][]const u8{ "mlx_array_free", "mlx_array_ndim", "mlx_array_shape", "mlx_array_dtype", "_mlx_array_is_available", "mlx_array_data_uint8", "_mlx_array_metal_buffer", "mlx_array_strides", "mlx_array_set" };
+    for (now.items) |n| {
+        var was: u64 = 0;
+        for (named_before) |b| if (std.mem.eql(u8, b.name, n.name)) {
+            was = b.count;
+        };
+        if (n.count == was) continue;
+        for (allowed) |name| {
+            if (std.mem.eql(u8, name, n.name)) break;
+        } else return error.AnMlxCallThatIsNotAnImportRead;
+    }
 }

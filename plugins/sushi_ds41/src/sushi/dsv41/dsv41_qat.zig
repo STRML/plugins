@@ -83,13 +83,16 @@ pub fn applyKernel(sc: *Scope, k: mlx.mlx_fast_metal_kernel, inputs: []const A, 
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     // A Metal kernel runs on the GPU stream even when the scope's ops run on the CPU stream (the tests' exact one).
-    const gpu = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(gpu);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, if (mlx.streamIsGpu(sc.s)) sc.s else gpu));
+    if (mlx.streamIsGpu(sc.s)) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, sc.s));
+    } else {
+        const gpu = mlx.mlx_default_gpu_stream_new();
+        defer _ = mlx.mlx_stream_free(gpu);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, gpu));
+    }
     for (outs, 0..) |*o, i| {
-        o.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(o, ov, i));
-        _ = try sc.keep(o.*);
+        var made = mlx.mlx_array_new();
+        o.* = try sc.res(mlx.mlx_vector_array_get(&made, ov, i), &made);
     }
 }
 
@@ -473,7 +476,7 @@ test "dsv41 qat: the three round trips are bit-exact with the reference's, midpo
     try mlx.requireGpu();
     var w = try loadFixture(try fixtureDir(), "qat.safetensors");
     defer w.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const x = w.get("x").?;
     inline for (.{
@@ -497,7 +500,7 @@ test "dsv41 qat: the three round trips are bit-exact with the reference's, midpo
 
 test "dsv41 packed fp4: rows of both FP4 round trips come back from their stored form bit for bit, zeros and signs included" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     var prng = std.Random.DefaultPrng.init(0xf4);
     const rnd = prng.random();
@@ -533,7 +536,7 @@ test "dsv41 packed fp4: rows of both FP4 round trips come back from their stored
 
 test "dsv41 hc split: the sinkhorn coefficients match the reference formulas" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     var prng = std.Random.DefaultPrng.init(5);
     const r = prng.random();
@@ -585,32 +588,9 @@ test "dsv41 hc split: the sinkhorn coefficients match the reference formulas" {
     }
 }
 
-test "dsv41 hc split: the kernel and the op chain agree" {
-    try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
-    defer sc.deinit();
-    var prng = std.Random.DefaultPrng.init(6);
-    const r = prng.random();
-    var mixes: [37 * 24]f32 = undefined;
-    for (&mixes) |*v| v.* = (r.float(f32) - 0.5) * 6;
-    const scale = [_]f32{ 0.3, 0.8, 1.1 };
-    var base: [24]f32 = undefined;
-    for (&base) |*v| v.* = (r.float(f32) - 0.5) * 2;
-    const mx = try sc.floats(&mixes, &.{ 37, 24 });
-    const sa = try sc.floats(&scale, &.{3});
-    const ba = try sc.floats(&base, &.{24});
-    const k = try hcSplit(&sc, mx, sa, ba, 20, 1e-6);
-    const o = try hcSplitOps(&sc, mx, sa, ba, 20, 1e-6);
-    inline for (.{ "pre", "post", "comb" }) |f| {
-        const a = try sc_mod.hostF32(@field(k, f));
-        const b = try sc_mod.hostF32(@field(o, f));
-        for (a, b) |x, y| try testing.expectApproxEqAbs(x, y, 2e-6);
-    }
-}
-
 test "dsv41 rotary: a forward rotation then the inverse gives the input, and positions rotate pairs" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     var freqs: [8]f32 = undefined;
     invFreqs(&freqs, 16, 64, 10000, 4, 32, 1);

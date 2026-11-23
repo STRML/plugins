@@ -655,18 +655,21 @@ test "qwen roundHalfEven matches python banker's rounding" {
 
 pub fn binary(comptime f: anytype, a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(f(&out, a, b, s));
     return out;
 }
 
 pub fn astype(a: mlx.mlx_array, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, a, dtype, s));
     return out;
 }
 
 pub fn reshape(a: mlx.mlx_array, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, a, shape.ptr, shape.len, s));
     return out;
 }
@@ -721,6 +724,14 @@ pub fn quantizedBytes(out: u64, in: u64, group: u64) u64 {
     return out * in * QUANT_BITS / 8 + 2 * 2 * out * (in / group);
 }
 
+/// `quantizedBytes` as a load holds them: on the engine of our own the codes, scales and biases are each a pool
+/// tensor of its size class.
+pub fn quantizedHeldBytes(out: u64, in: u64, group: u64, engine: bool) u64 {
+    if (!engine) return quantizedBytes(out, in, group);
+    const side = 2 * out * (in / group);
+    return mlx.engine.poolBytes(out * in * QUANT_BITS / 8) + 2 * mlx.engine.poolBytes(side);
+}
+
 /// `raw` (a bf16 `[out, in]` matrix) as evaluated affine 8-bit codes of `group`; the caller owns `raw` and the result.
 pub fn requantize(raw: mlx.mlx_array, group: u32, s: mlx.mlx_stream) !dflash.DflashLinear {
     var q = try dflash.quantizeDense(raw, QUANT_BITS, group, s);
@@ -759,14 +770,16 @@ pub fn putRandomBf16(allocator: std.mem.Allocator, map: *std.StringHashMap(mlx.m
     defer allocator.free(data);
     var prng = std.Random.DefaultPrng.init(seed);
     for (data) |*x| x.* = base + scale * (prng.random().float(f32) * 2 - 1);
-    const f = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+    const f = try mlx.newData(data.ptr, shape, .float32);
     defer _ = mlx.mlx_array_free(f);
     var b = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(b);
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
     try mlx.check(mlx.mlx_astype(&b, f, .bfloat16, cpu));
     try mlx.check(mlx.mlx_array_eval(b));
-    try map.put(try allocator.dupe(u8, name), b);
+    try map.ensureUnusedCapacity(1);
+    map.putAssumeCapacity(try allocator.dupe(u8, name), b);
 }
 
 pub const Gap = struct { cos: f64, max_abs: f64, rel_rms: f64 };

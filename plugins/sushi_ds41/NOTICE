@@ -1,5 +1,8 @@
 sushi-ds41 vendors a slice of sushi (MIT, Theinruj Toranavikrai and David Dalcu) in src/sushi/, in sushi's own folders
-(dsv41/, glm5/, exl3/), copied by scripts/sync-sushi.sh from commit ec2f5a2909725333d14ee005e489c85d5655f1e4. The files
-model.zig, transformer.zig, status.zig, scheduler.zig, test_models.zig, tokenizer.zig, dflash.zig, model_load.zig,
-pair_major_pack_test.zig, dsv41/transient_peak.zig and dsv41/repack.zig there are this repo's own cut edges. It is built against the mlx-serve plugin kit.
+(dsv41/, glm5/, exl3/, tensor/), copied by scripts/sync-sushi.sh from commit 17b2ac699ae7406b49c3fff9f85a976081e6aa9c.
+The files src/sushi/{model,transformer,status,scheduler,test_models,tokenizer,dflash,model_load,transient_peak,
+cooler_side,bills,gpu_mem,metal,pipeline_manifest,model_settings,mlx_util,trunk,prefill_plan,mtp_plan,sampler,
+test_note,chat,forward_refusal,request_media,server_state,test_support}.zig, src/sushi/dsv41/{repack,dsv41_state,
+pair_major_pack_test}.zig, src/sushi/tensor/{route,matmul,attention,core}.zig, and src/sushi/arch/*.zig there are this
+repo's own cut edges. It is built against the mlx-serve plugin kit.
 The sync then applies this repo's edits to the copy: patches/*.patch.

@@ -45,7 +45,7 @@ fn skipNoGpu() !void {
 
 test "sushi_ds41 gpu: ablation removes the strength's share of a write's component along r, f32 and bf16" {
     try skipNoGpu();
-    var sc = Scope.init(testing.allocator, mlx.mlx_default_gpu_stream_new());
+    var sc = Scope.plain(testing.allocator, mlx.mlx_default_gpu_stream_new());
     defer sc.deinit();
     const y = try randn(&sc, &.{ 9, D }, 11);
     const ab = try armed(&sc, 1);
@@ -65,7 +65,7 @@ test "sushi_ds41 gpu: ablation removes the strength's share of a write's compone
 
 test "sushi_ds41 gpu: the fused decode stream's ablation equals expanding the ablated output" {
     try skipNoGpu();
-    var sc = Scope.init(testing.allocator, mlx.mlx_default_gpu_stream_new());
+    var sc = Scope.plain(testing.allocator, mlx.mlx_default_gpu_stream_new());
     defer sc.deinit();
     const ab = try armed(&sc, 1);
     const r = ab.r;
@@ -87,7 +87,7 @@ test "sushi_ds41 gpu: the fused decode stream's ablation equals expanding the ab
 
 test "sushi_ds41 gpu: the Engram ablation leaves the gate's keys and clears the value along r" {
     try skipNoGpu();
-    var sc = Scope.init(testing.allocator, mlx.mlx_default_gpu_stream_new());
+    var sc = Scope.plain(testing.allocator, mlx.mlx_default_gpu_stream_new());
     defer sc.deinit();
     const ab = try armed(&sc, 1);
     const r = ab.r;
@@ -103,7 +103,7 @@ test "sushi_ds41 gpu: the Engram ablation leaves the gate's keys and clears the 
 
 test "sushi_ds41 gpu: the stream tap keeps the hc mean of each pass's last rows and frees them on clear" {
     try skipNoGpu();
-    var sc = Scope.init(testing.allocator, mlx.mlx_default_gpu_stream_new());
+    var sc = Scope.plain(testing.allocator, mlx.mlx_default_gpu_stream_new());
     defer sc.deinit();
     var tap = try dsv.StreamTap.init(testing.allocator, 2, 4);
     defer tap.deinit();
@@ -147,7 +147,7 @@ fn modeOf(path: []const u8) !u32 {
 
 test "sushi_ds41 gpu: a tap dump writes the npy and an index line with the ablated flag, and owner-only modes only for what it makes" {
     try skipNoGpu();
-    var sc = Scope.init(testing.allocator, mlx.mlx_default_gpu_stream_new());
+    var sc = Scope.plain(testing.allocator, mlx.mlx_default_gpu_stream_new());
     defer sc.deinit();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -1,8 +1,8 @@
 diff --git a/src/sushi/dsv41/dsv41_kernels.zig b/src/sushi/dsv41/dsv41_kernels.zig
-index 612a3ab..db425d6 100644
+index ed36ae8..880e2b9 100644
 --- a/src/sushi/dsv41/dsv41_kernels.zig
 +++ b/src/sushi/dsv41/dsv41_kernels.zig
-@@ -20,7 +20,7 @@ const TDtype = struct { name: [*:0]const u8, dt: mlx.mlx_dtype };
+@@ -22,7 +22,7 @@ const TDtype = struct { name: [*:0]const u8, dt: mlx.mlx_dtype };
  const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype };
  
  /// A kernel's source and signature; the pipeline is built on first use.
@@ -11,7 +11,7 @@ index 612a3ab..db425d6 100644
      name: [*:0]const u8,
      ins: []const [*:0]const u8,
      outs: []const [*:0]const u8,
-@@ -31,7 +31,7 @@ const Def = struct {
+@@ -33,7 +33,7 @@ const Def = struct {
  
  const Grid = [3]usize;
  
@@ -20,7 +20,7 @@ index 612a3ab..db425d6 100644
      const k = try qat_mod.kernelNew(&def.built, def.name, def.ins, def.outs, def.source, def.header);
      const cfg = mlx.mlx_fast_metal_kernel_config_new();
      defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-@@ -43,7 +43,7 @@ fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid:
+@@ -45,7 +45,7 @@ fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid:
      try qat_mod.applyKernel(sc, k, inputs, cfg, result);
  }
  
@@ -29,7 +29,7 @@ index 612a3ab..db425d6 100644
      return sc.floats(vals, &.{ci(vals.len)});
  }
  
-@@ -1259,7 +1259,7 @@ const ATTN_EPI_HEADER = qat_mod.QAT_HEADER ++
+@@ -1450,7 +1450,7 @@ const ATTN_EPI_HEADER = qat_mod.QAT_HEADER ++
  /// holds a 16 x 16 fragment as 8 elements, rows `dsv41_nax_r` (lane, i) and columns `dsv41_nax_c` (lane, i), four
  /// contiguous columns a row. `dsv41_nax_mma` runs one 16 x N x KK multiply-accumulate on register fragments (one of N and
  /// KK is 32): `a` is 16 x KK, `b` KK x N, a dimension of 32 two consecutive 16-wide fragments.
@@ -39,18 +39,18 @@ index 612a3ab..db425d6 100644
      \\inline short dsv41_nax_r(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 4) | ((short(lane) >> 1) & 3)) + (i >> 2) * 8; }
      \\inline short dsv41_nax_c(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 2) | (short(lane) & 1)) * 4 + (i & 3); }
 diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
-index 02724bf..7a535ce 100644
+index 0cc067e..027f64f 100644
 --- a/src/sushi/dsv41/dsv41_model.zig
 +++ b/src/sushi/dsv41/dsv41_model.zig
-@@ -12,6 +12,7 @@ const cfg_mod = @import("dsv41_config.zig");
+@@ -16,6 +16,7 @@ const dsv41_borrow = @import("dsv41_borrow.zig");
  const sc_mod = @import("dsv41_scope.zig");
  const qat_mod = @import("dsv41_qat.zig");
  const kernels = @import("dsv41_kernels.zig");
 +const index_nax = @import("../../index_nax.zig");
  const engram = @import("dsv41_engram.zig");
  const source = @import("dsv41_source.zig");
- const owned_mod = @import("dsv41_owned.zig");
-@@ -1540,6 +1541,13 @@ fn candidatePicks(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A,
+ const owned_mod = @import("../owned_weights.zig");
+@@ -1863,6 +1864,13 @@ fn candidatePicks(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A,
      return .{ .chosen = chosen, .reach = try sc.op2(mlx.mlx_greater, try sc.takeAlong(blocks, chosen, -1), ninf) };
  }
  
@@ -64,7 +64,7 @@ index 02724bf..7a535ce 100644
  /// The indexer's scores `[Ls, nb]` of `q` (f32 `[Ls, ih, ihd]`) against `keys`: sum over heads of the weight (the
  /// projection `w` times `wscale`) times relu(q . k), -inf past the groups a query sees. A kernel for a few rows, the
  /// matrix kernel for a wide block, else the op chain over key tiles.
-@@ -1550,7 +1558,7 @@ pub fn indexScores(sc: *Scope, m: *const Model, q: A, keys: A, w: A, wscale: f32
+@@ -1873,7 +1881,7 @@ pub fn indexScores(sc: *Scope, m: *const Model, q: A, keys: A, w: A, wscale: f32
      const ihd = dim(q, 2);
      if (fusedOn(sc, m) and nb > 0) {
          if (Ls <= NARROW_ROWS and ih * ihd <= 8192) return kernels.indexScores(sc, q, keys, w, wscale, p0, r);
@@ -73,9 +73,9 @@ index 02724bf..7a535ce 100644
      }
      const weights = try sc.mul(try sc.astype(w, .float32), try sc.f(wscale));
      const keysf = try sc.astype(keys, .float32);
-@@ -1621,7 +1629,7 @@ pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale:
+@@ -1944,7 +1952,7 @@ pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale:
          const t1 = @min(nb, t0 + tile);
-         var ts = Scope.init(sc.a, sc.s);
+         var ts = sc.child();
          defer ts.deinit();
 -        var scores = try kernels.indexScoresTile(&ts, q, try rows.rowsIn(&ts, t0, t1), w, wscale, p0, r, t0);
 +        var scores = try indexScoresWide(&ts, q, try rows.rowsIn(&ts, t0, t1), w, wscale, p0, r, t0);

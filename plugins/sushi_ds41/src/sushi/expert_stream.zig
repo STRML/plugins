@@ -1,11 +1,15 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
+const expert_stats = @import("expert_stats.zig");
+const fill_marks = @import("fill_marks.zig");
 const mlx = @import("mlx.zig");
+const gpu_mem = @import("gpu_mem.zig");
 const log = @import("log.zig");
 const io_mod = @import("expert_io.zig");
 const kernels = @import("expert_bf16_kernels.zig");
 pub const quant = @import("expert_quant.zig");
 const sushi_exl3 = @import("sushi_exl3");
-const expert_usage = @import("dsv41/expert_usage.zig");
+const expert_usage = @import("expert_usage.zig");
 const prefetch_plan = @import("prefetch_plan.zig");
 const PrefetchCredit = prefetch_plan.PrefetchCredit;
 const Ragged = sushi_exl3.Ragged;
@@ -63,6 +67,11 @@ pub const moeLayerCount = quant.moeLayerCount;
 
 fn warmSlotCount(slots_per_layer: u16) u16 {
     return @intCast((@as(u32, slots_per_layer) * 4) / 5);
+}
+
+/// The slots per layer the load's warm fills: a usage-ranked warm fills every pool to its slots, the lowest-id one 80%.
+pub fn warmedSlots(slots_per_layer: u16, ranked: bool) u16 {
+    return if (ranked) slots_per_layer else warmSlotCount(slots_per_layer);
 }
 
 /// Native MXFP4 bytes per expert: two U32-packed gate/up weights, one U32
@@ -154,7 +163,7 @@ fn workspaceBytes(experts: u16, expert_bytes: u64, shape: quant.StoreShape) !u64
     return std.math.add(u64, try std.math.mul(u64, one, shape.union_sets), shape.union_meta_bytes);
 }
 
-pub const MTP_UNSUPPORTED: []const u8 = "MTP under expert streaming needs --mtp on a Sushi EXL3 Qwen3.8-Flash-Next pack or DeepSeek-V4.1-Flash";
+pub const MTP_UNSUPPORTED: []const u8 = @import("arch/admission.zig").mtp_unsupported;
 
 /// A streamed load of a supported pack keeps the MTP head, with its own experts, resident and
 /// verifies on the streamed decode path.
@@ -168,12 +177,6 @@ pub fn mtpUnderStreaming(mtp_on: bool, from_settings: bool, from_default: bool, 
     if (head_supported) return .keep;
     if (from_default) return .drop_default;
     return if (from_settings) .drop_settings else .refuse;
-}
-
-/// The streamed layouts whose kept head is proven live: a Sushi EXL3 Qwen pack, whose resident tensors carry the
-/// canonical `language_model.mtp.` keys the loader keeps, and DeepSeek-V4.1-Flash's DSpark stages. Every other model refuses.
-pub fn streamedMtpHeadSupported(is_qwen4: bool, is_dsv41: bool, layout: quant.Layout) bool {
-    return (is_qwen4 and layout == .exl3_k4) or (is_dsv41 and (layout == .mxfp4_w123 or layout == .exl3_k4));
 }
 
 pub fn mtpRefusal(expert_streaming: bool, mtp_requested: bool, head_loaded: bool) ?[]const u8 {
@@ -198,6 +201,8 @@ pub const BudgetLedger = struct {
     selected_bytes: u64,
     bounce_bytes: u64,
     pool_bytes: u64 = 0,
+    /// The scales kept in host memory (`KeptScales`); 0 where the load keeps none.
+    kept_bytes: u64 = 0,
     cache_bytes: u64,
     slots_per_layer: u16,
     resident: bool = false,
@@ -237,7 +242,7 @@ pub fn budgetLedger(
     };
     const workspace_bytes = workspaceBytes(experts, expert_bytes, shape) catch return error.InvalidExpertGeometry;
     const selected_bytes = @as(u64, @min(top_k, experts)) *| expert_bytes;
-    const fixed = trunk_bytes +| mtp_bytes +| vision_bytes +| workspace_bytes +| selected_bytes +| bounce_bytes +| shape.pool_bytes;
+    const fixed = trunk_bytes +| mtp_bytes +| vision_bytes +| workspace_bytes +| selected_bytes +| bounce_bytes +| shape.pool_bytes +| shape.kept_bytes;
     if (fixed >= budget_bytes) return error.SsdBudgetBelowResident;
     const per_slot = @as(u64, layers) *| expert_bytes;
     const slots_u64 = @min((budget_bytes - fixed) / per_slot, experts);
@@ -253,6 +258,7 @@ pub fn budgetLedger(
         .selected_bytes = selected_bytes,
         .bounce_bytes = bounce_bytes,
         .pool_bytes = shape.pool_bytes,
+        .kept_bytes = shape.kept_bytes,
         .cache_bytes = @as(u64, slots) *| per_slot,
         .slots_per_layer = slots,
     };
@@ -483,6 +489,9 @@ pub const Options = struct {
     drop_owned: ?*expert_usage.Drop = null,
     /// Rate-grouped trellis tiles land in the pools in `layout.tileMajor` order, which the rate-group kernels read.
     tile_major: bool = false,
+    /// Decode-width picks score an expert the layer's cache lacks this much lower (`ModelConfig.expertCacheBias`, 0 =
+    /// exact), in the router's own sqrt-softplus units. DeepSeek-V4.1 only; the weights stay the unbiased scores.
+    cache_bias: f32 = 0,
 };
 
 pub const Binding = struct {
@@ -516,6 +525,19 @@ pub fn parsePickTolerance(raw: []const u8) error{InvalidPickTolerance}!f32 {
     const value = std.fmt.parseFloat(f32, raw) catch return error.InvalidPickTolerance;
     if (!(value >= 0) or value > MAX_PICK_TOLERANCE) return error.InvalidPickTolerance;
     return value;
+}
+
+pub const MAX_CACHE_BIAS: f32 = @import("model_settings.zig").expert_cache_bias_max;
+
+pub fn parseCacheBias(raw: []const u8) error{InvalidCacheBias}!f32 {
+    const value = std.fmt.parseFloat(f32, raw) catch return error.InvalidCacheBias;
+    if (!(value >= 0) or value > MAX_CACHE_BIAS) return error.InvalidCacheBias;
+    return value;
+}
+
+/// The pick-score penalty of each expert: 0 where the cache holds it ready (`host_map` slot >= 0), -`bias` elsewhere.
+pub fn biasPenalty(host_map: []const i32, bias: f32, out: []f32) void {
+    for (out, host_map) |*v, slot| v.* = if (slot >= 0) 0 else -bias;
 }
 
 pub const PICK_STARVE_LIMIT: u8 = 3;
@@ -1177,6 +1199,17 @@ pub const Bf16NgramStore = struct {
 
 pub var slab_release_timeouts: std.atomic.Value(u64) = .init(0);
 
+/// Every engine's lent decoder pools (`Engine.lentOutstanding`), the process's: a promise that outlives a lease counts
+/// them in use (`gpu_mem.lentBytes`). Written only by `Engine.publishLent`.
+pub var lent_total: std.atomic.Value(u64) = .init(0);
+
+/// Admission's own reading of what a release frees (`bills.admissionAvailableFor`), on either engine: the active bytes,
+/// MLX's and the engine's, and the engine's free buffers it credits. A buffer that leaves those in use for the free ones
+/// counts twice, since the read-back reuses it.
+fn lentReading() i64 {
+    return -@as(i64, @intCast(gpu_mem.activeBytes())) + @as(i64, @intCast(gpu_mem.engineFree()));
+}
+
 const SlabOperand = struct {
     present: bool = false,
     slab: ?*io_mod.PageSlab = null,
@@ -1189,16 +1222,16 @@ const SlabOperand = struct {
         return .{ .stride = 0, .count = 0 };
     }
 
-    fn create(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32) !SlabOperand {
-        return createTyped(allocator, count, d0, d1, .bfloat16, 2);
+    fn create(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, s: mlx.mlx_stream) !SlabOperand {
+        return createTyped(allocator, count, d0, d1, .bfloat16, 2, s);
     }
 
-    fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
-        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes);
+    fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
+        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes, s);
     }
 
     /// One flat axis of `elems` elements: a rate-grouped layer's trellis storage, pools back to back.
-    fn createFlat(allocator: std.mem.Allocator, elems: usize, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
+    fn createFlat(allocator: std.mem.Allocator, elems: usize, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
         if (elems == 0 or elems > std.math.maxInt(c_int) or elem_bytes == 0) return error.InvalidExpertGeometry;
         const stride = elems * elem_bytes;
         const slab = try io_mod.PageSlab.create(allocator, stride);
@@ -1206,7 +1239,7 @@ const SlabOperand = struct {
         const payload = try allocator.create(io_mod.ImportPayload);
         errdefer allocator.destroy(payload);
         payload.* = .{};
-        const operand = try io_mod.importSlab(slab, &.{@intCast(elems)}, dtype, payload, .{});
+        const operand = try io_mod.importSlab(slab, &.{@intCast(elems)}, dtype, payload, .{ .engine = mlx.engine.isStream(s) });
         if (!operand.aliased) {
             _ = mlx.mlx_array_free(operand.array);
             return error.ExpertSlabImportCopied;
@@ -1214,7 +1247,7 @@ const SlabOperand = struct {
         return .{ .present = true, .slab = slab, .payload = payload, .array = operand.array, .stride = stride, .count = 1 };
     }
 
-    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
+    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
         if (count == 0 or inner.len == 0 or inner.len > 3 or elem_bytes == 0) return error.InvalidExpertGeometry;
         var stride: usize = elem_bytes;
         var shape: [4]c_int = undefined;
@@ -1229,7 +1262,7 @@ const SlabOperand = struct {
         const payload = try allocator.create(io_mod.ImportPayload);
         errdefer allocator.destroy(payload);
         payload.* = .{};
-        const operand = try io_mod.importSlab(slab, shape[0 .. inner.len + 1], dtype, payload, .{});
+        const operand = try io_mod.importSlab(slab, shape[0 .. inner.len + 1], dtype, payload, .{ .engine = mlx.engine.isStream(s) });
         if (!operand.aliased) {
             _ = mlx.mlx_array_free(operand.array);
             return error.ExpertSlabImportCopied;
@@ -1238,10 +1271,17 @@ const SlabOperand = struct {
     }
 
     fn destroy(self: *SlabOperand, allocator: std.mem.Allocator, s: mlx.mlx_stream) void {
-        if (!self.present) return;
-        const slab = self.slab orelse return;
-        const payload = self.payload orelse return;
+        _ = self.release(allocator, s);
+    }
+
+    /// `destroy`, and whether this slab's pages left: false when its release timed out and they stay mapped.
+    fn release(self: *SlabOperand, allocator: std.mem.Allocator, s: mlx.mlx_stream) bool {
+        if (!self.present) return true;
+        const slab = self.slab orelse return true;
+        const payload = self.payload orelse return true;
         _ = mlx.mlx_array_free(self.array);
+        // The engine's imports of the array end when its passes have run, which only its own wait lets it know.
+        if (mlx.engine.enabled) mlx.engine.close();
         var attempt: usize = 0;
         while (payload.released.load(.acquire) == 0 and attempt < 32) : (attempt += 1) {
             _ = mlx.mlx_synchronize(s);
@@ -1252,14 +1292,15 @@ const SlabOperand = struct {
             const timeouts = slab_release_timeouts.fetchAdd(1, .monotonic) + 1;
             log.warn("[expert-stream] slab release timed out: {d} bytes stay mapped for MLX and are never freed (timeouts so far {d})\n", .{ slab.bytes.len, timeouts });
             self.* = undefined;
-            return;
+            return false;
         }
         slab.destroy();
         allocator.destroy(payload);
         self.* = undefined;
+        return true;
     }
 
-    fn slotBytes(self: *const SlabOperand, slot: usize) []u8 {
+    pub fn slotBytes(self: *const SlabOperand, slot: usize) []u8 {
         if (!self.present) return &.{};
         const slab = self.slab orelse return &.{};
         return slab.bytes[slot * self.stride ..][0..self.stride];
@@ -1427,6 +1468,8 @@ const LayerStats = struct {
     misses: u64 = 0,
     fill_bytes: u64 = 0,
     host_sync_ns: u64 = 0,
+    /// Routes whose picks the host read before the experts ran.
+    host_routes: u64 = 0,
     fill_ns: u64 = 0,
     compute_ns: u64 = 0,
 };
@@ -1641,6 +1684,8 @@ const LayerState = struct {
     /// release gave back.
     saved: []u16 = &.{},
     lent: u64 = 0,
+    /// What the pool's release moved in `lentReading` (`Engine.lentOutstanding`), its union workspace not netted out.
+    lent_read: i64 = 0,
     /// A resident pack's int32 `[experts]` map from expert id to its global slot in the cache bank; null while released.
     resident_map: mlx.mlx_array = .{ .ctx = null },
     /// A rate-grouped layer's `substituteMisses` starvation counts, by global expert id.
@@ -1650,11 +1695,14 @@ const LayerState = struct {
     spec_host: []i32 = &.{},
     spec_slots: mlx.mlx_array = .{ .ctx = null },
     spec_raw: mlx.mlx_array = .{ .ctx = null },
+    /// f32 `[experts]` pick-score penalty of `spec_host` (`biasPenalty`); null context while the engine's bias is off.
+    spec_pen: mlx.mlx_array = .{ .ctx = null },
 
     /// Brings the host map and its GPU copy up to the cache. The pair only ever
     /// changes together: a failure leaves no GPU map and a host map that forces
     /// the next call to rebuild.
-    fn refreshSpec(self: *LayerState, allocator: std.mem.Allocator) !void {
+    /// `cache_bias` > 0 also builds the map's pick-score penalty (`spec_pen`).
+    fn refreshSpec(self: *LayerState, allocator: std.mem.Allocator, s: mlx.mlx_stream, cache_bias: f32) !void {
         const experts = if (self.grouped) |gl| gl.expertCount() else self.cache.expert_to_slot.len;
         if (self.spec_host.len != experts) {
             if (self.spec_host.len != 0) allocator.free(self.spec_host);
@@ -1669,6 +1717,8 @@ const LayerState = struct {
             self.spec_slots = .{ .ctx = null };
             if (self.spec_raw.ctx != null) _ = mlx.mlx_array_free(self.spec_raw);
             self.spec_raw = .{ .ctx = null };
+            if (self.spec_pen.ctx != null) _ = mlx.mlx_array_free(self.spec_pen);
+            self.spec_pen = .{ .ctx = null };
             @memset(self.spec_host, -2);
         }
         const gpu = try allocator.alloc(i32, experts);
@@ -1678,15 +1728,29 @@ const LayerState = struct {
             spec_alloc_fail_for_test = false;
             return error.ExpertSpecMapAlloc;
         }
-        const fresh = mlx.mlx_array_new_data(gpu.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
+        const scope = mlx.engine.enter(s);
+        defer scope.end();
+        const fresh = try mlx.newData(gpu.ptr, &[_]c_int{@intCast(experts)}, .int32);
         if (fresh.ctx == null) return error.ExpertSpecMapAlloc;
         errdefer _ = mlx.mlx_array_free(fresh);
-        const raw = mlx.mlx_array_new_data(self.spec_host.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
+        var pen: mlx.mlx_array = .{ .ctx = null };
+        if (cache_bias > 0) {
+            const host_pen = try allocator.alloc(f32, experts);
+            defer allocator.free(host_pen);
+            biasPenalty(self.spec_host, cache_bias, host_pen);
+            pen = try mlx.newData(host_pen.ptr, &[_]c_int{@intCast(experts)}, .float32);
+        }
+        errdefer if (pen.ctx != null) {
+            _ = mlx.mlx_array_free(pen);
+        };
+        const raw = try mlx.newData(self.spec_host.ptr, &[_]c_int{@intCast(experts)}, .int32);
         if (raw.ctx == null) return error.ExpertSpecMapAlloc;
         if (self.spec_slots.ctx != null) _ = mlx.mlx_array_free(self.spec_slots);
         self.spec_slots = fresh;
         if (self.spec_raw.ctx != null) _ = mlx.mlx_array_free(self.spec_raw);
         self.spec_raw = raw;
+        if (self.spec_pen.ctx != null) _ = mlx.mlx_array_free(self.spec_pen);
+        self.spec_pen = pen;
     }
 };
 
@@ -1751,11 +1815,11 @@ fn createSlabSetAt(allocator: std.mem.Allocator, store: *const ExpertStore, laye
         slabs[made] = if (!store.componentPresent(made) or spec.slot_bytes == 0)
             SlabOperand.absent()
         else if (spec.exl3 and spec.packed_n != 0)
-            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes)
+            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes, s)
         else if (spec.exl3)
-            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes)
+            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes, s)
         else
-            try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes);
+            try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes, s);
     }
     return slabs;
 }
@@ -1772,9 +1836,9 @@ fn createGroupedSlabs(allocator: std.mem.Allocator, layer: *const GroupedLayer, 
     while (made < n) : (made += 1) {
         const pi = made / 3;
         slabs[made] = if (made % 3 == 0)
-            try SlabOperand.createFlat(allocator, if (slots) |per_group| layer.trellisElems(pi, per_group) else elems.?[pi], .uint16, 2)
+            try SlabOperand.createFlat(allocator, if (slots) |per_group| layer.trellisElems(pi, per_group) else elems.?[pi], .uint16, 2, s)
         else
-            try SlabOperand.createShaped(allocator, rows, &.{@intCast(layer.pieceBytes(0, made) / 2)}, .float16, 2);
+            try SlabOperand.createShaped(allocator, rows, &.{@intCast(layer.pieceBytes(0, made) / 2)}, .float16, 2, s);
     }
     return slabs;
 }
@@ -1788,6 +1852,31 @@ fn presentSlabCount(slabs: []const SlabOperand) u64 {
 }
 
 /// A wide route's SSD fill in stages: stage 0 every miss's scale pieces, stage 1 + g rate group g's trellis.
+/// A missed expert whose scales are being read from the SSD: where each scale component lands.
+const ScaleRead = struct { expert: u16, dst: [quant.component_count][]u8 = @splat(&.{}) };
+
+/// The scale vectors of every expert the engine has read them for (`Engine.keepScales`), in host memory: a later miss
+/// of the expert copies them from here and reads only its trellis. One entry an expert, its scale components in
+/// component order.
+pub const KeptScales = struct {
+    entries: []?[]u8,
+    experts: usize,
+    bytes: u64 = 0,
+    /// Experts whose scales were read from the SSD and kept.
+    read: u64 = 0,
+    /// Misses filled from here.
+    served: u64 = 0,
+
+    fn at(self: *KeptScales, layer: u16, expert: usize) *?[]u8 {
+        return &self.entries[@as(usize, layer) * self.experts + expert];
+    }
+
+    fn deinit(self: *KeptScales, allocator: std.mem.Allocator) void {
+        for (self.entries) |entry| if (entry) |bytes| allocator.free(bytes);
+        allocator.free(self.entries);
+    }
+};
+
 pub const Staged = struct {
     layer: u16,
     gl: *GroupedLayer,
@@ -1798,13 +1887,26 @@ pub const Staged = struct {
     spans: [1 + quant.rate_group_limit]std.ArrayList(io_mod.FillSpan) = @splat(.empty),
     /// Admitted misses as (group, slot), ready once every stage has landed.
     admitted: std.ArrayList([2]u16) = .empty,
+    /// The scales stage 0 reads, kept once it has landed.
+    scale_reads: std.ArrayList(ScaleRead) = .empty,
     misses: u64 = 0,
     /// Stages read so far.
     done: usize = 0,
     ended: bool = false,
+    /// The ranges each stage is still writing, marked in `fill_marks` (keyed by their start) when the route's caller reads
+    /// stage by stage on the engine; empty otherwise, where the slabs are marked whole.
+    marks: [1 + quant.rate_group_limit]std.ArrayList(usize) = @splat(.empty),
+    /// Each group's overflow into the union, kept for the bank a ranged route builds once the scales have landed.
+    overflow: [quant.rate_group_limit]u32 = @splat(0),
 
     pub fn stages(self: *const Staged) usize {
         return 1 + self.groups;
+    }
+
+    /// Stage `stage` has landed: its ranges may be read.
+    fn unmark(self: *Staged, stage: usize) void {
+        for (self.marks[stage].items) |begin| fill_marks.remove(begin);
+        self.marks[stage].clearRetainingCapacity();
     }
 
     fn slabSets(self: *const Staged, engine: *Engine) [2][]SlabOperand {
@@ -1815,12 +1917,16 @@ pub const Staged = struct {
     fn abort(self: *Staged, engine: *Engine) void {
         for (self.slabSets(engine)[0..self.sets], self.begun[0..self.sets]) |set, begun| for (set[0..begun]) |*operand| abortFill(operand);
         self.begun = @splat(0);
+        for (0..self.stages()) |stage| self.unmark(stage);
         for (self.gl.caches[0..self.groups]) |*cache| cache.invalidateUnready();
     }
 
     fn destroy(self: *Staged, allocator: std.mem.Allocator) void {
+        for (0..self.stages()) |stage| self.unmark(stage);
+        for (&self.marks) |*list| list.deinit(allocator);
         for (&self.spans) |*list| list.deinit(allocator);
         self.admitted.deinit(allocator);
+        self.scale_reads.deinit(allocator);
         allocator.destroy(self);
     }
 };
@@ -1936,13 +2042,22 @@ const probe_ns: u64 = 50 * std.time.ns_per_ms;
 /// What `Engine.probeReadRate` read: the rate at each of `probe_widths` and the best of them, in bytes a second.
 pub const ProbeReading = struct { bps: [probe_widths.len]f64, max_bps: f64 };
 
+/// Below this share of the routed rows kept, a drop's answers say nothing of the model's quality (`kept_share`).
+const drop_quality_floor = 0.5;
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     geometry: Geometry,
+    kept: ?KeptScales = null,
     drop_owned: ?*expert_usage.Drop = null,
+    /// Per routed layer, the `[experts]` row a router adds to its logits so it never picks a dropped expert
+    /// (`dropMask`), made on the first forward that asks.
+    drop_masks: []mlx.mlx_array = &.{},
     /// The pack's `expert_usage.json` counts, `[routed layer][expert id]`: ranks what `warmCache` preloads.
     warm_usage: ?expert_usage.Usage = null,
     plan: CachePlan,
+    /// `fillStats().bytes_read` already added to `expert_stats.process`.
+    read_reported: u64 = 0,
     store: ExpertStore,
     layers: []LayerState,
     s: mlx.mlx_stream,
@@ -1968,6 +2083,8 @@ pub const Engine = struct {
     copy_bytes_total: u64 = 0,
     /// Wide routes whose fill the caller staged (`prepareHostStaged`).
     staged_routes: u64 = 0,
+    /// The next staged route marks the ranges its stages write instead of the slabs whole (`prepareHostStagedRanged`).
+    range_marks: bool = false,
     forward_clock: Clock,
     last: Breakdown = .{},
     route_linear: RouteClass = .{},
@@ -1977,10 +2094,17 @@ pub const Engine = struct {
     /// published (`ModelConfig.expert_borrow_bytes`, read by admission on other threads).
     borrow_from: u16 = std.math.maxInt(u16),
     borrow_publish: ?*u64 = null,
+    /// Where this engine's share of `lent_total` is published (`ModelConfig.expert_lent_bytes`).
+    lent_publish: ?*u64 = null,
+    /// This engine's share of `lent_total`, as last published.
+    lent_published: u64 = 0,
     /// Routed ids the lossy pick replaced on rate-grouped layers, of the ids it saw (`swapGroupedMisses`).
     swapped_ids: u64 = 0,
     swap_seen_ids: u64 = 0,
     swap_reported_at: u64 = 0,
+    bias_logged: bool = false,
+    /// `Options.cache_bias`: this load's, never another's.
+    cache_bias: f32 = 0,
 
     pub fn pendingReaders(self: *const Engine) usize {
         var n: usize = 0;
@@ -2024,6 +2148,7 @@ pub const Engine = struct {
             .layers = &.{},
             .s = s,
             .forward_clock = Clock.init(),
+            .cache_bias = opts.cache_bias,
         };
         errdefer engine.releaseSlabs();
         const fds = try allocator.alloc(std.c.fd_t, engine.store.fileCount());
@@ -2114,6 +2239,11 @@ pub const Engine = struct {
             log.info("[expert-drop] n={d} per layer, {d} experts, {d:.2} GB not loaded, list from {s}\n", .{
                 d.n, @as(u64, d.n) * moeLayerCount(geometry), @as(f64, @floatFromInt(engine.droppedBytes())) / 1e9, d.source,
             });
+            const speed_only = d.kept_share < drop_quality_floor;
+            log.info("[expert-drop] the kept experts held {d:.1}% of the routed rows the list counts{s}; a layer past its {d} keeps every expert\n", .{
+                d.kept_share * 100, if (speed_only) ": its answers are a speed reading only, never a quality one" else "", d.rows.len,
+            });
+            if (d.moved != 0) log.info("[expert-drop] {d} experts kept to leave each rate group one, a less-used expert dropped in each place\n", .{d.moved});
         } else engine.drop_owned = opts.drop_owned;
         if (!plan.resident) engine.warm_usage = readWarmUsage(allocator, model_dir, moeLayerCount(geometry), geometry.experts);
         log.info("[expert-stream] cache {d:.3} GB, {d} slots/layer, workspace {d:.3} GB, bounce {d:.3} GB, fallback_imports={d}\n", .{
@@ -2123,6 +2253,7 @@ pub const Engine = struct {
             @as(f64, @floatFromInt(plan.bounce_bytes)) / 1e9,
             engine.fallback_imports,
         });
+        expert_stats.process.engine(true, plan.cache_bytes);
         return engine;
     }
 
@@ -2139,6 +2270,8 @@ pub const Engine = struct {
             layer.spec_slots = .{ .ctx = null };
             if (layer.spec_raw.ctx != null) _ = mlx.mlx_array_free(layer.spec_raw);
             layer.spec_raw = .{ .ctx = null };
+            if (layer.spec_pen.ctx != null) _ = mlx.mlx_array_free(layer.spec_pen);
+            layer.spec_pen = .{ .ctx = null };
             if (layer.resident_map.ctx != null) _ = mlx.mlx_array_free(layer.resident_map);
             layer.resident_map = .{ .ctx = null };
             if (layer.starved.len != 0) self.allocator.free(layer.starved);
@@ -2164,6 +2297,8 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
+        expert_stats.process.engine(false, self.plan.cache_bytes);
+        self.publishLent(0);
         self.stopPrefetch();
         self.drainPendingReaders();
         self.releaseSlabs();
@@ -2171,12 +2306,59 @@ pub const Engine = struct {
         self.allocator.free(self.layers);
         self.age_log.deinit(self.allocator);
         self.store.deinit();
+        for (self.drop_masks) |m| if (m.ctx != null) {
+            _ = mlx.mlx_array_free(m);
+        };
+        if (self.drop_masks.len != 0) self.allocator.free(self.drop_masks);
         if (self.drop_owned) |d| {
             d.deinit();
             self.allocator.destroy(d);
         }
         if (self.warm_usage) |*u| u.deinit();
+        if (self.kept) |*k| k.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// From here on the scales of an expert read from the SSD stay in host memory (`KeptScales`).
+    pub fn keepScales(self: *Engine) !void {
+        if (self.kept != null) return;
+        const entries = try self.allocator.alloc(?[]u8, @as(usize, self.geometry.layers) * self.geometry.experts);
+        @memset(entries, null);
+        self.kept = .{ .entries = entries, .experts = self.geometry.experts };
+    }
+
+    /// The scale component `ci` of `expert` copied to `dst` from the kept ones; false where none is kept, and the
+    /// caller reads it.
+    fn scaleFromKept(self: *Engine, layer: u16, expert: u16, ci: usize, dst: []u8) bool {
+        const k = &(self.kept orelse return false);
+        const entry = k.at(layer, expert).* orelse return false;
+        var at: usize = 0;
+        for (0..ci) |cj| {
+            if (cj % 3 != 0) at += self.store.spanAt(layer, expert, cj).len;
+        }
+        @memcpy(dst, entry[at..][0..dst.len]);
+        if (ci == 1) k.served += 1;
+        return true;
+    }
+
+    /// Keeps the scales `reads` name, which have landed.
+    fn keepRead(self: *Engine, layer: u16, reads: []const ScaleRead) !void {
+        const k = &(self.kept orelse return);
+        for (reads) |r| {
+            const entry = k.at(layer, r.expert);
+            if (entry.* != null) continue;
+            var total: usize = 0;
+            for (r.dst) |d| total += d.len;
+            const bytes = try self.allocator.alloc(u8, total);
+            var at: usize = 0;
+            for (r.dst) |d| {
+                @memcpy(bytes[at..][0..d.len], d);
+                at += d.len;
+            }
+            entry.* = bytes;
+            k.bytes += total;
+            k.read += 1;
+        }
     }
 
     /// Bytes `--drop-expert` leaves unloaded: each dropped expert at its own rate group's size.
@@ -2219,13 +2401,23 @@ pub const Engine = struct {
     }
 
     pub fn noteRoute(self: *Engine, layer: u16, full_attn: bool, detail: RouteDetail) void {
-        if (layer < self.layers.len) self.layers[layer].stats.host_sync_ns +|= detail.totalNs();
+        if (layer < self.layers.len) {
+            self.layers[layer].stats.host_sync_ns +|= detail.totalNs();
+            self.layers[layer].stats.host_routes += 1;
+        }
         if (full_attn) self.route_full.add(detail) else self.route_linear.add(detail);
     }
 
     pub fn routeProbeActive(self: *const Engine) bool {
         const next = self.forward_count + 1;
         return next <= 3 or next % BREAKDOWN_EVERY == BREAKDOWN_EVERY / 2;
+    }
+
+    /// Routes of every layer whose picks the host read (`noteRoute`) since the engine began.
+    pub fn hostRoutes(self: *const Engine) u64 {
+        var n: u64 = 0;
+        for (self.layers) |*layer| n += layer.stats.host_routes;
+        return n;
     }
 
     pub fn noteExpertCompute(self: *Engine, layer: u16, nanoseconds: u64) void {
@@ -2292,6 +2484,9 @@ pub const Engine = struct {
             acc.unions += layer.stats.unions;
         }
         self.last = acc;
+        const read_total = self.fillStats().bytes_read;
+        expert_stats.process.recordForward(.{ .wall_ns = wall_ns, .routes = acc.union_members, .hits = acc.hits, .fill_bytes = acc.fill_bytes, .fill_ns = acc.fill_ns, .ssd_read_bytes = read_total -| self.read_reported });
+        self.read_reported = read_total;
         if (self.prefetcher) |pf| {
             const io = std.Io.Threaded.global_single_threaded.io();
             pf.mu.lockUncancelable(io);
@@ -2386,7 +2581,7 @@ pub const Engine = struct {
         if (self.store.quantized == null or self.store.layout() == .bf16_individual or layer_index >= self.layers.len) return null;
         const layer = &self.layers[layer_index];
         if (!layer.active or layer.grouped != null or layer.slabs.len != self.store.componentCount()) return null;
-        try layer.refreshSpec(self.allocator);
+        try layer.refreshSpec(self.allocator, self.s, self.cache_bias);
         var operands: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         for (layer.slabs, 0..) |operand, ci| operands[ci] = operand.array;
         return .{ .slots = layer.spec_slots, .raw = layer.spec_raw, .starved = layer.cache.swap_starved, .host = layer.spec_host, .operands = operands };
@@ -2409,8 +2604,27 @@ pub const Engine = struct {
         const layer = &self.layers[layer_index];
         const gl = layer.grouped orelse return null;
         if (!layer.active or layer.borrowed or layer.resident_map.ctx != null or layer.slabs.len != quant.component_count) return null;
-        try layer.refreshSpec(self.allocator);
+        try layer.refreshSpec(self.allocator, self.s, self.cache_bias);
         return .{ .slots = layer.spec_slots, .host = layer.spec_host, .bank = &gl.cache_ragged };
+    }
+
+    /// The pick-score penalty `--expert-cache-bias` gives a layer's decode-width router (f32 `[experts]`).
+    /// Null where the bias is off, `--expert-pick-tolerance` is set (it swaps on the host and keeps nothing queued), or
+    /// the layer has no map (the cases `specGrouped` and `specRoute` answer null for).
+    pub fn cachePenalty(self: *Engine, layer_index: u16) !?mlx.mlx_array {
+        if (!(self.cache_bias > 0)) return null;
+        if (pick_tolerance > 0) {
+            if (!self.bias_logged) log.warn("[expert-bias] --expert-cache-bias is ignored: --expert-pick-tolerance is set\n", .{});
+            self.bias_logged = true;
+            return null;
+        }
+        const grouped = layer_index < self.layers.len and self.layers[layer_index].grouped != null;
+        const has_map = if (grouped) (try self.specGrouped(layer_index)) != null else (try self.specRoute(layer_index)) != null;
+        if (!has_map) return null;
+        const pen = self.layers[layer_index].spec_pen;
+        if (pen.ctx != null and !self.bias_logged) log.info("[expert-bias] engaged: bias={d:.2} (lossy: an expert the cache lacks scores that much lower at decode widths)\n", .{self.cache_bias});
+        self.bias_logged = true;
+        return if (pen.ctx != null) pen else null;
     }
 
     pub fn prepareHost(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
@@ -2830,19 +3044,31 @@ pub const Engine = struct {
 
     /// The bytes the union workspace takes: its nine slabs and the meta table of each layer that may be released.
     pub fn unionBytes(self: *const Engine) u64 {
-        var bytes: u64 = 0;
-        var meta: u64 = 0;
+        const parts = self.unionParts();
+        return parts.slabs + parts.metas * parts.meta;
+    }
+
+    /// What making the union workspace may take from `lentReading`: its slabs, and each meta table at its pool class
+    /// twice, since one the engine takes from its free buffers leaves their credit too.
+    fn unionReadBound(self: *const Engine) u64 {
+        const parts = self.unionParts();
+        return parts.slabs + parts.metas * 2 * @import("tensor/pool_class.zig").poolBytes(parts.meta);
+    }
+
+    fn unionParts(self: *const Engine) struct { slabs: u64, meta: u64, metas: u64 } {
+        var slabs: u64 = 0;
+        var metas: u64 = 0;
         for (self.layers, 0..) |*layer, li| {
             const gl = layer.grouped orelse continue;
-            if (bytes == 0) {
-                for (self.union_elems) |elems| bytes += elems * 2;
+            if (slabs == 0) {
+                for (self.union_elems) |elems| slabs += elems * 2;
                 for (0..quant.component_count) |ci| {
-                    if (ci % 3 != 0) bytes += @as(u64, self.geometry.kept()) * gl.pieceBytes(0, ci);
+                    if (ci % 3 != 0) slabs += @as(u64, self.geometry.kept()) * gl.pieceBytes(0, ci);
                 }
             }
-            if (li >= self.borrow_from) meta += @as(u64, self.geometry.kept()) * sushi_exl3.rate_groups.META_WORDS * 4;
+            if (li >= self.borrow_from) metas += 1;
         }
-        return bytes + meta;
+        return .{ .slabs = slabs, .meta = @as(u64, self.geometry.kept()) * sushi_exl3.rate_groups.META_WORDS * 4, .metas = metas };
     }
 
     /// What a resident pack's first release must first pay for the union workspace; 0 once it exists.
@@ -2916,7 +3142,9 @@ pub const Engine = struct {
             slot.* = @as(i32, @intCast(gl.slot_base[g])) + local;
         }
         if (layer.resident_map.ctx != null) _ = mlx.mlx_array_free(layer.resident_map);
-        layer.resident_map = mlx.mlx_array_new_data(host.ptr, &[_]c_int{@intCast(host.len)}, 1, .int32);
+        const scope = mlx.engine.enter(self.s);
+        defer scope.end();
+        layer.resident_map = try mlx.newData(host.ptr, &[_]c_int{@intCast(host.len)}, .int32);
     }
 
     /// The lossy pick on a rate-grouped layer: a missed expert may take any expert already in one of the layer's pools,
@@ -2963,8 +3191,34 @@ pub const Engine = struct {
         return .{ .map = layer.resident_map, .bank = &layer.grouped.?.cache_ragged };
     }
 
-    pub fn publishBorrowable(self: *const Engine) void {
+    /// Publishes what a prefill may still borrow (`ModelConfig.expert_borrow_bytes`) and what is lent (`lent_total`,
+    /// this engine's share in `ModelConfig.expert_lent_bytes`).
+    pub fn publishBorrowable(self: *Engine) void {
         if (self.borrow_publish) |dst| @atomicStore(u64, dst, self.borrowableBytes(), .monotonic);
+        self.publishLent(self.lentOutstanding());
+        if (self.lent_publish) |dst| @atomicStore(u64, dst, self.lent_published, .monotonic);
+    }
+
+    fn publishLent(self: *Engine, lent: u64) void {
+        _ = lent_total.fetchAdd(lent, .monotonic);
+        _ = lent_total.fetchSub(self.lent_published, .monotonic);
+        self.lent_published = lent;
+    }
+
+    /// What the released pools' read-back takes back from admission's reading: what each pool's release moved in
+    /// `lentReading`. A resident pack's union workspace is in the active bytes until the last read-back drops it, so a
+    /// promise holds it beside every pool the read-back takes back.
+    pub fn lentOutstanding(self: *const Engine) u64 {
+        var lent: i64 = 0;
+        var any = false;
+        for (self.layers) |*layer| if (layer.borrowed) {
+            lent += layer.lent_read;
+            any = true;
+        };
+        // A layer released with no union workspace (its workspace and take-back both failed) is healed before the next
+        // forward, which makes the workspace: held back before it is made.
+        if (any and self.grouped_union.len == 0) lent += @intCast(self.unionReadBound());
+        return @intCast(@max(lent, 0));
     }
 
     /// Releases rate-grouped layer `li`'s pool: its experts are remembered, its bank dropped and its slabs unmapped
@@ -2985,6 +3239,42 @@ pub const Engine = struct {
             }
         }
         layer.saved = try saved.toOwnedSlice(self.allocator);
+        const before = lentReading();
+        const freed = self.dropPool(layer, gl);
+        // Measured as the pool leaves, so every exit that leaves the layer released publishes it, stranded included.
+        layer.lent_read = lentReading() - before;
+        layer.borrowed = true;
+        layer.lent = freed;
+        defer self.publishBorrowable();
+        // Released first, so the workspace comes out of the pool it replaces; without one the layer takes its pool back.
+        self.ensureUnion() catch |e| {
+            self.restoreLayer(li) catch |re| log.err("[expert-stream] layer {d} stays released with no union workspace until the next forward: {s}\n", .{ li, @errorName(re) });
+            return e;
+        };
+        return freed;
+    }
+
+    /// A released layer reads its picks through the union workspace. One left without it (a release whose take-back
+    /// failed too) gets the workspace, else its pool back; when neither can be made the forward is refused.
+    pub fn healReleased(self: *Engine) !void {
+        if (self.grouped_union.len != 0) return;
+        for (self.layers) |*layer| {
+            if (layer.borrowed) break;
+        } else return;
+        if (self.ensureUnion()) |_| {
+            self.publishBorrowable();
+            return;
+        } else |union_err| for (self.layers, 0..) |*layer, li| {
+            if (!layer.borrowed) continue;
+            self.restoreLayer(@intCast(li)) catch |e| {
+                log.err("[expert-stream] layer {d} is released with no union workspace: the workspace failed ({s}), and its pool ({s})\n", .{ li, @errorName(union_err), @errorName(e) });
+                return error.ReleasedLayerHasNoUnion;
+            };
+        }
+    }
+
+    /// Drops a layer's bank, caches, slabs and resident map once no reader holds them; returns the bytes MLX gave back.
+    fn dropPool(self: *Engine, layer: *LayerState, gl: *GroupedLayer) u64 {
         const meta = gl.cache_ragged.meta;
         var freed: u64 = if (meta.ctx != null) mlx.mlx_array_size(meta) * mlx.mlx_array_itemsize(meta) else 0;
         gl.cache_ragged.deinit();
@@ -2992,19 +3282,12 @@ pub const Engine = struct {
         for (layer.slabs) |*operand| {
             if (!operand.present) continue;
             const bytes = operand.stride * operand.count;
-            const timeouts = slab_release_timeouts.load(.monotonic);
-            operand.destroy(self.allocator, self.s);
-            if (slab_release_timeouts.load(.monotonic) == timeouts) freed += bytes;
+            if (operand.release(self.allocator, self.s)) freed += bytes;
         }
         if (layer.slabs.len != 0) self.allocator.free(layer.slabs);
         layer.slabs = &.{};
         if (layer.resident_map.ctx != null) _ = mlx.mlx_array_free(layer.resident_map);
         layer.resident_map = .{ .ctx = null };
-        layer.borrowed = true;
-        layer.lent = freed;
-        // Released first, so the workspace comes out of the pool it replaces.
-        try self.ensureUnion();
-        self.publishBorrowable();
         return freed;
     }
 
@@ -3012,26 +3295,33 @@ pub const Engine = struct {
         return if (self.layers[li].borrowed) self.layers[li].lent else 0;
     }
 
-    /// Gives a released layer its pool back and reads into it the experts it held when released.
+    /// Gives a released layer its pool back and reads into it the experts it held when released. A restore that fails
+    /// leaves the layer released, as it was.
     pub fn restoreLayer(self: *Engine, li: u16) !void {
         self.prefetchWait(li);
         const layer = &self.layers[li];
         const gl = layer.grouped orelse return error.ExpertLayerNotGrouped;
         if (!layer.borrowed) return;
         try self.rebuildPool(layer, gl);
+        errdefer {
+            self.drainPendingReaders();
+            _ = mlx.mlx_synchronize(self.s);
+            _ = self.dropPool(layer, gl);
+        }
+        // The refill reads into the pool, which only a layer that is not released has.
         layer.borrowed = false;
-        self.publishBorrowable();
-        const saved = layer.saved;
-        layer.saved = &.{};
-        defer self.allocator.free(saved);
-        if (saved.len != 0) {
+        errdefer layer.borrowed = true;
+        if (layer.saved.len != 0) {
             const stats = layer.stats;
             defer layer.stats = stats;
-            var prepared = try self.prepareHost(li, saved);
+            var prepared = try self.prepareHost(li, layer.saved);
             prepared.deinit();
         }
+        if (self.plan.resident) try self.buildResidentMap(li);
+        self.allocator.free(layer.saved);
+        layer.saved = &.{};
+        self.publishBorrowable();
         if (!self.plan.resident) return;
-        try self.buildResidentMap(li);
         for (self.layers) |*other| if (other.borrowed) return;
         self.drainPendingReaders();
         _ = mlx.mlx_synchronize(self.s);
@@ -3187,6 +3477,8 @@ pub const Engine = struct {
 
         var spans: std.ArrayList(io_mod.FillSpan) = .empty;
         defer spans.deinit(self.allocator);
+        var scale_reads: std.ArrayList(ScaleRead) = .empty;
+        defer scale_reads.deinit(self.allocator);
         var misses: u64 = 0;
         var copy_clock = Clock.init();
         if (use_union) layer.stats.unions += 1;
@@ -3203,14 +3495,21 @@ pub const Engine = struct {
                 }
                 if (binding.hit) continue;
                 misses += 1;
+                const global = gl.groups.base[g] + binding.expert;
+                var read: ScaleRead = .{ .expert = global };
                 for (0..n) |ci| {
-                    const source = self.store.spanAt(layer_index, gl.groups.base[g] + binding.expert, ci);
+                    const source = self.store.spanAt(layer_index, global, ci);
                     const dst = if (use_union)
                         gl.unionRegion(&read_set[ci], g, ci, position)
                     else
                         gl.cacheRegion(&layer.slabs[ci], g, ci, binding.slot orelse return error.ExpertBindingMissing);
+                    if (ci % 3 != 0) {
+                        if (self.scaleFromKept(layer_index, global, ci, dst[0..source.len])) continue;
+                        read.dst[ci] = dst[0..source.len];
+                    }
                     try spans.append(self.allocator, gl.fillSpan(source, dst, g, ci));
                 }
+                if (self.kept != null and read.dst[1].len > 0) try scale_reads.append(self.allocator, read);
             }
         }
         if (!use_union and spans.items.len > 0) wrote_cache = true;
@@ -3218,6 +3517,7 @@ pub const Engine = struct {
         layer.stats.copy_ns += copied;
         self.copy_ns_total += copied;
         try self.runFill(layer_index, spans.items);
+        try self.keepRead(layer_index, scale_reads.items);
         self.fill_experts_total += misses;
 
         if (use_union) {
@@ -3332,6 +3632,8 @@ pub const Engine = struct {
 
         const to_slot = try self.allocator.alloc(u16, experts);
         defer self.allocator.free(to_slot);
+        // What each stage writes in each slab, as one range: a group's pool is its own region of the slab.
+        var cover: [1 + quant.rate_group_limit][2][n]?[2]usize = @splat(@splat(@splat(null)));
         for (resolutions, 0..) |resolution, g| {
             var spilled: u32 = 0;
             for (resolution.bindings) |binding| {
@@ -3340,21 +3642,41 @@ pub const Engine = struct {
                 if (binding.hit) continue;
                 st.misses += 1;
                 if (binding.slot) |slot| try st.admitted.append(self.allocator, .{ @intCast(g), slot });
+                var read: ScaleRead = .{ .expert = global };
                 for (0..n) |ci| {
                     const source = self.store.spanAt(layer_index, global, ci);
                     const dst = if (binding.slot) |slot| gl.cacheRegion(&layer.slabs[ci], g, ci, slot) else gl.unionRegion(&self.grouped_union[ci], g, ci, spilled);
+                    if (ci % 3 != 0) {
+                        if (self.scaleFromKept(layer_index, global, ci, dst[0..source.len])) continue;
+                        read.dst[ci] = dst[0..source.len];
+                    }
                     // The scales go first: every group's GEMM prepares its rows with all of them.
                     const stage = if (ci % 3 == 0) 1 + g else 0;
                     try st.spans[stage].append(self.allocator, gl.fillSpan(source, dst, g, ci));
+                    const at_dst = @intFromPtr(dst.ptr);
+                    const seen = &cover[stage][if (binding.slot != null) 0 else 1][ci];
+                    seen.* = if (seen.*) |r| .{ @min(r[0], at_dst), @max(r[1], at_dst + dst.len) } else .{ at_dst, at_dst + dst.len };
                 }
+                if (self.kept != null and read.dst[1].len > 0) try st.scale_reads.append(self.allocator, read);
                 if (binding.slot == null) spilled += 1;
             }
         }
 
-        const bank = try self.allocator.create(Ragged);
-        errdefer self.allocator.destroy(bank);
-        bank.* = try Ragged.initSplit(self.s, &gl.cache_ragged, &gl.union_ragged, overflow[0..resolutions.len]);
-        errdefer bank.deinit();
+        if (self.range_marks) {
+            for (sets[0..st.sets]) |set| for (set[0..n]) |*operand| if (operand.slab) |slab| slab.dropMark();
+            for (0..st.stages()) |stage| for (cover[stage]) |per_set| for (per_set) |range| if (range) |r| {
+                fill_marks.add(r[0], r[1] - r[0]);
+                try st.marks[stage].append(self.allocator, r[0]);
+            };
+        }
+
+        st.overflow = overflow;
+        // A ranged route builds its bank on the engine once the scales have landed (`stageBank`): the bank concatenates them.
+        const bank: ?*Ragged = if (self.range_marks) null else try self.splitBank(gl, overflow[0..resolutions.len], self.s);
+        errdefer if (bank) |b| {
+            b.deinit();
+            self.allocator.destroy(b);
+        };
         const remapped = try self.allocator.alloc(u16, occurrences.len);
         for (occurrences, remapped) |expert, *slot| slot.* = to_slot[expert];
 
@@ -3377,6 +3699,39 @@ pub const Engine = struct {
         };
     }
 
+    fn splitBank(self: *Engine, gl: *GroupedLayer, overflow: []const u32, s: mlx.mlx_stream) !*Ragged {
+        const bank = try self.allocator.create(Ragged);
+        errdefer self.allocator.destroy(bank);
+        bank.* = try Ragged.initSplit(s, &gl.cache_ragged, &gl.union_ragged, overflow);
+        return bank;
+    }
+
+    /// `0` for a kept expert and `-inf` for a dropped one, in the router logits' `dtype`, for a router that picks by
+    /// softmax and renormalizes over its picks: added to the logits, the kept picks and their weights stay the
+    /// unmasked ones. Null where layer `layer` drops nothing (no drop, or a layer the list does not cover).
+    pub fn dropMask(self: *Engine, layer: u16, dtype: mlx.mlx_dtype) !?mlx.mlx_array {
+        const d = self.geometry.drop orelse return null;
+        if (layer < d.first_layer or layer - d.first_layer >= d.rows.len) return null;
+        const row = layer - d.first_layer;
+        if (self.drop_masks.len == 0) {
+            self.drop_masks = try self.allocator.alloc(mlx.mlx_array, d.rows.len);
+            @memset(self.drop_masks, .{ .ctx = null });
+        }
+        if (self.drop_masks[row].ctx == null) {
+            const experts = self.geometry.experts;
+            var mask: [expert_usage.max_experts]f32 = undefined;
+            for (mask[0..experts], 0..) |*v, e| v.* = if (d.isDropped(layer, e)) -std.math.inf(f32) else 0;
+            const f = try mlx.newData(&mask, &[_]c_int{@intCast(experts)}, .float32);
+            defer _ = mlx.mlx_array_free(f);
+            var typed = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(typed);
+            try mlx.check(mlx.mlx_astype(&typed, f, dtype, self.s));
+            try mlx.check(mlx.mlx_array_eval(typed));
+            self.drop_masks[row] = typed;
+        }
+        return self.drop_masks[row];
+    }
+
     /// Whether `--drop-expert` left this layer's expert unloaded: it has no slot and no bytes are ever read for it.
     pub fn isDropped(self: *const Engine, layer: u16, expert: u16) bool {
         const d = self.geometry.drop orelse return false;
@@ -3396,15 +3751,58 @@ pub const Engine = struct {
     /// published and leased for the route.
     pub fn fillStaged(self: *Engine, p: *Prepared, ctx: *anyopaque, ready: *const fn (ctx: *anyopaque, group: usize) anyerror!void) !void {
         const st = p.staged orelse return;
-        try self.runFill(st.layer, st.spans[0].items);
-        st.done = 1;
+        try self.stageScales(p);
         for (0..st.groups) |g| if (st.spans[1 + g].items.len == 0) try ready(ctx, g);
         for (0..st.groups) |g| {
             if (st.spans[1 + g].items.len == 0) continue;
-            try self.runFill(st.layer, st.spans[1 + g].items);
-            st.done = 2 + g;
+            try self.stageGroup(p, g);
             try ready(ctx, g);
         }
+        try self.stageEnd(p);
+    }
+
+    /// `prepareHostStaged` for a caller on the engine of our own, which reads the route stage by stage (`stageScales`,
+    /// `stageGroup`, `stageEnd`) and encodes each group's GEMMs between them: the stages' ranges are marked, not the
+    /// slabs, so a pass that binds a group whose experts have landed may commit while the next group is read.
+    pub fn prepareHostStagedRanged(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
+        self.range_marks = true;
+        defer self.range_marks = false;
+        return self.prepareHostStaged(layer_index, occurrences);
+    }
+
+    /// Reads stage 0 of a staged route: the scales of every miss.
+    pub fn stageScales(self: *Engine, p: *Prepared) !void {
+        const st = p.staged orelse return;
+        if (st.done >= 1) return;
+        try self.runFill(st.layer, st.spans[0].items);
+        try self.keepRead(st.layer, st.scale_reads.items);
+        st.scale_reads.clearRetainingCapacity();
+        st.done = 1;
+        st.unmark(0);
+    }
+
+    /// The bank of a ranged route, made on the engine from the slab views and the scales that have landed: its slices and
+    /// reshapes are views of the engine's, its concatenation of the scales one dispatch. Once per route.
+    pub fn stageBank(self: *Engine, p: *Prepared) !*const Ragged {
+        if (p.ragged) |bank| return bank;
+        const st = p.staged orelse return error.Dsv41StqLayerNotGrouped;
+        const bank = try self.splitBank(st.gl, st.overflow[0..st.groups], mlx.engine.stream());
+        p.ragged = bank;
+        p.split = bank;
+        return bank;
+    }
+
+    /// Reads rate group `g`'s trellis of a staged route.
+    pub fn stageGroup(self: *Engine, p: *Prepared, g: usize) !void {
+        const st = p.staged orelse return;
+        if (st.spans[1 + g].items.len > 0) try self.runFill(st.layer, st.spans[1 + g].items);
+        st.done = 2 + g;
+        st.unmark(1 + g);
+    }
+
+    /// Every stage has landed: the admitted misses are ready, the slabs published and leased for the route.
+    pub fn stageEnd(self: *Engine, p: *Prepared) !void {
+        const st = p.staged orelse return;
         st.done = st.stages();
         for (st.admitted.items) |pair| st.gl.caches[pair[0]].markReady(pair[1]);
         const layer = &self.layers[st.layer];
@@ -3827,17 +4225,6 @@ test "exl3 expert bytes at the MiMo K2.5 geometry size the resident admission" {
     try t.expectEqual(@as(u64, 95_067_045_888), per_expert * geometry.experts * routed_layers);
 }
 
-test "only a Qwen EXL3 pack or a DeepSeek-V4.1 checkpoint or STQ pack keeps its MTP head under streaming" {
-    const t = std.testing;
-    try t.expect(streamedMtpHeadSupported(true, false, .exl3_k4));
-    try t.expect(!streamedMtpHeadSupported(true, false, .bf16_fused));
-    try t.expect(!streamedMtpHeadSupported(false, false, .exl3_k4));
-    try t.expect(!streamedMtpHeadSupported(false, false, .mxfp4_individual));
-    try t.expect(streamedMtpHeadSupported(false, true, .mxfp4_w123));
-    try t.expect(streamedMtpHeadSupported(false, true, .exl3_k4));
-    try t.expect(!streamedMtpHeadSupported(false, true, .mxfp4_individual));
-}
-
 test "expert stream refuses MTP by name, at load and at request parse" {
     const t = std.testing;
     try t.expect(mtpRefusal(false, true, false) == null);
@@ -3951,6 +4338,27 @@ test "expert stream ssd budget ledger bills the MLX pool beside the fixed terms 
     // A budget the pool alone tips under two slots a layer is refused.
     const floor = fixed + 2 * 48 * expert_bytes;
     try t.expectError(error.SsdBudgetBelowResident, budgetLedger(floor - 1, trunk, 0, 0, 48, 512, 10, expert_bytes, BOUNCE_BYTES, .{ .pool_bytes = 6 * GiB }));
+}
+
+test "expert stream ssd budget ledger bills the kept scales beside the cache, and a resident store bills none" {
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const expert_bytes: u64 = 9_830_400;
+    const trunk: u64 = 9_900_000_000;
+    const kept: u64 = 700_000_000;
+    const none = try budgetLedger(100 * GiB, trunk, 0, 0, 40, 384, 6, expert_bytes, BOUNCE_BYTES, .{});
+    const keeps = try budgetLedger(100 * GiB, trunk, 0, 0, 40, 384, 6, expert_bytes, BOUNCE_BYTES, .{ .kept_bytes = kept });
+    try t.expectEqual(@as(u64, 0), none.kept_bytes);
+    try t.expectEqual(kept, keeps.kept_bytes);
+    try t.expect(keeps.slots_per_layer < none.slots_per_layer);
+    const fixed = trunk + keeps.workspace_bytes + keeps.selected_bytes + BOUNCE_BYTES + kept;
+    try t.expect(fixed + keeps.cache_bytes <= 100 * GiB);
+    try t.expect(fixed + keeps.cache_bytes + 40 * expert_bytes > 100 * GiB);
+    // Nothing is read on a route of a resident store, so nothing is kept.
+    const shape: quant.StoreShape = .{ .all_bytes = 100_000_000_000, .kept_bytes = kept };
+    const resident = try budgetLedger(trunk + shape.all_bytes, trunk, 0, 0, 40, 384, 6, 9_000_000, BOUNCE_BYTES, shape);
+    try t.expect(resident.resident);
+    try t.expectEqual(@as(u64, 0), resident.kept_bytes);
 }
 
 test "expert stream: a resident store still bills the pool, and a budget short by it streams" {
@@ -4331,6 +4739,13 @@ const TinyLayersEngine = struct {
         self.tmp.cleanup();
     }
 };
+
+test "the warm line reports the slots it filled: all of them ranked by usage, 80 percent by lowest id" {
+    const t = std.testing;
+    try t.expectEqual(@as(u16, 262), warmedSlots(262, true));
+    try t.expectEqual(@as(u16, 209), warmedSlots(262, false));
+    try t.expectEqual(@as(u16, 0), warmedSlots(0, true));
+}
 
 test "expert stream warm cache floors 80 percent, including zero and one slot" {
     const t = std.testing;
@@ -4718,6 +5133,42 @@ test "expert stream route detail buckets by attention class and probes off the p
     try t.expect(engine.routeProbeActive());
 }
 
+test "expert stream: every forward and the engine's cache reach the process counters" {
+    const t = std.testing;
+    const before = expert_stats.process.snapshot();
+    var fixture = try TinyEngine.open(2, 4);
+    errdefer fixture.close();
+    const engine = &fixture.engine;
+    const open = expert_stats.process.snapshot();
+    try t.expectEqual(before.engines + 1, open.engines);
+    try t.expectEqual(before.cache_bytes + engine.plan.cache_bytes, open.cache_bytes);
+
+    engine.beginForward();
+    var cold = try engine.prepareHost(0, &.{ 0, 2 });
+    cold.deinit();
+    engine.finishForward(1);
+    const after_cold = expert_stats.process.snapshot();
+    try t.expectEqual(open.forwards + 1, after_cold.forwards);
+    try t.expectEqual(open.routes + 2, after_cold.routes);
+    try t.expectEqual(open.hits, after_cold.hits);
+    try t.expect(after_cold.fill_bytes > open.fill_bytes);
+    try t.expect(after_cold.ssd_read_bytes - open.ssd_read_bytes >= after_cold.fill_bytes - open.fill_bytes);
+
+    engine.beginForward();
+    var warm = try engine.prepareHost(0, &.{ 0, 2 });
+    warm.deinit();
+    engine.finishForward(1);
+    const after_warm = expert_stats.process.snapshot();
+    try t.expectEqual(after_cold.routes + 2, after_warm.routes);
+    try t.expectEqual(after_cold.hits + 2, after_warm.hits);
+    try t.expectEqual(after_cold.fill_bytes, after_warm.fill_bytes);
+
+    fixture.close();
+    const closed = expert_stats.process.snapshot();
+    try t.expectEqual(before.engines, closed.engines);
+    try t.expectEqual(before.cache_bytes, closed.cache_bytes);
+}
+
 test "expert stream a streamed reader holds its slab lease until the next route readback" {
     const t = std.testing;
     var fixture = try TinyEngine.open(2, 4);
@@ -4752,9 +5203,9 @@ pub const TinyQuantPack = struct {
         return if (quant.partOf(@fromBackingInt(@intCast(ci))) == .weight) .uint32 else .bfloat16;
     }
 
-    pub fn residentBank(self: *const TinyQuantPack, experts: u16, ci: usize) mlx.mlx_array {
+    pub fn residentBank(self: *const TinyQuantPack, experts: u16, ci: usize) mlx.HostArrayRefused!mlx.mlx_array {
         const shape = [_]c_int{ @intCast(experts), @intCast(self.rows[ci]), @intCast(self.cols[ci]) };
-        return mlx.mlx_array_new_data(self.data[ci].ptr, &shape, 3, dtypeOf(ci));
+        return try mlx.newData(self.data[ci].ptr, &shape, dtypeOf(ci));
     }
 
     pub fn deinit(self: *TinyQuantPack) void {
@@ -5224,7 +5675,7 @@ fn writeMimoExl3StreamFixture(dir: std.Io.Dir) !void {
     try dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
 }
 
-fn checkMimoExl3Streaming(runtime: bool) !void {
+fn checkMimoExl3Streaming(model_type: []const u8, runtime: bool) !void {
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -5233,7 +5684,7 @@ fn checkMimoExl3Streaming(runtime: bool) !void {
     const len = try tmp.dir.realPath(t.io, &buf);
     const path = buf[0..len];
     const geometry: Geometry = .{ .layers = 3, .experts = 4, .hidden = 128, .intermediate = 128, .first_moe_layer = 1, .exl3_n = 64 };
-    try t.expectEqual(quant.Layout.exl3_k4, try quant.streamingLayoutOfDir(t.allocator, t.io, "mimo_v2", path, 3, 1));
+    try t.expectEqual(quant.Layout.exl3_k4, try quant.streamingLayoutOfDir(t.allocator, t.io, model_type, path, 3, 1));
     const per = try expertBytesFor(t.allocator, path, geometry, .exl3_k4);
     try t.expectEqual(try exl3ExpertBytes(geometry), per);
     const fixed = (1 << 20) + 4 * per + 2 * per + BOUNCE_BYTES;
@@ -5313,11 +5764,15 @@ fn checkMimoExl3Streaming(runtime: bool) !void {
 }
 
 test "MiMo EXL3 streaming CPU geometry ledger and slab ids cross the dense prefix" {
-    try checkMimoExl3Streaming(false);
+
+    try test_note.needArchs(&.{"mimo2"});
+    try checkMimoExl3Streaming("mimo_v2", false);
 }
 
 test "MiMo EXL3 streaming imported slabs warm and reuse different layer rates" {
-    try checkMimoExl3Streaming(true);
+
+    try test_note.needArchs(&.{"mimo2"});
+    try checkMimoExl3Streaming("mimo_v2", true);
 }
 
 test "expert pick tolerance accepts 0 through 0.6 and names a bad value" {
@@ -5332,6 +5787,17 @@ test "expert pick tolerance accepts 0 through 0.6 and names a bad value" {
     try t.expectError(error.InvalidPickTolerance, parsePickTolerance("nan"));
     try t.expectError(error.InvalidPickTolerance, parsePickTolerance("nope"));
     try t.expectError(error.InvalidPickTolerance, parsePickTolerance(""));
+}
+
+test "expert cache bias accepts 0 through 2 and penalizes only the experts the cache lacks" {
+    const t = std.testing;
+    try t.expectEqual(@as(f32, 0.0), try parseCacheBias("0"));
+    try t.expectEqual(@as(f32, 0.2), try parseCacheBias("0.2"));
+    try t.expectEqual(@as(f32, 2.0), try parseCacheBias("2"));
+    for ([_][]const u8{ "2.5", "8", "-0.1", "nan", "inf", "nope", "" }) |bad| try t.expectError(error.InvalidCacheBias, parseCacheBias(bad));
+    var pen: [4]f32 = undefined;
+    biasPenalty(&.{ 3, -1, 0, -1 }, 0.25, &pen);
+    try t.expectEqualSlices(f32, &.{ 0, -0.25, 0, -0.25 }, &pen);
 }
 
 fn PickScratch(comptime experts: usize) type {
@@ -5581,73 +6047,42 @@ test "a failed spec map refresh leaves no GPU map until a rebuild matches the ca
     var first = try layer.cache.resolve(t.allocator, &.{ 0, 1 });
     defer first.deinit(t.allocator);
     markResolvedReady(&layer.cache, &first);
-    try layer.refreshSpec(t.allocator);
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    try layer.refreshSpec(t.allocator, s, 0);
     var second = try layer.cache.resolve(t.allocator, &.{ 0, 2 });
     defer second.deinit(t.allocator);
     markResolvedReady(&layer.cache, &second);
     spec_alloc_fail_for_test = true;
-    try t.expectError(error.ExpertSpecMapAlloc, layer.refreshSpec(t.allocator));
+    try t.expectError(error.ExpertSpecMapAlloc, layer.refreshSpec(t.allocator, s, 0));
     try t.expect(layer.spec_slots.ctx == null);
-    try layer.refreshSpec(t.allocator);
+    try layer.refreshSpec(t.allocator, s, 0);
     const gpu = mlx.mlx_array_data_int32(layer.spec_slots).?;
     for (layer.spec_host, 0..) |host, e| try t.expectEqual(@max(host, 0), gpu[e]);
     try t.expectEqual(layer.cache.expert_to_slot[2], layer.spec_host[2]);
 }
 
-test "GLM BF16 stream imports split expert slabs and preserves bytes across cache and union" {
-    try mlx.requireGpu();
+test "the spec map refresh builds the cache-bias penalty only while the bias is on" {
     const t = std.testing;
-    const fixture = @import("glm5/glm_stream_fixture.zig");
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    try fixture.write(t.allocator, tmp.dir, .none);
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(t.io, &path_buf);
-    const geometry = Geometry{ .layers = 4, .experts = 4, .hidden = 32, .intermediate = 16, .first_moe_layer = 3 };
-    const s = mlx.gpuStream();
-    var engine = try Engine.initWithOptions(t.allocator, path_buf[0..path_len], geometry, 2 * 3072, s, .{ .layout = .bf16_individual, .bounce_size = 1 << 20 });
-    defer engine.deinit();
-    try t.expectEqual(@as(u64, 6), engine.slab_imports);
-    try t.expectEqual(@as(u64, 0), engine.fallback_imports);
-    try t.expectEqual(@as(u64, 3072), engine.store.perExpertBytes());
-    try expectError(error.ExpertLayerAbsent, engine.prepareHost(0, &.{0}));
-    try t.expect((try engine.specRoute(3)) == null);
-    const groups = [_][]const u16{ &.{ 3, 1 }, &.{ 1, 3, 1 }, &.{ 0, 1, 2, 3 }, &.{ 2, 0 } };
-    for (groups, 0..) |ids, group| {
-        var prepared = try engine.prepareHost(3, ids);
-        defer prepared.deinit();
-        try t.expect(!prepared.quantized);
-        try t.expectEqual(group == 2, prepared.workspace);
-        for ([_]mlx.mlx_array{ prepared.gate, prepared.up, prepared.down }, 0..) |array, pi| {
-            try t.expect(array.ctx != null);
-            try t.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(array));
-            const shape = mlx.getShape(array);
-            try t.expectEqual(@as(usize, 3), shape.len);
-            try t.expectEqual(@as(c_int, if (pi == 2) 16 else 32), shape[1]);
-            try t.expectEqual(@as(c_int, if (pi == 2) 32 else 16), shape[2]);
-            const input_dim: c_int = if (pi == 2) 16 else 32;
-            const input_data: [32]u16 = @splat(0x3f80);
-            const input = mlx.mlx_array_new_data(&input_data, &[_]c_int{ 1, 1, input_dim }, 3, .bfloat16);
-            defer _ = mlx.mlx_array_free(input);
-            const first_slot = [_]u32{prepared.remapped[0]};
-            const selected = mlx.mlx_array_new_data(&first_slot, &[_]c_int{1}, 1, .uint32);
-            defer _ = mlx.mlx_array_free(selected);
-            var result = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(result);
-            try mlx.check(mlx.mlx_gather_mm(&result, input, array, .{ .ctx = null }, selected, false, s));
-            try mlx.check(mlx.mlx_array_eval(result));
-            const result_data = mlx.mlx_array_data_bfloat16(result).?;
-            // Summing 16 or 32 identical powers-of-two-scaled BF16 values is exact.
-            const expected = fixture.value(ids[0], pi) + @as(u16, if (pi == 2) 4 else 5) * 128;
-            for (result_data[0..mlx.mlx_array_size(result)]) |v| try t.expectEqual(expected, v);
-            const ci = pi * 3;
-            for (ids, prepared.remapped) |expert, slot| {
-                const bytes = if (prepared.workspace) engine.union_slabs[ci].slotBytes(slot) else engine.cacheSlotBytesAt(3, slot, ci);
-                for (0..512) |i| try t.expectEqual(fixture.value(expert, pi), std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little));
-            }
-        }
-        if (group == 1) try t.expectEqual(@as(u64, 2), engine.fill_experts_total);
+    var layer = LayerState{ .cache = try GroupCache.init(t.allocator, 2, 4) };
+    defer {
+        if (layer.spec_slots.ctx != null) _ = mlx.mlx_array_free(layer.spec_slots);
+        if (layer.spec_raw.ctx != null) _ = mlx.mlx_array_free(layer.spec_raw);
+        if (layer.spec_pen.ctx != null) _ = mlx.mlx_array_free(layer.spec_pen);
+        t.allocator.free(layer.spec_host);
+        layer.cache.deinit();
     }
+    var resolved = try layer.cache.resolve(t.allocator, &.{ 0, 1 });
+    defer resolved.deinit(t.allocator);
+    markResolvedReady(&layer.cache, &resolved);
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    try layer.refreshSpec(t.allocator, s, 0);
+    try t.expect(layer.spec_pen.ctx == null);
+    layer.spec_host[0] = -2;
+    try layer.refreshSpec(t.allocator, s, 0.25);
+    const pen = mlx.mlx_array_data_float32(layer.spec_pen).?;
+    for (layer.spec_host, 0..) |host, e| try t.expectEqual(if (host >= 0) @as(f32, 0) else -0.25, pen[e]);
 }
 
 test "expert cache profile: the split spends the uniform bytes, gives the most reused layer more, and caps a layer at its experts" {
@@ -5696,4 +6131,43 @@ test "expert cache profile: the load line names the split" {
     var buf: [128]u8 = undefined;
     try t.expectEqualStrings("[expert-stream] slots per layer: profile (212..374)\n", cacheSplitLine(&buf, true, 212, 374));
     try t.expectEqualStrings("[expert-stream] slots per layer: uniform (234)\n", cacheSplitLine(&buf, false, 234, 234));
+}
+
+test "expert stream: a slab an engine pass bound is unmapped by its release, though the engine has not waited since" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    var operand = try SlabOperand.createFlat(std.testing.allocator, 1 << 16, .float16, 2, gpu);
+    const timeouts = slab_release_timeouts.load(.monotonic);
+    var sum = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&sum, operand.array, operand.array, mlx.engine.stream()));
+    _ = mlx.mlx_array_free(sum);
+    operand.destroy(std.testing.allocator, gpu);
+    try std.testing.expectEqual(timeouts, slab_release_timeouts.load(.monotonic));
+}
+
+test "expert stream: a slab made on the engine's stream is the engine's buffer over the slab's own bytes, and its release asks nothing of MLX" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    const s = mlx.engine.stream();
+    const mapped = mlx.engine.mappedTotal();
+    var operand = try SlabOperand.createFlat(std.testing.allocator, 1 << 16, .float16, 2, s);
+    try std.testing.expectEqual(mapped + (2 << 16), mlx.engine.mappedTotal());
+    @memset(std.mem.bytesAsSlice(u16, operand.slotBytes(0)), 0x3c00);
+    var sum = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&sum, operand.array, operand.array, s));
+    try mlx.check(mlx.mlx_array_eval(sum));
+    try std.testing.expectEqual(@as(u16, 0x4000), mlx.mlx_array_data_uint16(sum).?[1]);
+    _ = mlx.mlx_array_free(sum);
+    const timeouts = slab_release_timeouts.load(.monotonic);
+    const calls = mlx.engine.mlxCalls();
+    operand.destroy(std.testing.allocator, s);
+    try std.testing.expectEqual(calls, mlx.engine.mlxCalls());
+    try std.testing.expectEqual(timeouts, slab_release_timeouts.load(.monotonic));
+    try std.testing.expectEqual(mapped, mlx.engine.mappedTotal());
 }

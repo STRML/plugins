@@ -5,6 +5,7 @@ const std = @import("std");
 const kit = @import("mlx_serve");
 const abi = kit.abi.plugin;
 const sc = @import("src/sushi/dsv41/dsv41_config.zig");
+const prefill_plan = @import("src/sushi/prefill_plan.zig");
 const exl3 = @import("sushi_exl3");
 
 pub const model_types = [_][]const u8{"deepseek_v41"};
@@ -24,6 +25,30 @@ pub fn private(p: *const abi.Parsed) *const Private {
 
 pub fn of(p: *const abi.Parsed) *const sc.Config {
     return &private(p).cfg;
+}
+
+fn worstLayerBytesPerToken(c: *const sc.Config) u64 {
+    var worst: u64 = 0;
+    for (0..c.layers) |l| {
+        const r: u64 = @max(c.ratios[l], 1);
+        var b: u64 = 0;
+        if (c.isKvSource(l)) b += (c.head_dim / 2 + c.head_dim / 16) / r;
+        if (c.isOwner(l)) b += (c.index_head_dim / 2 + c.index_head_dim / 32) / r;
+        worst = @max(worst, b);
+    }
+    return worst;
+}
+
+/// `mlxForwardCap` of the widest forward a prefill of `seq` tokens runs at `chunk`-row chunks with the flat tail merge,
+/// plus the unbound row-store growth allowance (`1/16` slack + one worst-layer copy during `Rows.append`): this plugin runs
+/// on the host's MLX stream (`engine = false`) without calling `bindRequest`, never Cooler's pool (`sc.Config.chunkCap`).
+pub fn mlxChunkCap(c: *const sc.Config, chunk: u64, seq: u64) u64 {
+    const ctx = @max(seq, 1);
+    const widest = prefill_plan.widestForward(@intCast(ctx), @intCast(@max(chunk, 1)), false);
+    const rows = @max(@min(chunk, ctx), widest);
+    // Match `dsv41_config.rows_grow_div` (16): unbound MLX row stores grow by 1/16 and temporarily hold old+new during copy.
+    const growth = ctx *| (c.stateBytesPerToken() / 16 +| worstLayerBytesPerToken(c));
+    return c.mlxForwardCap(rows, ctx) +| (growth *| 5 / 4);
 }
 
 fn root(tree: *const std.json.Parsed(std.json.Value)) ?std.json.ObjectMap {
@@ -100,6 +125,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     const priv = gpa.create(Private) catch return refuse("out of memory");
     errdefer gpa.destroy(priv);
     priv.cfg = sc.parse(text, o) catch return refuse("config.json is not a DeepSeek-V4.1 geometry sushi serves");
+    priv.cfg.wide_arms = .kernels;
     if (priv.cfg.expert_dec == null or priv.cfg.trunk_dec == null) return refuse("an STQ pack names both expert_quant and trunk_quant");
     // parseExpertQuant, not parseQuantBlock: the block parser is shared with `trunk_quant` and never reads
     // `tile_order`, so a pair-major pack would reach the store without its order named and be refused.
@@ -178,10 +204,17 @@ test "sushi_ds41 parses the STQ pack's geometry" {
     // The bill's arithmetic runs unchecked in a release build: Debug traps an overflow.
     const c = of(&p);
     for ([_]u64{ 1, 256, 2048, 8192 }) |chunk| {
-        for ([_]u64{ 1, 4096, 131072, 1 << 20 }) |seq| try testing.expect(c.chunkCap(chunk, seq) > 0 and c.forwardCap(chunk, seq) > 0);
+        for ([_]u64{ 1, 4096, 131072, 1 << 20 }) |seq| {
+            const cap = mlxChunkCap(c, chunk, seq);
+            try testing.expect(cap > 0 and c.mlxForwardCap(chunk, seq) > 0);
+            if (chunk > sc.verify_rows) try testing.expect(cap >= c.chunkCap(chunk, seq));
+        }
+        try testing.expect(mlxChunkCap(c, chunk, 1 << 20) > mlxChunkCap(c, chunk, 4096));
     }
     // The mini pack names no stage tensors in its (absent) index: no native drafter.
     try testing.expectEqual(@as(u32, 0), p.spec.native_stages);
+    try testing.expect(sc.validPrefillTopK(0, 12, 384) and sc.validPrefillTopK(5, 12, 384) and sc.validPrefillTopK(12, 12, 384) and sc.validPrefillTopK(32, 36, 384));
+    try testing.expect(!sc.validPrefillTopK(1, 12, 384) and !sc.validPrefillTopK(13, 12, 384) and !sc.validPrefillTopK(33, 36, 384) and !sc.validPrefillTopK(6, 12, 4));
 }
 
 test "sushi_ds41 keeps expert_quant.tile_order for the load's geometry" {

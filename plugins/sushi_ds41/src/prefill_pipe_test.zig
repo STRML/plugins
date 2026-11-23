@@ -42,20 +42,20 @@ fn arm(m: *dsv.Model, sc: *Scope, ids: []const u32, cut: usize, depth: usize, st
     dsv.resetState(m);
     const whole = try bytesOf(sc, try dsv.extendSpan(m, ids, .all, dsv.SPAN));
     errdefer testing.allocator.free(whole);
-    try testing.expectEqual(@as(usize, 0), m.pipe_n);
+    try testing.expectEqual(@as(usize, 0), m.pipe.n);
 
     dsv.resetState(m);
     try dsv.extendState(m, ids[0..cut], dsv.SPAN, null, &.{});
     if (depth == 0 or streamed) {
-        try testing.expectEqual(@as(usize, 0), m.pipe_n);
+        try testing.expectEqual(@as(usize, 0), m.pipe.n);
     } else {
         // The pipeline engaged: the encoder's last layers are still queued.
-        try testing.expect(m.pipe_n > 0 and m.pipe_n <= depth);
+        try testing.expect(m.pipe.n > 0 and m.pipe.n <= depth);
     }
     try dsv.pipeDrain(m);
-    try testing.expectEqual(@as(usize, 0), m.pipe_n);
+    try testing.expectEqual(@as(usize, 0), m.pipe.n);
     const chunked = try bytesOf(sc, try dsv.extendSpan(m, ids[cut..], .all, dsv.SPAN));
-    try testing.expectEqual(@as(usize, 0), m.pipe_n);
+    try testing.expectEqual(@as(usize, 0), m.pipe.n);
     return .{ .whole = whole, .chunked = chunked };
 }
 
@@ -73,7 +73,7 @@ test "sushi_ds41 gpu: pipelined prefill layers give the waiting schedule's logit
     try mlx.requireGpu();
     const dir = try dsv.fixtureDir();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     // The pack only (its reference logits are not read): a fixed prompt over the tiny vocabulary, BOS first.
     var ids: [40]u32 = undefined;

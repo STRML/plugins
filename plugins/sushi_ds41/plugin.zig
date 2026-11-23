@@ -20,8 +20,9 @@ const stream = @import("src/sushi/expert_stream.zig");
 const smodel = @import("src/sushi/model.zig");
 const sc = @import("src/sushi/dsv41/dsv41_config.zig");
 const vis = @import("src/sushi/dsv41/dsv41_vision.zig");
-const rows_policy = @import("src/sushi/dsv41/dspark_rows.zig");
+const rows_policy = @import("src/sushi/dspark_rows.zig");
 const borrow = @import("src/sushi/dsv41/dsv41_borrow.zig");
+const prefill_plan = @import("src/sushi/prefill_plan.zig");
 const depth_bounds = @import("src/sushi/mtp_depth_bounds.zig");
 const vision_common = @import("src/sushi/vision_common.zig");
 const index_nax = @import("src/index_nax.zig");
@@ -108,7 +109,7 @@ fn attnKeys(p: *const abi.Parsed, seq: u64) callconv(.c) u64 {
 fn prefillBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8, warm: u64) callconv(.c) u64 {
     _ = kv_bits;
     _ = warm;
-    return config.of(p).chunkCap(chunk, seq);
+    return config.mlxChunkCap(config.of(p), @max(@as(u64, chunk), sc.prefillWidthFor("")), seq);
 }
 
 /// Window layers keep a ring; a compressed layer reads the last KV source at or above it.
@@ -145,9 +146,9 @@ fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.St
     _ = shards;
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = model_dir.slice();
-    const trunk = source.residentBytes(io, gpa, dir) catch |e| return Verdict.named(.failed, @errorName(e));
-    const tower = if (config.of(p).vision != null) source.visionBytes(io, gpa, dir, vision_common.vision_bf16) catch |e| return Verdict.named(.failed, @errorName(e)) else 0;
-    const stages = if (config.private(p).dspark) source.dsparkBytes(io, gpa, dir) catch |e| return Verdict.named(.failed, @errorName(e)) else 0;
+    const trunk = source.residentBytes(io, gpa, dir, false) catch |e| return Verdict.named(.failed, @errorName(e));
+    const tower = if (config.of(p).vision != null) source.visionBytes(io, gpa, dir, vision_common.vision_bf16, false) catch |e| return Verdict.named(.failed, @errorName(e)) else 0;
+    const stages = if (config.private(p).dspark) source.dsparkBytes(io, gpa, dir, false) catch |e| return Verdict.named(.failed, @errorName(e)) else 0;
     out.* = trunk + tower + stages;
     return .ok;
 }
@@ -195,7 +196,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     m.weights = try source.loadResident(io, gpa, dir, .{ .dspark = priv.dspark, .vision = c.vision != null });
     errdefer m.weights.deinit();
     // The stages' storage is built after the room is read (the model builds it from tensors already loaded).
-    const stages = if (priv.dspark) try source.dsparkBytes(io, gpa, dir) else 0;
+    const stages = if (priv.dspark) try source.dsparkBytes(io, gpa, dir, false) else 0;
     m.billed_context = ctxSetting(ctx.settings_json.slice()) orelse default_context;
     const room = try expertRoom(ctx, c, m.billed_context) -| stages;
     const ledger = try stream.budgetLedger(room, engram.cacheBytes(c.engram), 0, 0, geo.layers, geo.experts, @intCast(c.top_k), per.expert_bytes, stream.BOUNCE_BYTES, geo.shape);
@@ -212,8 +213,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     errdefer m.mdl.deinit();
     // As sushi's server does: each matrix-unit arm (the wide-span attention, the decode index scan) serves only if its
     // load-time trial agrees with the SIMD kernel; each logs which kernel serves.
-    dsv.setAttnNax(m.mdl, kernels.attn_nax_bar);
-    dsv.setIndexNax(m.mdl);
+    try dsv.setAttnNax(m.mdl, kernels.attn_nax_bar);
+    try dsv.setIndexNax(m.mdl);
     log.info("[sushi_ds41] wide-span attention: {s}\n", .{if (m.mdl.attn_nax) "matmul2d (the M5's matrix units)" else "attnFused (simdgroup matrices)"});
     log.info("[sushi_ds41] decode index scan: {s}\n", .{if (m.mdl.index_nax) "matmul2d (the M5's matrix units)" else "scalar kernel"});
     ane_shared.setAneShared(m.mdl, ctx.host);
@@ -282,7 +283,7 @@ const tap_rows = 4;
 
 /// MLX's freed-buffer pool during decode, which the ledger bills.
 const pool_bytes: u64 = 1 << 30;
-/// The pool a prefill chunk of `sc.prefill_width` rows parks. At `pool_bytes` a 2048-row chunk frees and remakes its
+/// The pool a prefill chunk of `sc.prefillWidthFor` rows parks. At `pool_bytes` a wide chunk frees and remakes its
 /// buffers op after op, which halves prefill. sushi bounds a wide forward's pool with its MLX transient cap, which the
 /// host's MLX does not have, so here the pool keeps a cap of its own and the expert room bills it.
 const prefill_pool_bytes: u64 = 8 << 30;
@@ -304,7 +305,7 @@ fn gb(b: u64) f64 {
 /// process overhead and one request of `context` positions (its state and one prefill chunk's working set).
 fn expertRoom(ctx: *const abi.LoadCtx, c: *const sc.Config, context: u64) !u64 {
     const ceiling = if (kit.host.Host.of(ctx.host)) |h| h.memoryCeiling() else |_| mlx.maxRecommendedWorkingSet();
-    const request = c.chunkCap(host_chunk, context) +| (context +| generation_rows) *| c.stateBytesPerToken() +| c.stateFixedBytes(false) +|
+    const request = config.mlxChunkCap(c, @max(host_chunk, sc.prefillWidthFor("")), context) +| (context +| generation_rows) *| c.stateBytesPerToken() +| c.stateFixedBytes(false) +|
         (prefill_pool_bytes - pool_bytes);
     return ceiling -| ctx.wired_margin_bytes -| host_bytes -| request;
 }
@@ -359,7 +360,8 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     for (host.ids) |t| if (t >= m.cfg.vocab) return Verdict.refuse(.failed, "sushi_ds41: token id past the vocabulary");
     // Every row's logits come from one pass over the whole span (`run` chunks only a prompt that wants the last row's),
     // so refuse a span wider than the widest prefill pass: a DeepSeek-V4.1 pass past 8,192 rows can hang the machine.
-    if (f.logits == .all_rows and host.ids.len > sc.prefill_width + sc.tail_merge_rows) return Verdict.refuse(.too_large, "sushi_ds41: every row's logits past one prefill pass");
+    const prefill_width: usize = sc.prefillWidthFor("");
+    if (f.logits == .all_rows and host.ids.len > prefill_width + prefill_plan.TAIL_MERGE_MAX - 1) return Verdict.refuse(.too_large, "sushi_ds41: every row's logits past one prefill pass");
     capture(m) catch return Verdict.refuse(.failed, "sushi_ds41: the restore point could not be taken");
     const want: dsv.Want = if (f.logits == .all_rows) .all else .last;
     const rows: ?dsv.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
@@ -445,12 +447,13 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
         t.on = false;
     };
     var rows = media;
+    const prefill_width: usize = sc.prefillWidthFor("");
     const prefix = if (want == .last and ids.len > 1) ids.len - 1 else 0;
     var at: usize = 0;
     while (at < prefix) {
-        var end = @min(at + sc.prefill_width, prefix);
-        if (end < prefix and prefix - end < sc.tail_merge_rows) end = prefix;
-        const next = if (end < prefix) @min(end + sc.prefill_width, prefix) else ids.len;
+        var end = @min(at + prefill_width, prefix);
+        if (end < prefix and prefix - end < prefill_plan.TAIL_MERGE_MAX) end = prefix;
+        const next = if (end < prefix) @min(end + prefill_width, prefix) else ids.len;
         // Another chunk of the prefix follows and is wider than the window (the merge keeps tails of `tail_merge_rows`
         // rows), so its CED tail overwrites this chunk's decoder rows before anything reads them: run this one without
         // its decoder (`extendState`, which refuses a chunk of `window` rows or fewer; sushi's `tailUnread`).
@@ -1006,4 +1009,17 @@ fn argmaxRows(m: *Model, logits: mlx.mlx_array, suppress: ?mlx.mlx_array, rows: 
     const data = mlx.mlx_array_data_uint32(flat) orelse return error.InvalidInput;
     if (mlx.mlx_array_size(flat) != rows) return error.InvalidInput;
     return gpa.dupe(u32, data[0..rows]);
+}
+
+test "sushi_ds41 prefillBytes bills the actual forward width even when the host supplies a smaller chunk" {
+    const stq_cfg = @embedFile("tests/stq.json");
+    const mem: kit.sdk.fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = stq_cfg }} };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try std.testing.expect(config.parse(&dir, abi.Str.of(stq_cfg), .{}, null, true, &p).isOk());
+    defer config.freeParsed(&p);
+    const small = prefillBytes(&p, 32768, 512, 0, 0);
+    const actual = prefillBytes(&p, 32768, @intCast(sc.prefillWidthFor("")), 0, 0);
+    try std.testing.expectEqual(actual, small);
+    try std.testing.expect(small >= config.mlxChunkCap(config.of(&p), 8192, 32768));
 }

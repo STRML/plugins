@@ -1,20 +1,29 @@
 //! EXL3 trellis experts: routed MoE banks in turboderp's EXL3 format, decoded
 //! and multiplied by Metal kernels. A module, so another MLX host (mlx-serve)
 //! can serve EXL3 packs through the same code: it needs an `mlx_host` import
-//! whose root exposes `pub const mlx`, `log` and `io_util`.
+//! whose root exposes `pub const mlx`, `log` and `io_util`,.
+//! The contract is docs/mlx-serve-integration.md.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
+/// The sushi version this copy of the module was cut at; the sushi tests check it against build.zig.zon.
+pub const version: []const u8 = "1.7.3";
+pub const device = @import("device.zig");
 pub const format = @import("expert_exl3.zig");
+pub const pack = @import("pack.zig");
 pub const kernels = @import("expert_exl3_kernels.zig");
 pub const project_rows = @import("project_rows.zig");
-pub const glm_group2 = @import("glm_group2.zig");
-pub const glm_fold = @import("glm_fold.zig");
-pub const qwen_riders = @import("qwen_riders.zig");
-pub const qwen_fold = @import("qwen_fold.zig");
-pub const glm_prefill_grid = @import("glm_prefill_grid.zig");
+pub const coop_rows2 = @import("coop_rows2.zig");
+pub const fold_clamped = @import("fold_clamped.zig");
+pub const riders_gated = @import("riders_gated.zig");
+pub const shared_trellis = @import("shared_trellis.zig");
+pub const fold_gated = @import("fold_gated.zig");
+pub const prefill_grid = @import("prefill_grid.zig");
 pub const codebook_tables = @import("codebook_tables.zig");
-/// The microbench bodies `sushi-ubench` runs; its host root supplies `report`.
-pub const ubench = @import("ubench.zig");
+/// Test-only: the f32-truth helpers the geometry and real-pack parity tests share.
+pub const f32_truth = @import("f32_truth.zig");
+/// Test and bench only: synthetic random banks.
+pub const synth = @import("synth.zig");
 
 /// One projection's bank, expert e on axis 0: `trellis` U16 [E, in/16, out/16, n],
 /// `suh` F16 [E, in], `svh` F16 [E, out].
@@ -24,7 +33,17 @@ pub const GroupLayout = group_layout.Layout;
 pub const rate_groups = @import("rate_groups.zig");
 pub const Ragged = rate_groups.Ragged;
 pub const linear = @import("linear.zig");
+pub const trunk_gemm = @import("trunk_gemm.zig");
+pub const trunk = @import("trunk.zig");
+pub const side_cache = @import("side_cache.zig");
 pub const Bank = struct { gate: Proj, up: Proj, down: Proj };
+
+/// Frees the arrays cached for side `side` of the host (`host_side.of`): the GEMM inputs and every `side_cache`, the
+/// host's own included. For a side no model uses any more; the next model's first asks make them again.
+pub fn dropHostArrays(side: u1) void {
+    linear.dropGemmInputs(side);
+    side_cache.dropAll(side);
+}
 
 /// Routed SwiGLU experts over `x` [B, S, D] for the top-k `inds`/`scores` [B, S, K],
 /// returned in x's shape and dtype. Up to `kernels.DECODE_ROWS_MAX` rows (or any
@@ -57,6 +76,7 @@ pub fn moeWithGatedShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds:
         return moeOutput(s, x, bank, inds, scores, dec, verify_rows, .bfloat16, down, gate);
     const routed = try moe(s, x, bank, inds, scores, dec, verify_rows);
     defer _ = mlx.mlx_array_free(routed);
+    if (try mlx.engine.fusedChain(mlx.engine.chains.sigmoid_gated_add, s, &.{ routed, gate, down })) |out| return out;
     var sig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sig);
     try mlx.check(mlx.mlx_sigmoid(&sig, gate, s));
@@ -152,13 +172,14 @@ fn moeOutputClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.m
         else
             try moeMixedDecode(s, x2, bank, slots_u, sc, K, xd)
     else
-        try kernels.moePrefill(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, K);
+        try kernels.moePrefill(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, K, null);
     defer _ = mlx.mlx_array_free(y);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, y, xsh.ptr, @intCast(xsh.len), s));
     if (mlx.mlx_array_dtype(out) != xd) {
         var cast = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(cast);
         try mlx.check(mlx.mlx_astype(&cast, out, xd, s));
         _ = mlx.mlx_array_free(out);
         return cast;
@@ -486,12 +507,16 @@ test "exl3 a layer may pack below the rate the config bills, never above it" {
 }
 
 test {
+    _ = device;
     _ = format;
+    _ = pack;
     _ = kernels;
     _ = @import("kernel_source.zig");
     _ = project_rows;
     _ = @import("sorted_windows.zig");
     _ = codebook_tables;
+    _ = trunk;
+    _ = group_layout;
 }
 
 test "exl3 Sushi CPU config and packed shapes admit K1 through K8" {
@@ -551,67 +576,6 @@ test "sushi coder layouts refuse malformed missing mixed and unsupported groups"
     try t.expectError(error.Exl3GroupNameInvalid, plan.add("gate_proj.g32.trellis", &.{ 1, 8, 8, 32 }, .u16));
 }
 
-test "sushi coder GPU two groups equal independently routed uniform banks" {
-    try mlx.requireGpu();
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    var banks: [2]Bank = undefined;
-    var held: std.ArrayList(mlx.mlx_array) = .empty;
-    defer {
-        for (held.items) |a| _ = mlx.mlx_array_free(a);
-        held.deinit(t.allocator);
-    }
-    for (&banks, 0..) |*bank, group| {
-        for ([_]*Proj{ &bank.gate, &bank.up, &bank.down }, 0..) |p, projection| {
-            const n: c_int = @intCast(32 + 16 * ((group + projection) % 3));
-            const words = try t.allocator.alloc(u16, @intCast(8 * 8 * n));
-            defer t.allocator.free(words);
-            for (words, 0..) |*v, i| v.* = @truncate(i *% 7919 +% 23);
-            const signs: [128]u16 = @splat(format.f32ToF16Bits(0.125));
-            p.trellis = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ 1, 8, 8, n }, 4, .uint16);
-            try held.append(t.allocator, p.trellis);
-            p.suh = mlx.mlx_array_new_data(&signs, &[_]c_int{ 1, 128 }, 2, .float16);
-            try held.append(t.allocator, p.suh);
-            p.svh = mlx.mlx_array_new_data(&signs, &[_]c_int{ 1, 128 }, 2, .float16);
-            try held.append(t.allocator, p.svh);
-        }
-    }
-    const xh: [128]u16 = @splat(format.f32ToF16Bits(0.25));
-    const x = mlx.mlx_array_new_data(&xh, &[_]c_int{ 1, 1, 128 }, 3, .float16);
-    defer _ = mlx.mlx_array_free(x);
-    const ids = mlx.mlx_array_new_data(&[_]i32{ 1, 0 }, &[_]c_int{ 1, 1, 2 }, 3, .int32);
-    defer _ = mlx.mlx_array_free(ids);
-    const scores = mlx.mlx_array_new_data(&[_]f32{ 0.25, 0.75 }, &[_]c_int{ 1, 1, 2 }, 3, .float32);
-    defer _ = mlx.mlx_array_free(scores);
-    const got = try moeGroups(s, x, &banks, ids, scores, .mcg, false);
-    defer _ = mlx.mlx_array_free(got);
-    const one_id = mlx.mlx_array_new_data(&[_]i32{0}, &[_]c_int{ 1, 1, 1 }, 3, .int32);
-    defer _ = mlx.mlx_array_free(one_id);
-    var outputs: [2]mlx.mlx_array = undefined;
-    for (&outputs, 0..) |*out, i| {
-        const score = mlx.mlx_array_new_data(&[_]f32{if (i == 0) 0.75 else 0.25}, &[_]c_int{ 1, 1, 1 }, 3, .float32);
-        defer _ = mlx.mlx_array_free(score);
-        out.* = try moe(s, x, banks[i], one_id, score, .mcg, false);
-    }
-    defer for (outputs) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    var want = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(want);
-    try mlx.check(mlx.mlx_add(&want, outputs[0], outputs[1], s));
-    var actual = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(actual);
-    var expected = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(expected);
-    try mlx.check(mlx.mlx_astype(&actual, got, .float32, s));
-    try mlx.check(mlx.mlx_astype(&expected, want, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(actual));
-    try mlx.check(mlx.mlx_array_eval(expected));
-    const a = mlx.mlx_array_data_float32(actual).?;
-    const e = mlx.mlx_array_data_float32(expected).?;
-    for (0..128) |i| try t.expectApproxEqAbs(e[i], a[i], 0.0001 + @abs(e[i]) * 0.01);
-}
-
 /// Routed SwiGLU of a rate-grouped layer, in `moe`'s shapes and dtype. Decode and verify rows fold
 /// `shared` (with `shared_gate`: the bf16 `sigmoid(gate) * shared`) into the finish reduce where the
 /// uniform chain does (one row); otherwise the tail runs as separate ops.
@@ -644,8 +608,9 @@ pub fn moeRagged(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, inds: m
     else
         try rate_groups.moePrefill(s, x2, rb, slots, sc, K);
     defer _ = mlx.mlx_array_free(y);
+    // One owner: a return of `routed` itself hands it out and leaves the defer an empty handle.
     var routed = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(routed);
+    defer _ = mlx.mlx_array_free(routed);
     try mlx.check(mlx.mlx_reshape(&routed, y, xsh.ptr, xsh.len, s));
     if (mlx.mlx_array_dtype(routed) != xd) {
         var c = mlx.mlx_array_new();
@@ -653,9 +618,17 @@ pub fn moeRagged(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, inds: m
         _ = mlx.mlx_array_free(routed);
         routed = c;
     }
-    const value = shared orelse return routed;
-    if (fold) return routed;
-    defer _ = mlx.mlx_array_free(routed);
+    const value = shared orelse {
+        const whole = routed;
+        routed = mlx.mlx_array_new();
+        return whole;
+    };
+    if (fold) {
+        const whole = routed;
+        routed = mlx.mlx_array_new();
+        return whole;
+    }
+    if (shared_gate) |logit| if (try mlx.engine.fusedChain(mlx.engine.chains.sigmoid_gated_add, s, &.{ routed, logit, value })) |out| return out;
     var gated = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gated);
     if (shared_gate) |logit| {
@@ -678,13 +651,13 @@ pub fn moeGroups(s: mlx.mlx_stream, x: mlx.mlx_array, banks: []const Bank, inds:
         _ = mlx.mlx_array_free(total);
     };
     var offset: c_int = 0;
-    const zero = mlx.mlx_array_new_int(0);
+    const zero = try host_side.made(mlx.mlx_array_new_int(0));
     defer _ = mlx.mlx_array_free(zero);
     for (banks) |bank| {
         const count = mlx.getShape(bank.gate.trellis)[0];
-        const lo = mlx.mlx_array_new_int(offset);
+        const lo = try host_side.made(mlx.mlx_array_new_int(offset));
         defer _ = mlx.mlx_array_free(lo);
-        const hi = mlx.mlx_array_new_int(offset + count);
+        const hi = try host_side.made(mlx.mlx_array_new_int(offset + count));
         defer _ = mlx.mlx_array_free(hi);
         var lower = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(lower);
@@ -806,16 +779,18 @@ test "GLM clamped EXL3 rejects malformed banks before kernel dispatch" {
     }
 }
 
-test { _ = glm_group2; }
+test { _ = coop_rows2; }
 
 test {
     _ = rate_groups;
     _ = linear;
-    _ = @import("dsv41_real.zig");
+    _ = trunk_gemm;
+    _ = @import("geometry_5120x2304_test.zig");
 }
 
 test {
-    _ = glm_prefill_grid;
+    _ = prefill_grid;
+    _ = side_cache;
 }
 
 test "a host Decode that names std1 without its table is refused by name" {

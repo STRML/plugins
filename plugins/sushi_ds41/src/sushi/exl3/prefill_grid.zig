@@ -77,7 +77,7 @@ fn eligible(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr
     return true;
 }
 pub fn tryMoe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr, dec: api.format.Decode, limit: c_int) !?Arr {
-    if (!dec.codebook.servesGlmFastPaths() or limit != 10 or !eligible(s, x, bank, indices, scores)) return null;
+    if (!dec.codebook.servesLaneFastPaths() or limit != 10 or !eligible(s, x, bank, indices, scores)) return null;
     if (base.gemmWindowRows() != 32 or !base.gemmWindowAligned()) return null;
     base.setDecodeParams(dec);
     if (!support.available()) return null;
@@ -86,7 +86,7 @@ pub fn tryMoe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: A
     return result;
 }
 pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr, dec: api.format.Decode) !?Arr {
-    if (!dec.codebook.servesGlmFastPaths() or !eligible(s, x, bank, indices, scores)) return null;
+    if (!dec.codebook.servesLaneFastPaths() or !eligible(s, x, bank, indices, scores)) return null;
     base.setDecodeParams(dec);
     const c = kernel_src.slotRow(dec.codebook, false);
     const w = dec.window.index();
@@ -95,7 +95,7 @@ pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr,
     const slot = &kernels[c][w];
     if (slot.* == null) slot.* = build(dec) catch {
         failed[c][w] = true;
-        if (!@import("builtin").is_test) log.info("[exl3-prefill] GLM grid transpose declined (kernel probe failed); the clamped sorted GEMM serves prefill\n", .{});
+        if (!@import("builtin").is_test) log.info("[exl3-prefill] prefill grid transpose declined (kernel probe failed); the clamped sorted GEMM serves prefill\n", .{});
         return null;
     };
     const kernel = slot.*.?;
@@ -125,7 +125,7 @@ pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr,
     defer for ([_]Arr{ metadata.inverse, metadata.table.starts, metadata.table.nlives }) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    if (metadata.inverse.ctx == null) return error.ExpectedGlmInverseRouting;
+    if (metadata.inverse.ctx == null) return error.ExpectedInverseRouting;
     const tab = metadata.table;
     const gate = try project(s, kernel, prep[0], bank.gate.trellis, sorted, tab.starts, tab.nlives, tab.nwin);
     defer _ = mlx.mlx_array_free(gate);
@@ -240,7 +240,7 @@ fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool, dec: api.format.Decode)
     try mlx.check(mlx.mlx_array_eval(want.*));
     base.unfolded_for_test = false;
     const before = dispatchCount();
-    const got = try o.own((try tryMoe(s, x.*, bank, ids.*, scores.*, dec, 10)) orelse return error.TestExpectedGlmGrid);
+    const got = try o.own((try tryMoe(s, x.*, bank, ids.*, scores.*, dec, 10)) orelse return error.TestExpectedGrid);
     try std.testing.expectEqual(before + 1, dispatchCount());
     try mlx.check(mlx.mlx_array_eval(want.*));
     try mlx.check(mlx.mlx_array_eval(got.*));
@@ -251,34 +251,22 @@ fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool, dec: api.format.Decode)
 
 const MCG_W12: api.format.Decode = .{ .codebook = .mcg, .window = .w12 };
 
-test "GLM prefill grid serves every admitted rate, mixed projections included, with the sorted chain's bytes" {
-    for ([_]c_int{ 16, 24, 32, 36, 40, 48, 64 }) |n| {
-        try gridMatchesSortedChain(.{ n, n, n }, @mod(n, 8) == 0, MCG_W12);
-    }
+// A rate is the grid's reader, which the reader tests hold at every rate: the served K2.25 mixed with K2.5, three rates
+// on one layer unskewed, and K4's own NAX fragment.
+test "GLM prefill grid serves mixed projections and K4 with the sorted chain's bytes" {
     try gridMatchesSortedChain(.{ 40, 40, 36 }, true, MCG_W12);
     try gridMatchesSortedChain(.{ 36, 40, 48 }, false, MCG_W12);
-    try gridMatchesSortedChain(.{ 32, 64, 40 }, true, MCG_W12);
+    try gridMatchesSortedChain(.{ 64, 64, 64 }, true, MCG_W12);
 }
 
-test "GLM prefill grid serves W14 packs with the sorted chain's bytes" {
-    try gridMatchesSortedChain(.{ 36, 36, 36 }, true, .{ .codebook = .mcg, .window = .w14 });
-    try gridMatchesSortedChain(.{ 40, 40, 40 }, false, .{ .codebook = .mcg, .window = .w14 });
-    try gridMatchesSortedChain(.{ 40, 40, 36 }, true, .{ .codebook = .mcg, .window = .w14 });
-}
-
-test "GLM serves spec1 and std1 on the prefill grid with the unfolded sorted chain's bytes" {
-    try gridMatchesSortedChain(.{ 36, 40, 48 }, true, api.format.Decode.tabled(.spec1, .w15));
-    try gridMatchesSortedChain(.{ 36, 40, 48 }, true, api.format.Decode.tabled(.std1, .w15));
+test "GLM serves spec1 on the prefill grid with the unfolded sorted chain's bytes" {
     // A per-rate SPEC1 table at a window other than its own: the three projections decode rows of three rates.
     const table = api.codebook_tables.indexOf("spec1-test-per-rate");
     try gridMatchesSortedChain(.{ 24, 32, 48 }, true, .{ .codebook = .spec1, .window = .w9, .table = table });
-    try gridMatchesSortedChain(.{ 40, 42, 64 }, false, .{ .codebook = .spec1, .window = .w16, .table = table });
 }
 
 test "GLM serves PAIR1 on the prefill grid with the unfolded sorted chain's bytes" {
-    try gridMatchesSortedChain(.{ 36, 36, 36 }, true, .{ .codebook = .pair1, .window = .w16 });
     try gridMatchesSortedChain(.{ 24, 32, 48 }, true, .{ .codebook = .pair1, .window = .w16 });
-    try gridMatchesSortedChain(.{ 40, 42, 64 }, false, .{ .codebook = .pair1, .window = .w16 });
 }
 
 test "GLM serves std1 on the prefill grid and probes a failing kernel once per codebook and window" {

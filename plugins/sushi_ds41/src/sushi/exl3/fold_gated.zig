@@ -1,4 +1,4 @@
-//! Qwen3.8-Flash-Next decode on a one-bank layer (MCG EXL3): the shared expert's kernels (`qwen_riders.zig`) ride the
+//! Qwen3.8-Flash-Next decode on a one-bank layer (MCG EXL3): the shared expert's kernels (`riders_gated.zig`) ride the
 //! routed chain's pair and fused-mid down launches as extra threadgroups (`fuse.zig`), and the gated shared add rides
 //! the finish reduce, so a layer's shared gate/up, SwiGLU, down, gate logit, pair, down, reduce and sigmoid tail
 //! become three launches. Every part keeps its own statements, so the output is the bytes of the separate chain.
@@ -9,7 +9,8 @@ const kernels = @import("expert_exl3_kernels.zig");
 const rate_groups = @import("rate_groups.zig");
 const codebook_tables = @import("codebook_tables.zig");
 const fuse = @import("fuse.zig");
-const riders = @import("qwen_riders.zig");
+const riders = @import("riders_gated.zig");
+const shared_trellis = @import("shared_trellis.zig");
 const root = @import("root.zig");
 
 const Stage = enum { pair, down };
@@ -26,6 +27,7 @@ const Key = struct {
     group: c_int,
     logit_group: c_int,
     logit: bool,
+    tr: ?shared_trellis.Geo,
     layout: kernels.GemvLayout,
     dec: exl3.Decode,
     shared_first: bool,
@@ -86,8 +88,8 @@ fn stageFor(k: Key) !*const Built {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const geo: riders.Geometry = .{ .hidden = k.hidden, .width = k.width, .group = k.group, .logit_group = k.logit_group };
-    const a = try routedParts(alloc, k.stage, k.hidden, k.inter, k.topk, k.rows, k.n, k.layout, try rate_groups.headerOf(k.dec));
+    const geo: riders.Geometry = .{ .hidden = k.hidden, .width = k.width, .group = k.group, .logit_group = k.logit_group, .tr = k.tr };
+    const a = try routedParts(alloc, k.stage, k.hidden, k.inter, k.topk, k.rows, k.n, k.layout, try rate_groups.headerOf(alloc, k.dec));
     const b = switch (k.stage) {
         .pair => try riders.gateUpPart(alloc, geo, k.rows, k.logit),
         .down => try riders.downPart(alloc, geo, k.rows),
@@ -95,9 +97,13 @@ fn stageFor(k: Key) !*const Built {
     const src = try fuse.source(alloc, a, b);
     const head = try fuse.header(alloc, a, b);
     var name: std.ArrayList(u8) = .empty;
-    try name.print(alloc, "sushi_qwen_fold_{s}_{s}_w{d}", .{ @tagName(k.stage), @tagName(k.dec.codebook), k.dec.window.bits() });
+    try name.print(alloc, "sushi_gated_fold_{s}_{s}_w{d}", .{ @tagName(k.stage), @tagName(k.dec.codebook), k.dec.window.bits() });
     if (k.dec.codebook.tabledHashMask()) try name.print(alloc, "_t{s}", .{codebook_tables.tables[k.dec.table.?].digest});
     if (k.logit) try name.appendSlice(alloc, "_logit");
+    if (k.tr) |t| {
+        try name.print(alloc, "_tr_{s}_w{d}_n{d}_{d}", .{ @tagName(t.dec.codebook), t.dec.window.bits(), t.n_gu, t.n_dn });
+        if (t.dec.codebook.tabledHashMask()) try name.print(alloc, "_t{s}", .{codebook_tables.tables[t.dec.table.?].digest});
+    }
     try name.append(alloc, 0);
     var slot: ?mlx.mlx_fast_metal_kernel = null;
     const kernel = try kernels.getNamedKernel(&slot, @ptrCast(name.items.ptr), try fuse.insOf(alloc, a, b), try fuse.outsOf(alloc, a, b), src, head);
@@ -120,9 +126,16 @@ fn get(v: mlx.mlx_vector_array, i: usize) !mlx.mlx_array {
 pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, sh: riders.Shared, gate: ?mlx.mlx_array) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s)) return null;
     const route = riders.Routing.of(x, inds, scores) orelse return null;
-    const rows = route.rows;
-    const topk = route.topk;
     const hidden = mlx.getShape(x)[2];
+    const geo = riders.geometry(sh, hidden, route.rows) orelse return null;
+    return fold(s, x, bank, bankShape(bank, hidden) orelse return null, inds, scores, dec, sh, gate, route, geo);
+}
+
+/// A one-bank routed layer's launch shape, read and checked once (`bankShape`).
+pub const BankShape = struct { hidden: c_int, inter: c_int, n: u32, down_n: u32 };
+
+/// The shape the fold launches `bank` at for `hidden`-wide rows, or null where the fold does not serve it.
+pub fn bankShape(bank: root.Bank, hidden: c_int) ?BankShape {
     const gs = mlx.getShape(bank.gate.trellis);
     const us = mlx.getShape(bank.up.trellis);
     const ds = mlx.getShape(bank.down.trellis);
@@ -134,7 +147,33 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank
     if (gs[3] != us[3]) return null;
     const rate = exl3.kFromPackedDim(@intCast(gs[3])) orelse return null;
     const down_rate = exl3.kFromPackedDim(@intCast(ds[3])) orelse return null;
-    const geo = riders.geometry(sh, hidden) orelse return null;
+    return .{ .hidden = hidden, .inter = inter, .n = rate.n, .down_n = down_rate.n };
+}
+
+/// `moeGatedSharedFolded` with the shared expert's geometry given: `geo` is `riders_gated.geometry(sh, hidden, rows)`
+/// for this `sh`, hidden width and row count, read once at load. One that does not fit `x` or `sh` gives null.
+pub fn moeGatedSharedFoldedGeo(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, sh: riders.Shared, gate: ?mlx.mlx_array, geo: *const riders.Geometry) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
+    const route = riders.Routing.of(x, inds, scores) orelse return null;
+    if (!riders.geometryFits(geo.*, sh)) return null;
+    return fold(s, x, bank, bankShape(bank, geo.hidden) orelse return null, inds, scores, dec, sh, gate, route, geo.*);
+}
+
+/// `moeGatedSharedFoldedGeo` with the routed bank's shape given too: `shape` is `bankShape(bank, hidden)` for these
+/// arrays, read once at load.
+pub fn moeGatedSharedFoldedBound(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank, shape: *const BankShape, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, sh: riders.Shared, gate: ?mlx.mlx_array, geo: *const riders.Geometry) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
+    const route = riders.Routing.of(x, inds, scores) orelse return null;
+    if (!riders.geometryFits(geo.*, sh)) return null;
+    return fold(s, x, bank, shape.*, inds, scores, dec, sh, gate, route, geo.*);
+}
+
+fn fold(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank, shape: BankShape, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, sh: riders.Shared, gate: ?mlx.mlx_array, route: riders.Routing, geo: riders.Geometry) !?mlx.mlx_array {
+    const rows = route.rows;
+    const topk = route.topk;
+    const hidden = mlx.getShape(x)[2];
+    if (geo.hidden != hidden or shape.hidden != hidden) return null;
+    const inter = shape.inter;
     const want_logit = sh.logit != null;
     if (!want_logit) {
         const g = gate orelse return null;
@@ -157,7 +196,7 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank
     defer _ = mlx.mlx_array_free(sc);
     try mlx.check(mlx.mlx_reshape(&sc, scores, &[_]c_int{nslots}, 1, s));
 
-    var key: Key = .{ .stage = .pair, .hidden = hidden, .inter = inter, .width = geo.width, .topk = topk, .rows = rows, .n = rate.n, .group = geo.group, .logit_group = geo.logit_group, .logit = want_logit, .layout = kernels.gemvLayout(@divExact(inter, 16)), .dec = dec, .shared_first = shared_first };
+    var key: Key = .{ .stage = .pair, .hidden = hidden, .inter = inter, .width = geo.width, .topk = topk, .rows = rows, .n = shape.n, .group = geo.group, .logit_group = geo.logit_group, .logit = want_logit, .tr = geo.tr, .layout = kernels.gemvLayout(@divExact(inter, 16)), .dec = dec, .shared_first = shared_first };
     const pair = try stageFor(key);
     var buf: [11]mlx.mlx_array = undefined;
     const rider_in = riders.gateUpInputs(sh, x2, &buf);
@@ -178,10 +217,15 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank
     };
 
     key.stage = .down;
-    key.n = down_rate.n;
+    key.n = shape.down_n;
     key.layout = kernels.gemvLayout(@divExact(hidden, 16));
     const down_stage = try stageFor(key);
-    const down_ov = try kernels.applyOuts(s, down_stage.kernel, &.{ ig, iu, bank.down.trellis, bank.gate.svh, bank.up.svh, bank.down.suh, slots, mid, sh.down.weight, sh.down.scales, sh.down.biases }, down_stage.cfg, 2);
+    var down_buf: [7]mlx.mlx_array = undefined;
+    const rider_down = riders.downInputs(sh, x2, mid, &down_buf);
+    var down_in: [14]mlx.mlx_array = undefined;
+    down_in[0..7].* = .{ ig, iu, bank.down.trellis, bank.gate.svh, bank.up.svh, bank.down.suh, slots };
+    @memcpy(down_in[7..][0..rider_down.len], rider_down);
+    const down_ov = try kernels.applyOuts(s, down_stage.kernel, down_in[0 .. 7 + rider_down.len], down_stage.cfg, 2);
     defer _ = mlx.mlx_vector_array_free(down_ov);
     const down = try get(down_ov, 0);
     defer _ = mlx.mlx_array_free(down);
@@ -191,7 +235,7 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank
     folded_layers += 1;
     // Pair, down, reduce.
     folded_launches += 3;
-    const y = try kernels.downFinishReduceWithShared(s, down, bank.down.svh, slots, sc, hidden, rows, topk, .bfloat16, shared_out, logit_out orelse gate.?, false);
+    const y = try riders.reduce(s, sh, geo, down, bank.down.svh, slots, sc, hidden, rows, topk, shared_out, logit_out orelse gate.?);
     defer _ = mlx.mlx_array_free(y);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);

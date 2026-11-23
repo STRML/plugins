@@ -3,6 +3,7 @@
 const std = @import("std");
 const log = @import("../log.zig");
 const sushi_exl3 = @import("sushi_exl3");
+const pool_class = @import("../tensor/pool_class.zig");
 
 pub const max_layers = 64;
 pub const max_engram = 4;
@@ -13,6 +14,10 @@ pub const max_block = 16;
 /// Rows a backbone window ring keeps past the window while DSpark is on, so a verify chunk writes its rows and
 /// still rolls back to any accepted prefix.
 pub const ring_slack: u32 = 16;
+
+/// The widest decode pass that queues its routed chains before their picks are read (`dsv41_model.specOn`). The queue
+/// saves a wait a layer and loses a layer's work when a pick is outside the cache map; each row brings `top_k` picks.
+pub const route_spec_rows: u32 = 8;
 
 pub const Engram = struct {
     n: u32 = 0,
@@ -71,6 +76,23 @@ pub const Vision = struct {
         return @as(u64, self.downsample) * self.downsample * (self.max_tokens - 2);
     }
 };
+
+/// A wide forward's hyper-connection expand (the fused kernel, or `hcExpandOps`'s chain) and Engram gate (the kernel, or
+/// `engramGateOps`'s chain): the chains hold planes the kernels do not.
+pub const WideArms = struct {
+    expand_fused: bool,
+    engram_fused: bool,
+
+    /// The served kernels' arms: a matrix-unit GPU with its fused kernels on.
+    pub const kernels: WideArms = .{ .expand_fused = true, .engram_fused = true };
+
+    /// A load's arms: `fused`, its kernels on; `expand_probed`, `hcExpandFused` reproduces this GPU's chain.
+    pub fn of(fused: bool, expand_probed: bool) WideArms {
+        return .{ .expand_fused = fused and expand_probed, .engram_fused = fused };
+    }
+};
+
+/// Who asked for decode on MLX instead of the engine of our own.
 
 pub const Config = struct {
     /// DeepSeek's recommended serving for V4.1-Flash: a 1M window and a generation budget of at least 256K.
@@ -135,10 +157,27 @@ pub const Config = struct {
     /// FP4 experts and FP8 trunk.
     expert_dec: ?sushi_exl3.format.Decode = null,
     trunk_dec: ?sushi_exl3.format.Decode = null,
+    /// The most rate groups one layer's routed experts span in an STQ pack (`ModelConfig.expert_rate_groups`, set
+    /// once the pack's layout is read); 1 for an ungrouped pack.
+    rate_groups: u8 = 1,
+    /// Whether a routed chain can read a spill pool beside each rate group's cache pool (`Ragged.initSplit`): a streamed
+    /// plan's route does when an expert misses the cache; a resident plan's cache holds every expert, so its route makes
+    /// none. The shape sum bills the pools the route makes. True until the plan says resident (`adoptPlan`, and the load's
+    /// own plan, `dsv41_serving.initDsv41`).
+    spill_pools: bool = true,
+    /// The wide forward's arms the shape sum bills (`dsv41_wide_bytes`): what the parse predicts for this GPU until
+    /// the load records its own (`dsv41_model.setFused`). Null only for a config no parse made.
+    wide_arms: ?WideArms = null,
 
     pub fn isDsparkTarget(self: *const Config, l: usize) bool {
         for (self.dspark.targets[0..self.dspark.n_targets]) |t| if (t == l) return true;
         return false;
+    }
+
+    /// The pack's layout gives a row one arm at every width: trellis experts and trunk (`Model.widthExact` checks the
+    /// loaded linears). The release's FP8 trunk and FP4 experts take a product plan by row count.
+    pub fn widthExactLayout(self: *const Config) bool {
+        return self.expert_dec != null and self.trunk_dec != null;
     }
 
     pub fn isKvSource(self: *const Config, l: usize) bool {
@@ -183,7 +222,7 @@ pub const Config = struct {
 
     /// Bytes ONE token adds to a request's state: the compressed KV rows of each KV source (FP4 with an E4M3 scale per
     /// 16) and the index keys of each owner (MXFP4), at their `ratio`-to-1 compression, stored as the round trips
-    /// left them. Growth slack and the copy a growth makes are transient (`forwardCap`).
+    /// left them. A request's stores are made at its last row (`stateReservedBytes`), so they never grow.
     pub fn stateBytesPerToken(self: *const Config) u64 {
         var raw: u64 = 0;
         for (0..self.layers) |l| {
@@ -192,19 +231,6 @@ pub const Config = struct {
             if (self.isOwner(l)) raw += indexRowBytes(self.index_head_dim) / r;
         }
         return raw;
-    }
-
-    /// The largest one layer's state per token: a growth holds its old rows beside the new buffer.
-    fn worstLayerBytesPerToken(self: *const Config) u64 {
-        var worst: u64 = 0;
-        for (0..self.layers) |l| {
-            const r: u64 = @max(self.ratios[l], 1);
-            var b: u64 = 0;
-            if (self.isKvSource(l)) b += compRowBytes(self.head_dim) / r;
-            if (self.isOwner(l)) b += indexRowBytes(self.index_head_dim) / r;
-            worst = @max(worst, b);
-        }
-        return worst;
     }
 
     /// What a request holds whatever its length: every layer's window ring and open pooling group, and with DSpark
@@ -220,22 +246,111 @@ pub const Config = struct {
         return base + (@as(u64, self.n_mtp) * self.window + @as(u64, self.layers) * ring_slack) * self.head_dim * act_bytes;
     }
 
-    /// The most one forward of `rows` ending at position `seq` may allocate through MLX beyond what is live when it
-    /// starts: its transients and the state rows it appends. The transient cap installs it (`dsv41_borrow`) and
-    /// admission bills it. A prefill-width forward costs `cap_row_bytes_per_dim` a row and a channel; a decode or
-    /// verify block scores every key (`narrow_rows` rows, `score_copies` copies) and its rows fit in the slack. Both
-    /// carry the rows' growth: its slack plus one layer's old rows beside the new buffer during the copy.
+    /// The most one forward of `rows` ending at position `seq` may allocate beyond what is live when it starts: its
+    /// transients and the state rows it appends. The transient cap installs it (`dsv41_borrow`) and admission bills it.
+    /// A prefill-width forward holds the tensors `dsv41_wide_bytes` counts from its shapes, the state rows among them; a
+    /// decode or verify block scores every key (`narrow_rows` rows, `score_copies` copies) beside `forward_held_bytes`.
+    /// Both carry the bill's one margin; the row stores are made at the request's last row, so neither grows one.
     pub fn forwardCap(self: *const Config, rows: u64, seq: u64) u64 {
         const ctx = @max(seq, 1);
-        const by_rows = if (rows > verify_rows) rows *| self.dim *| cap_row_bytes_per_dim else narrow_rows * ctx * 4 * score_copies;
-        const growth = ctx * (self.stateBytesPerToken() / rows_grow_div + self.worstLayerBytesPerToken());
-        return (by_rows +| growth) *| 5 / 4 +| cap_slack_bytes;
+        if (rows > verify_rows) return wide_bytes.bytes(self, rows, ctx) +| BILL_MARGIN_BYTES;
+        return narrow_rows * ctx * 4 * score_copies +| cap_fixed_bytes;
     }
 
-    /// `forwardCap` of a prefill chunk of `chunk` rows ending at `seq`: the last chunk of a prompt absorbs a tail of
-    /// up to `tail_merge_rows`, so the widest forward is `chunk + tail_merge_rows` rows.
+    /// `forwardCap` of a load on MLX's stream: MLX's graph holds what its evaluation order keeps, which no shape sum
+    /// of ours counts, so a prefill-width forward there keeps the per-row rate measured on it.
+    pub fn mlxForwardCap(self: *const Config, rows: u64, seq: u64) u64 {
+        if (rows <= verify_rows) return self.forwardCap(rows, seq) +| self.rowsGridBytes();
+        return rows *| self.dim *| mlx_row_bytes_per_dim +| self.rowsGridBytes() +| cap_fixed_bytes;
+    }
+
+    /// The most MLX's page grid adds to the row stores (`Rows.pagedCap`): under one grid step of each packed buffer.
+    pub fn rowsGridBytes(self: *const Config) u64 {
+        const pages = @import("../mlx_pages.zig");
+        var sum: u64 = 0;
+        for (0..self.layers) |l| {
+            if (self.isKvSource(l)) sum +|= pages.gridStepBytes(&.{ self.head_dim / 2, self.head_dim / 16 });
+            if (self.isOwner(l)) sum +|= pages.gridStepBytes(&.{ self.index_head_dim / 2, self.index_head_dim / 32 });
+        }
+        return sum;
+    }
+
+    /// `forwardCap` on the side a load runs on: the engine of our own (`engine`) or MLX.
+    pub fn forwardCapOn(self: *const Config, engine: bool, rows: u64, seq: u64) u64 {
+        return if (engine) self.forwardCap(rows, seq) else self.mlxForwardCap(rows, seq);
+    }
+
+    /// The rows layer `l`'s row stores hold for a request that ends at token `end`, which they are made at up front
+    /// (`dsv41_model.bindRequest`): the rows of `end` and of a verify block written past it.
+    pub fn storeRows(self: *const Config, l: usize, end: u64) u64 {
+        return (end +| verify_rows) / @max(self.ratios[l], 1);
+    }
+
+    /// What a request that ends at token `end` holds in its row stores, made at those rows up front: each store's codes
+    /// and scales a pool buffer of their own on the engine, the rows' exact bytes on MLX (whose page grid `rowsGridBytes`
+    /// adds to the caps).
+    pub fn stateReservedBytes(self: *const Config, engine: bool, end: u64) u64 {
+        var bytes: u64 = 0;
+        for (0..self.layers) |l| {
+            if (!self.isKvSource(l)) continue;
+            const rows = self.storeRows(l, end);
+            bytes += storeBytes(engine, rows, self.head_dim, 16);
+            if (self.isOwner(l)) bytes += storeBytes(engine, rows, self.index_head_dim, 32);
+        }
+        return bytes;
+    }
+
+    /// What the row stores of a state at token `n` keep once their request has ended (`dsv41_model.Request.reset`): the
+    /// rows they hold and a sixteenth over (`reservedRows`), each buffer at its pool size class.
+    pub fn keptStoreBytes(self: *const Config, n: u64) u64 {
+        var bytes: u64 = 0;
+        for (0..self.layers) |l| {
+            if (!self.isKvSource(l)) continue;
+            const rows = n / @max(self.ratios[l], 1);
+            bytes += if (rows == 0) 0 else packedStoreBytes(reservedRows(rows), self.head_dim, 16);
+            if (self.isOwner(l) and rows > 0) bytes += packedStoreBytes(reservedRows(rows), self.index_head_dim, 32);
+        }
+        return bytes;
+    }
+
+    /// What a forward of `rows` rows from position `kv_len` makes of the row stores, which hold `caps` rows a layer: each
+    /// store its rows overflow is regrown by `grownRows` (to the request's `end` when one is bound), its codes and its
+    /// scales a buffer each at their pool size class. Returns those buffers' bytes; `caps` becomes what the stores hold after.
+    pub fn growRowStores(self: *const Config, caps: *[max_layers]u32, kv_len: u64, rows: u64, end: ?u64) u64 {
+        var bytes: u64 = 0;
+        for (0..self.layers) |l| {
+            if (!self.isKvSource(l)) continue;
+            const r: u64 = @max(self.ratios[l], 1);
+            const used = kv_len / r;
+            const n = (kv_len +| rows) / r - used;
+            if (used + n <= caps[l]) continue;
+            const grown = grownRows(caps[l], used, n, if (end) |e| self.storeRows(l, e) else 0);
+            caps[l] = @intCast(grown);
+            bytes += packedStoreBytes(grown, self.head_dim, 16);
+            if (self.isOwner(l)) bytes += packedStoreBytes(grown, self.index_head_dim, 32);
+        }
+        return bytes;
+    }
+
+    /// `forwardCap` of a joined decode forward, a row per request at `seqs`: each request's scores are its own,
+    /// `cap_fixed_bytes` the forward's.
+    pub fn joinedCap(self: *const Config, seqs: []const u64) u64 {
+        return self.joinedCapOn(true, seqs);
+    }
+
+    /// `joinedCap` on the side a load runs on (`forwardCapOn`): on MLX each request's row stores take the grid's step.
+    pub fn joinedCapOn(self: *const Config, engine: bool, seqs: []const u64) u64 {
+        var sum: u64 = 0;
+        for (seqs) |seq| sum +|= self.forwardCapOn(engine, 1, seq) - cap_fixed_bytes;
+        return sum +| cap_fixed_bytes;
+    }
+
+    /// `forwardCap` of the widest forward a prefill of `seq` tokens runs at `chunk`-row chunks with the flat tail merge
+    /// (`prefill_plan.widestForward`): a served request's is `bills.requestForwardRows`.
     pub fn chunkCap(self: *const Config, chunk: u64, seq: u64) u64 {
-        return self.forwardCap(@min(chunk +| tail_merge_rows, @max(seq, 1)), seq);
+        const prefill_plan = @import("../prefill_plan.zig");
+        const widest = prefill_plan.widestForward(@intCast(seq -| 1), @intCast(@max(chunk, 1)), false);
+        return self.forwardCapOn(true, @max(@min(chunk, @max(seq, 1)), widest), seq);
     }
 };
 
@@ -246,21 +361,54 @@ fn compRowBytes(width: u64) u64 {
     return width / 2 + width / 16;
 }
 
+/// A packed store of `rows` rows of `width` values: its codes and its scales, each a pool buffer.
+fn packedStoreBytes(rows: u64, width: u64, group: u64) u64 {
+    return pool_class.poolBytes(@intCast(rows * (width / 2))) + pool_class.poolBytes(@intCast(rows * (width / group)));
+}
+
+/// `packedStoreBytes` on the engine, else the rows' bytes as they are.
+fn storeBytes(engine: bool, rows: u64, width: u64, group: u64) u64 {
+    return if (engine) packedStoreBytes(rows, width, group) else rows * (width / 2 + width / group);
+}
+
 /// An index key: FP4 codes and one E8M0 scale per 32.
 fn indexRowBytes(width: u64) u64 {
     return width / 2 + width / 32;
 }
-/// The prefill chunk a load runs at when its bill fits (an explicit `--prefill-chunk` outranks it): with CED the bulk of a
-/// chunk is the encoder's 20 layers, whose experts a wider chunk reads once for more rows.
-pub const prefill_width: u32 = 2048;
-/// Added to every cap: twice the 0.12 GiB of small tensors and tables a decode forward was measured to hold.
-const cap_slack_bytes: u64 = 256 << 20;
+/// The prefill chunk a request starts at on the GPU named `chip` (`chip.chipBrand()`), stepping down where its bill does
+/// not fit (an explicit `--prefill-chunk` outranks it): with CED the bulk of a chunk is the encoder's 20 layers, whose
+/// experts a wider chunk reads once for more rows. One width for every chip until a chip measures another.
+pub fn prefillWidthFor(chip: []const u8) u32 {
+    _ = chip;
+    return 8192;
+}
+
+/// The widest chunk the load's own kernel warm runs (`dsv41_serving.warmAll`); the served warm (`cooler_warm`) runs a
+/// request's widest rung.
+pub const warm_width: u32 = 2048;
+
+/// Rows the router scores in one dense product on a prefill chunk (`dsv41_model.gateLogitsWide`): a divisor of every
+/// ladder rung from 2048 up, so those chunks pad nothing. A narrower forward pads one f32 tile a layer at a time (42 MB
+/// at the release width), inside the cap's margin: the measured chunk peaks the cap is fitted to are taken with it.
+pub const gate_tile_rows: u64 = 2048;
+
+/// The MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
+pub const dsv41_pool_bytes: u64 = 1 << 30;
+/// The small tensors and tables a forward holds whatever its rows: the 0.12 GiB a decode forward was measured to hold.
+pub const forward_held_bytes: u64 = 123 << 20;
+/// The bill's one safety margin, by the name and value `bills.zig` gives the shared one, which replaces it.
+pub const BILL_MARGIN_BYTES: u64 = 256 << 20;
+/// What a decode or verify forward's cap carries beyond its scores and its context.
+pub const cap_fixed_bytes: u64 = forward_held_bytes + BILL_MARGIN_BYTES;
 const score_copies: u64 = 3;
-/// `prefill_plan.TAIL_MERGE_MAX - 1`: the longest tail the last chunk of a prompt absorbs.
-pub const tail_merge_rows: u64 = 511;
-/// Peak bytes a prefill forward row holds per hidden channel: measured on the 5120-wide release as 2.3 MiB a row from
-/// 256 to 2048 rows (2.8 MiB for one 363-row chunk, its state rows included), rounded up.
-const cap_row_bytes_per_dim: u64 = 480;
+/// Rows of a wide chunk one attention span takes: a span's scores and gathered rows are freed before the next.
+pub const attn_span: u64 = 256;
+/// Layers a prefill pass keeps in flight (`Model.pipe_depth`): their output streams stay in use until it waits on them.
+pub const prefill_pipe_depth: usize = 2;
+/// Peak bytes a prefill forward row on MLX's stream holds per hidden channel: measured on the 5120-wide release as 2.3
+/// MiB a row from 256 to 2048 rows (2.8 MiB for one 363-row chunk, its state rows included), rounded up.
+const mlx_row_bytes_per_dim: u64 = 480;
+const wide_bytes = @import("dsv41_wide_bytes.zig");
 /// Keys one pass of a wide span's streamed index top-k scores, as `dsv41_model` runs them.
 pub const index_stream_tile: u64 = 32768;
 /// Rows up to which the indexer scores a block with the scalar kernel, whole rows at a time.
@@ -269,6 +417,20 @@ pub const narrow_rows: u64 = 16;
 pub const verify_rows: u64 = 17;
 /// A row store grows by its length over this: slack is that fraction of the state, and each growth copies the store.
 pub const rows_grow_div: u64 = 16;
+
+/// The rows a row store of `cap` rows that holds `used` has once it appends `n` (`dsv41_model.Rows.append`): as it is
+/// while they fit, else the rows its request ends at (`goal`, the larger when the rows asked pass it) or, for a store no
+/// request has bound (`goal` 0), the rows it needs or its capacity a sixteenth over, the larger, and at least 64.
+pub fn grownRows(cap: u64, used: u64, n: u64, goal: u64) u64 {
+    if (used + n <= cap) return cap;
+    if (goal > 0) return @max(used + n, goal);
+    return @max(used + n, @max(64, cap + cap / rows_grow_div));
+}
+
+/// The rows `dsv41_model.Rows.reserve` makes a store holding `used` rows: the slack its next append would have taken.
+pub fn reservedRows(used: u64) u64 {
+    return @max(64, used + @max(1, used / rows_grow_div));
+}
 
 fn refuse(comptime fmt: []const u8, args: anytype) error{UnsupportedDsv41Config} {
     log.err("deepseek_v41: " ++ fmt ++ "\n", args);
@@ -280,15 +442,21 @@ fn field(obj: std.json.ObjectMap, key: []const u8) ?std.json.Value {
     return if (v == .null) null else v;
 }
 
-fn envU32(name: [*:0]const u8) !u32 {
-    const raw = std.c.getenv(name) orelse return 0;
-    return std.fmt.parseInt(u32, std.mem.span(raw), 10) catch refuse("{s} is not a whole number", .{name});
-}
-
 fn uint(comptime T: type, obj: std.json.ObjectMap, key: []const u8) !T {
     const v = field(obj, key) orelse return refuse("missing {s}", .{key});
     if (v != .integer) return refuse("{s} is not an integer", .{key});
     return std.math.cast(T, v.integer) orelse refuse("{s} is out of range", .{key});
+}
+
+pub const prefill_top_k_max: u32 = 32;
+
+pub fn validPrefillTopK(k: u32, top_k: u32, experts: u32) bool {
+    return k == 0 or (k >= 2 and k <= @min(top_k, @min(experts, prefill_top_k_max)));
+}
+
+fn envU32(name: [*:0]const u8) !u32 {
+    const raw = std.c.getenv(name) orelse return 0;
+    return std.fmt.parseInt(u32, std.mem.span(raw), 10) catch refuse("{s} is not a whole number", .{name});
 }
 
 fn num(obj: std.json.ObjectMap, key: []const u8) !f64 {
@@ -360,6 +528,38 @@ fn parseVision(obj: std.json.ObjectMap) !Vision {
     return v;
 }
 
+/// The DeepSeek part of the parse, onto the shared `ModelConfig` (taken as `anytype`: this file stays free of `model.zig`).
+pub fn parseFamily(config: anytype, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
+    var c = try parse(cfg_obj, root);
+    // What a planner bills before the load probes its arms: the fused expand serves on the matrix-unit (NAX) GPUs.
+    c.wide_arms = .of(true, sushi_exl3.kernels.gemmNaxOn());
+    config.model_type = "deepseek_v41";
+    config.weight_prefix = "";
+    config.text_prompt_bos = config.bos_token_id;
+    config.hidden_act = .silu;
+    config.num_experts = c.experts;
+    config.num_experts_per_tok = c.top_k;
+    config.moe_intermediate_size = c.moe_inter;
+    config.first_k_dense_replace = 0;
+    config.rms_norm_eps = c.eps;
+    config.has_vision = c.vision != null;
+    if (c.vision) |v| {
+        // The shared ViT geometry the media bills read.
+        config.qv_depth = v.layers;
+        config.qv_hidden = v.hidden;
+        config.qv_heads = v.heads;
+        config.qv_head_dim = v.headDim();
+        config.qv_intermediate = v.inter;
+        config.qv_out_hidden = c.dim;
+        config.qv_patch = v.patch;
+        config.qv_merge = v.downsample;
+        config.qv_temporal_patch = 1;
+    }
+    if (root.get("trunk_quant")) |b| config.trunk_quant_rate = (try sushi_exl3.parseQuantBlock(b)).rate;
+    config.dsv41 = c;
+    config.serve_defaults = Config.serveDefaults(@TypeOf(config.serve_defaults));
+}
+
 /// `text` is `text_config` (or the root of a flat config), `root` the file's top level.
 pub fn parse(text: std.json.ObjectMap, root: std.json.ObjectMap) !Config {
     var c: Config = .{};
@@ -399,7 +599,7 @@ pub fn parse(text: std.json.ObjectMap, root: std.json.ObjectMap) !Config {
     if ((try uint(u32, text, "n_shared_experts")) != 1) return refuse("n_shared_experts is not 1", .{});
     if ((try uint(u32, text, "num_key_value_heads")) != 1) return refuse("num_key_value_heads is not 1", .{});
     if (field(text, "attention_bias")) |v| if (v == .bool and v.bool) return refuse("attention_bias is on", .{});
-    if (c.prefill_top_k == 1 or c.prefill_top_k > c.experts) return refuse("SUSHI_DS41_PREFILL_TOP_K {d} is outside 2..{d}", .{ c.prefill_top_k, c.experts });
+    if (!validPrefillTopK(c.prefill_top_k, c.top_k, c.experts)) return refuse("SUSHI_DS41_PREFILL_TOP_K {d} is outside 2..{d}", .{ c.prefill_top_k, @min(c.top_k, @min(c.experts, prefill_top_k_max)) });
 
     if (c.layers == 0 or c.layers > max_layers or c.dim == 0 or c.heads == 0 or c.head_dim == 0 or
         c.rope_dim == 0 or c.rope_dim > c.head_dim or c.rope_dim % 2 != 0 or c.window == 0 or
@@ -540,7 +740,7 @@ fn gibs(x: f64) u64 {
     return @intFromFloat(x * @as(f64, @floatFromInt(gib)));
 }
 
-test "dsv41 forward cap: covers a quarter over what every measured peak added to the state it started from" {
+test "dsv41 forward cap: on MLX, covers what every measured peak added to the state it started from, with no multiplier" {
     const c = try parseText(release_config);
     // Peaks of MLX's own bytes (imported weights left out, state rows in), STQ pack, budget 108, binary 26a28040. The
     // cap is over the level a forward starts at, which holds the state of `ctx` tokens at least.
@@ -559,27 +759,108 @@ test "dsv41 forward cap: covers a quarter over what every measured peak added to
     };
     for (peaks) |m| {
         const added = gibs(m.peak) -| m.ctx * c.stateBytesPerToken();
-        try testing.expect(c.forwardCap(m.rows, m.ctx) >= added * 5 / 4);
+        try testing.expect(c.mlxForwardCap(m.rows, m.ctx) >= added);
     }
 }
 
-test "dsv41 forward cap: grows with the rows and the context, a chunk's tail merge is priced, and 1M fits" {
+test "dsv41 forward cap: a wide forward's row term is the shape sum of its widest layer's tensors, for the tiny fixture's geometry and the release's" {
+    var tiny = try parseText(stq_tiny_config);
+    tiny.rate_groups = 3;
+    const rel_stq = try releaseStqForTest();
+    const rel = try parseText(release_config);
+    const Case = struct { c: *const Config, rows: u64, shapes: u64 };
+    // At `parseText`'s arms, the served kernels'. The tiny: layer 2 (Engram, KV source and index owner) at its routed chain over six pools; its trace at three
+    // pools reads these less the three spill pools. The release: layer 14 (the same roles) over ten pools (the STQ
+    // pack's combined chain) or the FP4 experts' sorted gather.
+    for ([_]Case{
+        .{ .c = &tiny, .rows = 512, .shapes = 22_872_064 },
+        .{ .c = &tiny, .rows = 2048, .shapes = 89_899_008 },
+        .{ .c = &tiny, .rows = 8192, .shapes = 358_449_152 },
+        .{ .c = &rel_stq, .rows = 363, .shapes = 499_957_760 },
+        .{ .c = &rel_stq, .rows = 2048, .shapes = 2_696_380_416 },
+        .{ .c = &rel_stq, .rows = 4096, .shapes = 5_391_433_728 },
+        .{ .c = &rel_stq, .rows = 8192, .shapes = 10_775_347_200 },
+        .{ .c = &rel, .rows = 2048, .shapes = 1_333_067_776 },
+    }) |k| {
+        const got = k.c.forwardCap(k.rows, k.rows) - BILL_MARGIN_BYTES;
+        errdefer std.debug.print("{d} rows: shape sum {d}\n", .{ k.rows, got });
+        try testing.expectEqual(k.shapes, got);
+    }
+}
+
+test "dsv41 forward cap: a resident plan's route makes no spill pool, so its wide forward bills the cache pools alone, never past the streamed worst case" {
+    var tiny = try parseText(stq_tiny_config);
+    tiny.rate_groups = 3;
+    var rel_stq = try releaseStqForTest();
+    const Case = struct { c: *Config, rows: u64, shapes: u64 };
+    for ([_]Case{
+        .{ .c = &tiny, .rows = 512, .shapes = 20_267_008 },
+        .{ .c = &tiny, .rows = 8192, .shapes = 282_918_912 },
+        .{ .c = &rel_stq, .rows = 363, .shapes = 433_356_800 },
+        .{ .c = &rel_stq, .rows = 2048, .shapes = 2_327_232_512 },
+        .{ .c = &rel_stq, .rows = 4096, .shapes = 4_653_219_840 },
+        .{ .c = &rel_stq, .rows = 8192, .shapes = 9_298_886_656 },
+    }) |k| {
+        k.c.spill_pools = true;
+        const streamed = k.c.forwardCap(k.rows, k.rows) - BILL_MARGIN_BYTES;
+        k.c.spill_pools = false;
+        const got = k.c.forwardCap(k.rows, k.rows) - BILL_MARGIN_BYTES;
+        errdefer std.debug.print("{d} rows: resident shape sum {d}, streamed {d}\n", .{ k.rows, got, streamed });
+        try testing.expectEqual(k.shapes, got);
+        try testing.expectEqual(wide_bytes.bytesAt(k.c, k.rows, k.rows, k.c.rate_groups), got);
+        try testing.expect(got < streamed);
+    }
+}
+
+test "dsv41 forward cap: each config bills its own wide arms, whichever was priced or loaded before it" {
+    const rows: u64 = 8192;
+    var chain = try parseText(stq_tiny_config);
+    chain.rate_groups = 3;
+    chain.wide_arms = .of(false, true);
+    var fused = chain;
+    fused.wide_arms = .of(true, true);
+    const chain_cap = chain.forwardCap(rows, rows);
+    const fused_cap = fused.forwardCap(rows, rows);
+    errdefer std.debug.print("chain arms {d}, kernel arms {d}\n", .{ chain_cap, fused_cap });
+    // The chains' planes: four f32 `[L,hc,D]` and an f32 `[L,D]` per expand, eight f32 `[L,hc,D]` in the Engram write.
+    try testing.expect(chain_cap > fused_cap);
+    try testing.expectEqual(chain_cap, chain.forwardCap(rows, rows));
+    try testing.expectEqual(fused_cap, fused.forwardCap(rows, rows));
+}
+
+test "dsv41 prefill width: a request starts at 8192 rows on every chip, the router's tile a whole number of times" {
+    for ([_][]const u8{ "Apple M5 Ultra", "Apple M5 Max", "Apple M1 Max", "" }) |chip| {
+        try testing.expectEqual(@as(u32, 8192), prefillWidthFor(chip));
+        try testing.expectEqual(@as(u64, 0), prefillWidthFor(chip) % gate_tile_rows);
+    }
+}
+
+test "dsv41 forward cap: a joined decode forward bills each request's one-row cap, the fixed bytes once" {
     const c = try parseText(release_config);
+    for ([_]u64{ 1, 4096, 1 << 20 }) |seq| try testing.expectEqual(c.forwardCap(1, seq), c.joinedCap(&.{seq}));
+    try testing.expectEqual(c.forwardCap(1, 4096) + c.forwardCap(1, 90_000) - cap_fixed_bytes, c.joinedCap(&.{ 4096, 90_000 }));
+    try testing.expectEqual(3 * c.forwardCap(1, 9_000) - 2 * cap_fixed_bytes, c.joinedCap(&.{ 9_000, 9_000, 9_000 }));
+}
+
+test "dsv41 forward cap: grows with the rows, a decode block's with the context, a chunk's tail merge is priced, and 1M fits" {
+    const c = try releaseStqForTest();
     const m: u64 = 1 << 20;
     try testing.expect(c.forwardCap(2048, 9_000) > c.forwardCap(1024, 9_000));
-    try testing.expect(c.forwardCap(2048, m) > c.forwardCap(2048, 9_000));
     try testing.expect(c.forwardCap(verify_rows, m) > c.forwardCap(1, 9_000));
-    try testing.expect(c.forwardCap(verify_rows, m) * 4 < c.forwardCap(2048, m));
-    try testing.expectEqual(c.forwardCap(2048 + tail_merge_rows, m), c.chunkCap(2048, m));
+    try testing.expect(c.forwardCap(verify_rows, m) * 3 < c.forwardCap(2048, m));
+    // A prompt's widest forward is a chunk with the longest tail it absorbs; one 300 rows past a chunk runs them whole.
+    try testing.expectEqual(c.forwardCap(2048 + 511, m), c.chunkCap(2048, m));
+    try testing.expectEqual(c.forwardCap(2348, 2349), c.chunkCap(2048, 2349));
     // A prompt shorter than the chunk cannot run more rows than it has.
     try testing.expectEqual(c.forwardCap(100, 100), c.chunkCap(2048, 100));
-    // The measured growth beyond the state rows (1094 B a token less 890) is a fraction of the cap's per-token slope.
-    const measured: u64 = (gibs(0.336) - gibs(0.116)) / (225_000 - 9_000) - c.stateBytesPerToken();
+    // A request's row stores are made whole at its last row, so a cap's slope in the context is the decode block's scores
+    // alone, and a prefill-width cap has none.
     const slope = (c.forwardCap(1, m) - c.forwardCap(1, 9_000)) / (m - 9_000);
-    try testing.expect(slope >= measured * 5 / 4);
-    // The extrapolation to 1M context: a decode forward under 1.1 GB, a tail-merged 2048-row chunk under 8.8 GB.
-    try testing.expect(c.forwardCap(verify_rows, m) < 1_100_000_000);
-    try testing.expect(c.chunkCap(2048, m) < 8_800_000_000);
+    try testing.expectEqual(narrow_rows * 4 * score_copies, slope);
+    try testing.expectEqual(c.forwardCap(2048, 9_000), c.forwardCap(2048, m));
+    // The extrapolation to 1M context: a decode forward under 1.05 GB, a tail-merged 2048-row chunk under 7.2 GB.
+    try testing.expect(c.forwardCap(verify_rows, m) < 1_050_000_000);
+    try testing.expect(c.chunkCap(2048, m) < 7_200_000_000);
 }
 
 /// The V4.1-Flash release's `config.json`.
@@ -612,12 +893,55 @@ pub const release_config =
     \\  "max_image_tokens": 1024, "min_pixels": 295936, "max_wh_ratio": null}}
 ;
 
+/// The release as its STQ pack serves it (`DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw`): trellis experts and trunk, and
+/// five rate groups at its widest layer.
+pub fn releaseStqForTest() !Config {
+    var c = try parseText(release_config);
+    const quant =
+        \\{"expert_quant": {"format": "stq", "k": 2.5, "codebook": "pair1", "window": 16, "codebook_table": "pair1-w16-v1", "codebook_digest": "c089b4eb"},
+        \\ "trunk_quant": {"format": "stq", "k": 6, "codebook": "spec1", "window": 15, "codebook_table": "spec1-w15", "codebook_digest": "37f72431"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, quant, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestUnexpectedResult;
+    const blocks = parsed.value.object;
+    c.expert_dec = try stqDecode(blocks.get("expert_quant").?);
+    c.trunk_dec = try stqDecode(blocks.get("trunk_quant").?);
+    c.rate_groups = 5;
+    return c;
+}
+
+/// `DSV41_STQ_TINY`'s config: the release's layout of layers at a tiny width, three rate groups a layer.
+const stq_tiny_config =
+    \\{"model_type": "deepseek_v41", "image_token_id": 129264,
+    \\ "text_config": {"vocab_size": 256, "hidden_size": 256, "moe_intermediate_size": 128, "num_hidden_layers": 8,
+    \\  "num_attention_heads": 2, "num_key_value_heads": 1, "hidden_act": "silu", "head_dim": 128, "qk_rope_head_dim": 16,
+    \\  "q_lora_rank": 128, "o_lora_rank": 128, "o_groups": 2, "swiglu_limit": 1.0, "rms_norm_eps": 1e-20,
+    \\  "max_position_embeddings": 128, "rope_theta": 10000.0,
+    \\  "rope_scaling": {"rope_type": "yarn", "factor": 4, "beta_fast": 32, "beta_slow": 1, "original_max_position_embeddings": 64},
+    \\  "n_routed_experts": 8, "n_shared_experts": 1, "num_experts_per_tok": 3, "scoring_func": "sqrtsoftplus",
+    \\  "topk_method": "noaux_tc", "norm_topk_prob": true, "routed_scaling_factor": 1.5, "sliding_window": 8,
+    \\  "compress_ratios": [0, 0, 2, 2, 2, 1, 1, 1, 0, 0, 0], "compress_rope_theta": 40000.0, "kv_source_layer_ids": [2, 5],
+    \\  "index_source_layer_ids": [2, 5, 7], "index_n_heads": 8, "index_head_dim": 128, "index_topk": 4,
+    \\  "candidate_source_layer_id": 5, "candidate_topk_blocks": 3, "candidate_block_size": 2, "hc_mult": 4,
+    \\  "hc_sinkhorn_iters": 20, "hc_eps": 1e-06, "engram_layer_ids": [1, 2], "engram_max_ngram_size": 4,
+    \\  "engram_vocab_size": 50, "engram_n_heads": 2, "engram_head_dim": 64, "engram_pad_token_id": 2,
+    \\  "engram_compressed_vocab_size": 256, "engram_num_embeddings": [384, 552], "num_nextn_predict_layers": 3,
+    \\  "dspark_block_size": 4, "dspark_noise_token_id": 255, "dspark_target_layer_ids": [5, 6, 7], "dspark_markov_rank": 32,
+    \\  "dspark_n_routed_experts": 4, "dspark_num_experts_per_tok": 2},
+    \\ "expert_quant": {"format": "stq", "k": 4.0, "codebook": "pair1", "window": 16, "codebook_table": "pair1-w16-v1", "codebook_digest": "c089b4eb"},
+    \\ "trunk_quant": {"format": "stq", "k": 6.0, "codebook": "spec1", "window": 15, "codebook_table": "spec1-w15", "codebook_digest": "37f72431"}}
+;
+
 /// Test fixtures elsewhere (the server's bills) parse the release config through it.
 pub fn parseText(json: []const u8) !Config {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
-    return parse(root.get("text_config").?.object, root);
+    var c = try parse(root.get("text_config").?.object, root);
+    // A fixture prices the served kernels' arms on every box; a test of another arm sets its own.
+    c.wide_arms = .kernels;
+    return c;
 }
 
 test "dsv41 config: the V4.1-Flash release parses to its geometry" {

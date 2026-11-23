@@ -97,7 +97,7 @@ fn aneError(what: []const u8, err: []const u8) error{AneShared} {
 fn build(m: *dsv.Model, ane: *const HostAne, n_units: usize) !*AneState {
     const d: u32 = @intCast(m.cfg.dim);
     const ffn: u32 = @intCast(m.layers[0].shared[0].outDim());
-    const chunk = cfg_mod.prefill_width;
+    const chunk = cfg_mod.prefillWidthFor("");
     if (n_units == 0 or n_units > max_units or chunk % (32 * n_units) != 0) return error.AneSharedShape;
     const unit_rows: u32 = @intCast(chunk / n_units);
     const layers = @min(m.ced_split orelse m.cfg.layers, m.cfg.layers);
@@ -107,7 +107,7 @@ fn build(m: *dsv.Model, ane: *const HostAne, n_units: usize) !*AneState {
     defer for (banks) |b| if (b) |x| ane.bank_free(ane.ctx, x);
     for (banks[0..n_units]) |*b| b.* = ane.bank_create(ane.ctx) orelse return error.AneSharedBank;
     for (0..layers) |li| {
-        var sc = Scope.init(m.gpa, m.s);
+        var sc = m.scope();
         defer sc.deinit();
         var arena = std.heap.ArenaAllocator.init(m.gpa);
         defer arena.deinit();
@@ -202,7 +202,7 @@ fn dot(sc: *Scope, a: A, b: A) !f32 {
 }
 
 fn selfCheck(m: *dsv.Model, st: *AneState) !void {
-    var sc = Scope.init(m.gpa, m.s);
+    var sc = m.scope();
     defer sc.deinit();
     var hn = mlx.mlx_array_new();
     const shape = [_]c_int{ ci(st.chunk_rows), ci(m.cfg.dim) };
@@ -210,7 +210,7 @@ fn selfCheck(m: *dsv.Model, st: *AneState) !void {
     try mlx.check(mlx.mlx_array_eval(try pack(&sc, st, h)));
     var worst: struct { layer: usize = 0, cos: f32 = 2 } = .{};
     for (0..st.layers) |li| {
-        var lsc = Scope.init(m.gpa, m.s);
+        var lsc = m.scope();
         defer lsc.deinit();
         const gpu = try lsc.astype(try dsv.sharedExpert(&lsc, m, li, &m.layers[li], h), .float32);
         st.start(li);
@@ -251,7 +251,7 @@ fn moeOnHost(sc: *Scope, m: *const dsv.Model, st: *AneState, li: usize, ly: *con
 }
 
 fn routedSum(sc: *Scope, hk: dsv.Experts.Hook, li: usize, h: A, r: kernels.Routes) !A {
-    const y = try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, .none);
+    const y = try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, r.local, .none);
     try dsv.submit(y);
     return y;
 }

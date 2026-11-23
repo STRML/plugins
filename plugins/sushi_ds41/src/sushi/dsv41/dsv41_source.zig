@@ -6,9 +6,11 @@ const std = @import("std");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const expert_io = @import("../expert_io.zig");
-const log = @import("../log.zig");
 const vision = @import("dsv41_vision.zig");
 const exl3 = @import("sushi_exl3");
+const weights_where = @import("../weights_where.zig");
+const shardNames = weights_where.shardNames;
+const freeShardNames = weights_where.freeShardNames;
 
 pub const Parts = struct {
     /// Routed experts as stacked-at-load banks (a checkpoint small enough to hold them); streamed ones are not read here.
@@ -43,32 +45,6 @@ pub fn keeps(key: []const u8, parts: Parts) bool {
     return true;
 }
 
-/// The checkpoint's weight shards in name order; the caller frees each name and the list.
-fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !std.ArrayList([]const u8) {
-    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
-    defer dir.close(io);
-    var shards: std.ArrayList([]const u8) = .empty;
-    errdefer freeShardNames(allocator, &shards);
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .file and entry.kind != .sym_link) continue;
-        if (!std.mem.startsWith(u8, entry.name, "model") or !std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
-        try shards.append(allocator, try allocator.dupe(u8, entry.name));
-    }
-    std.mem.sort([]const u8, shards.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lt);
-    if (shards.items.len == 0) return error.NoWeightFiles;
-    return shards;
-}
-
-fn freeShardNames(allocator: std.mem.Allocator, shards: *std.ArrayList([]const u8)) void {
-    for (shards.items) |f| allocator.free(f);
-    shards.deinit(allocator);
-}
-
 /// A vision-tower tensor (not a routing bias): what a tower test loads without the trunk.
 pub fn isTowerKey(key: []const u8) bool {
     return isVisionKey(key) and !std.mem.endsWith(u8, key, ".bias_vl");
@@ -88,48 +64,8 @@ pub fn loadTower(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8)
     }.f);
 }
 
-pub fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, ctx: anytype, comptime keep: anytype) !model.Weights {
-    var weights = model.Weights.init(allocator);
-    errdefer weights.deinit();
-    var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
-    defer reader.deinit();
-    var shards = try shardNames(io, allocator, dir_path);
-    defer freeShardNames(allocator, &shards);
-
-    for (shards.items) |name| {
-        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_path, name }, 0);
-        defer allocator.free(path);
-        const fd = try expert_io.openHinted(path, .{ .nocache = true, .readahead_off = false });
-        defer _ = std.c.close(fd);
-        var header = try expert_io.SafetensorsHeader.read(allocator, fd);
-        defer header.deinit();
-        var tensors = header.parsed.value.object.iterator();
-        while (tensors.next()) |entry| {
-            const key = entry.key_ptr.*;
-            if (std.mem.eql(u8, key, "__metadata__") or !keep(key, ctx)) continue;
-            const read = try model.readSafetensorArray(&reader, fd, &header, entry.value_ptr.*);
-            const value = read.array;
-            var value_owned = true;
-            defer if (value_owned) {
-                _ = mlx.mlx_array_free(value);
-            };
-            // A copied import would put the weight back in MLX's allocator, outside the ledger.
-            if (read.bytes.len >= model.import_min_bytes and read.mapped == null) {
-                log.err("[dsv41-mem] {s}: MLX refused the no-copy import of its {d} bytes\n", .{ key, read.bytes.len });
-                return error.OwnedImportCopied;
-            }
-            const owned = try allocator.dupe(u8, key);
-            var key_owned = true;
-            defer if (key_owned) allocator.free(owned);
-            const gop = try weights.map.getOrPut(owned);
-            if (gop.found_existing) return error.DuplicateTensor;
-            gop.value_ptr.* = value;
-            value_owned = false;
-            key_owned = false;
-        }
-    }
-    log.info("[dsv41] loaded {d} resident tensors from {d} shards\n", .{ weights.count(), shards.items.len });
-    return weights;
+fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, ctx: anytype, comptime keep: anytype) !model.Weights {
+    return weights_where.loadWhere("dsv41", io, allocator, dir_path, ctx, keep);
 }
 
 /// The pack's routed trellis tensors against the `order` its config names, before any weight loads: each is stored
@@ -169,16 +105,17 @@ pub fn validateTileOrder(io: std.Io, allocator: std.mem.Allocator, dir_path: []c
 }
 
 /// Bytes the resident load holds once built: the stored tensors, the head widened to f32, and each
-/// fp8 weight's 32x32 scale grid spread over its rows.
-pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !u64 {
-    return sumBytes(io, allocator, dir_path, .trunk, false);
+/// fp8 weight's 32x32 scale grid spread over its rows. `engine` is whether the engine of our own holds the weights,
+/// which maps every one (`model.importFloor`).
+pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, engine: bool) !u64 {
+    return sumBytes(io, allocator, dir_path, .trunk, false, engine);
 }
 
 /// Bytes the vision tower adds once loaded: its block and aligner matrices as the affine 8-bit codes they are
 /// requantized to (`dsv41_vision.Dsv41Vision.init`), the rest as stored, bf16.
 /// `keep_bf16` (`--vision-bf16`) bills every matrix as stored.
-pub fn visionBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, keep_bf16: bool) !u64 {
-    return sumBytes(io, allocator, dir_path, .vision, keep_bf16);
+pub fn visionBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, keep_bf16: bool, engine: bool) !u64 {
+    return sumBytes(io, allocator, dir_path, .vision, keep_bf16, engine);
 }
 
 /// Does the checkpoint ship the DSpark stages? Its weight index names `mtp.0.main_proj` (stored, or a trellis bank).
@@ -191,18 +128,37 @@ pub fn shipsDspark(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u
 }
 
 /// Bytes the DSpark stages add once built: their tensors and experts, with the Markov head widened to f32.
-pub fn dsparkBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !u64 {
-    return sumBytes(io, allocator, dir_path, .stages, false);
+pub fn dsparkBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, engine: bool) !u64 {
+    return sumBytes(io, allocator, dir_path, .stages, false, engine);
 }
 
 const Section = enum { trunk, stages, vision };
 
 /// `keeps`' bytes as built, over the trunk, only the DSpark stages, or only the vision tower.
-fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, section: Section, keep_bf16: bool) !u64 {
+fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, section: Section, keep_bf16: bool, engine: bool) !u64 {
     var shards = try shardNames(io, allocator, dir_path);
     defer freeShardNames(allocator, &shards);
+    const floor = model.importFloor(engine);
+    // A pooling compressor (one with a gate) holds its weights in f32.
+    var pooled: std.ArrayList(u8) = .empty;
+    defer pooled.deinit(allocator);
+    for (shards.items) |name| {
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_path, name }, 0);
+        defer allocator.free(path);
+        const fd = try expert_io.openHinted(path, .{ .nocache = true, .readahead_off = false });
+        defer _ = std.c.close(fd);
+        var header = try expert_io.SafetensorsHeader.read(allocator, fd);
+        defer header.deinit();
+        var tensors = header.parsed.value.object.iterator();
+        while (tensors.next()) |entry| if (std.mem.endsWith(u8, entry.key_ptr.*, ".attn.compressor.wgate.weight")) {
+            const k = entry.key_ptr.*;
+            try pooled.appendSlice(allocator, k[0 .. k.len - "wgate.weight".len]);
+            try pooled.append(allocator, 0);
+        };
+    }
     var total: u64 = 0;
     var ragged: [ragged_slots]u64 = @splat(0);
+    var banks: [bank_slots]u64 = @splat(0);
     for (shards.items) |name| {
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_path, name }, 0);
         defer allocator.free(path);
@@ -218,19 +174,30 @@ fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, sect
             if (mine != section) continue;
             const offs = (entry.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader).array.items;
             if (offs.len != 2 or offs[0] != .integer or offs[1] != .integer) return error.InvalidSafetensorsHeader;
-            const bytes: u64 = @intCast(offs[1].integer - offs[0].integer);
+            const stored: u64 = @intCast(offs[1].integer - offs[0].integer);
+            const bytes = stored *| f32From(key, entry.value_ptr.object, pooled.items);
             if (section == .vision and !keep_bf16) if (requantizedShape(key, entry.value_ptr.object)) |shape| {
-                total +|= vision.quantizedBytes(shape[0], shape[1]);
+                total +|= vision.quantizedHeldBytes(shape[0], shape[1], engine);
                 continue;
             };
             if (raggedSlot(key)) |slot| {
                 ragged[slot] +|= bytes;
                 continue;
             }
-            total +|= builtBytes(key, bytes);
+            if (bankSlot(key)) |slot| {
+                banks[slot] +|= bytes;
+                continue;
+            }
+            // Engram's q.k product is an op's result, never a region.
+            if (std.mem.endsWith(u8, key, ".engram.q_weight")) {
+                total +|= bytes;
+                continue;
+            }
+            total +|= builtBytes(key, bytes, floor);
         }
     }
     for (ragged) |b| total +|= if (b > 0) expert_io.pageRoundUp(b) else 0;
+    for (banks) |b| total +|= if (b < floor) b else expert_io.pageRoundUp(b);
     return total;
 }
 
@@ -240,19 +207,52 @@ fn requantizedShape(key: []const u8, entry: std.json.ObjectMap) ?[2]u64 {
     return if (vision.quantizesAtLoad(key, m.bf16, &m.dims)) m.dims else null;
 }
 
-/// Bytes a stored tensor holds once built. From `import_min_bytes` it lives in its own page-rounded mapping, built
-/// there or read into it; a block scale and a stacked expert are rebuilt in MLX's allocator.
-fn builtBytes(key: []const u8, stored: u64) u64 {
-    const w = widening(key);
-    const built = stored *| w;
-    if (w == 32 or std.mem.indexOf(u8, key, ".ffn.experts.") != null or built < model.import_min_bytes) return built;
+/// Bytes a stored tensor holds once built. From the load's `floor` it lives in its own page-rounded mapping, built
+/// there or read into it; an expert is part of a bank (`bankSlot`).
+fn builtBytes(key: []const u8, stored: u64, floor: u64) u64 {
+    const built = stored *| widening(key);
+    if (std.mem.indexOf(u8, key, ".ffn.experts.") != null or built < floor) return built;
     return expert_io.pageRoundUp(built);
 }
 
+/// How many times a stored tensor's bytes the load's f32 copy takes: a pooling compressor's weights (a prefix in
+/// `pooled`, each 0-terminated) and Engram's q.k product (q stands for it; k is dropped once it is made) are held in
+/// f32. 1 for every other tensor, or one stored in f32 or fp8.
+fn f32From(key: []const u8, entry: std.json.ObjectMap, pooled: []const u8) u64 {
+    const dt = entry.get("dtype") orelse return 1;
+    if (dt != .string) return 1;
+    const two = std.mem.eql(u8, dt.string, "BF16") or std.mem.eql(u8, dt.string, "F16");
+    if (std.mem.endsWith(u8, key, ".engram.k_weight")) return 0;
+    if (std.mem.endsWith(u8, key, ".engram.q_weight")) return if (two) 2 else 1;
+    if (!two or !std.mem.endsWith(u8, key, ".weight") or std.mem.indexOf(u8, key, ".attn.compressor.w") == null) return 1;
+    var it = std.mem.splitScalar(u8, pooled, 0);
+    while (it.next()) |p| if (p.len > 0 and std.mem.startsWith(u8, key, p)) return 2;
+    return 1;
+}
+
 const ragged_slots = 16 * 9;
+const bank_slots = 16 * 6;
+
+/// A DSpark stage's mxfp4 expert tensor `mtp.<s>.ffn.experts.<e>.<w1|w2|w3>.<weight|scale>` as the bank of its (stage,
+/// projection, part), which `dsv41_model.loadBank` stacks over every expert into one owned region; null for any other.
+fn bankSlot(key: []const u8) ?usize {
+    const head = "mtp.";
+    if (!std.mem.startsWith(u8, key, head)) return null;
+    const dot = std.mem.indexOfScalarPos(u8, key, head.len, '.') orelse return null;
+    const stage = std.fmt.parseInt(usize, key[head.len..dot], 10) catch return null;
+    const mid = ".ffn.experts.";
+    if (stage >= 16 or !std.mem.startsWith(u8, key[dot..], mid)) return null;
+    const rest = key[dot + mid.len ..];
+    const at = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    _ = std.fmt.parseInt(usize, rest[0..at], 10) catch return null;
+    const tail = rest[at + 1 ..];
+    const proj: usize = if (std.mem.startsWith(u8, tail, "w1.")) 0 else if (std.mem.startsWith(u8, tail, "w3.")) 1 else if (std.mem.startsWith(u8, tail, "w2.")) 2 else return null;
+    const part: usize = if (std.mem.eql(u8, tail[3..], "weight")) 0 else if (std.mem.eql(u8, tail[3..], "scale")) 1 else return null;
+    return stage * 6 + proj * 2 + part;
+}
 
 /// A DSpark stage's trellis expert tensor `mtp.<s>.mlp.switch_mlp.<proj>_proj[.gN].<part>` as the one owned region
-/// its (stage, projection, part) is built into (`dsv41_owned.raggedOwned`), or null for any other key.
+/// its (stage, projection, part) is built into (`owned_weights.raggedOwned`), or null for any other key.
 fn raggedSlot(key: []const u8) ?usize {
     const head = "mtp.";
     if (!std.mem.startsWith(u8, key, head)) return null;
@@ -268,14 +268,13 @@ fn raggedSlot(key: []const u8) ?usize {
 }
 
 /// How many times the built tensor is as large as the stored one: an fp8 weight's block scale is repeated down its
-/// 32 rows, and the bf16 tensors the forward holds in f32 (the heads, the confidence head) double; an
-/// expert's per-row scales are stored as built.
+/// 32 rows, and the bf16 tensors the forward holds in f32 (the head, the confidence head) double; an
+/// expert's per-row scales and the Markov head are held as stored.
 fn widening(key: []const u8) u64 {
     if (std.mem.indexOf(u8, key, ".ffn.experts.") != null) return 1;
     if (std.mem.endsWith(u8, key, ".scale")) return 32;
     if (std.mem.eql(u8, key, "head.weight")) return 2;
-    for ([_][]const u8{ ".markov_head.head.weight", ".confidence_head.proj.weight" }) |tail|
-        if (std.mem.endsWith(u8, key, tail)) return 2;
+    if (std.mem.endsWith(u8, key, ".confidence_head.proj.weight")) return 2;
     return 1;
 }
 
@@ -363,7 +362,7 @@ fn writeShard(dir: std.Io.Dir, name: []const u8, tensors: []const struct { []con
     try dir.writeFile(testing.io, .{ .sub_path = name, .data = file });
 }
 
-test "dsv41 source: the tower's bytes are the vision section, the trunk's exclude them (the ssd budget's vision term)" {
+test "dsv41 source: the tower bytes are the vision section, the trunk bytes exclude them (the ssd budget's vision term)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeShard(tmp.dir, "model-globals.safetensors", &.{
@@ -373,9 +372,9 @@ test "dsv41 source: the tower's bytes are the vision section, the trunk's exclud
     });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
-    try testing.expectEqual(@as(u64, 40 + 300 + 500 + 20), try visionBytes(testing.io, testing.allocator, root, false));
-    try testing.expectEqual(@as(u64, 1040), try residentBytes(testing.io, testing.allocator, root));
-    try testing.expectEqual(@as(u64, 7000), try dsparkBytes(testing.io, testing.allocator, root));
+    try testing.expectEqual(@as(u64, 40 + 300 + 500 + 20), try visionBytes(testing.io, testing.allocator, root, false, false));
+    try testing.expectEqual(@as(u64, 1040), try residentBytes(testing.io, testing.allocator, root, false));
+    try testing.expectEqual(@as(u64, 7000), try dsparkBytes(testing.io, testing.allocator, root, false));
     var tower = try loadTower(testing.io, testing.allocator, root);
     defer tower.deinit();
     try testing.expectEqual(@as(usize, 3), tower.count());
@@ -405,7 +404,7 @@ test "dsv41 source: the tower's bill counts the matrices the load requantizes as
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
     // Only the bf16 wqkv matrix of whole groups is requantized; its bias, an f32 matrix and the 588-wide patch embedding stay as stored.
     const expect = vision.quantizedBytes(384, 256) + 768 + 65536 + 301056;
-    try testing.expectEqual(expect, try visionBytes(testing.io, testing.allocator, root, false));
+    try testing.expectEqual(expect, try visionBytes(testing.io, testing.allocator, root, false, false));
 }
 
 test "dsv41 source: --vision-bf16 bills the tower's matrices as stored" {
@@ -420,8 +419,8 @@ test "dsv41 source: --vision-bf16 bills the tower's matrices as stored" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "model-a.safetensors", .data = &file });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
-    try testing.expectEqual(vision.quantizedBytes(384, 256), try visionBytes(testing.io, testing.allocator, root, false));
-    try testing.expectEqual(@as(u64, 196608), try visionBytes(testing.io, testing.allocator, root, true));
+    try testing.expectEqual(vision.quantizedBytes(384, 256), try visionBytes(testing.io, testing.allocator, root, false, false));
+    try testing.expectEqual(@as(u64, 196608), try visionBytes(testing.io, testing.allocator, root, true, false));
 }
 
 test "dsv41 source: a tensor from 1 MiB is billed page-rounded, a DSpark stage's trellis tensors as one region each" {
@@ -440,11 +439,29 @@ test "dsv41 source: a tensor from 1 MiB is billed page-rounded, a DSpark stage's
     });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
-    // The scale grid is rebuilt by MLX at 32x, unrounded; the gate is held as stored.
-    const trunk = expert_io.pageRoundUp(mib + 100) + 4000 + 600_000 + (2 * mib + 1) * 32;
-    try testing.expectEqual(trunk, try residentBytes(testing.io, testing.allocator, root));
+    // The scale grid is repeated 32x into a region of its own; the gate is held as stored.
+    const trunk = expert_io.pageRoundUp(mib + 100) + 4000 + 600_000 + expert_io.pageRoundUp((2 * mib + 1) * 32);
+    try testing.expectEqual(trunk, try residentBytes(testing.io, testing.allocator, root, false));
     // The two groups' trellis bytes are one region, their scales another.
-    try testing.expectEqual(expert_io.pageRoundUp(3 * mib + 100) + expert_io.pageRoundUp(100), try dsparkBytes(testing.io, testing.allocator, root));
+    try testing.expectEqual(expert_io.pageRoundUp(3 * mib + 100) + expert_io.pageRoundUp(100), try dsparkBytes(testing.io, testing.allocator, root, false));
+}
+
+test "dsv41 source: a DSpark stage's mxfp4 bank (one projection's codes or scales over every expert) is billed as the one region it is built in" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeShard(tmp.dir, "model-a.safetensors", &.{
+        .{ "mtp.0.ffn.experts.0.w1.weight", 600_000 },
+        .{ "mtp.0.ffn.experts.1.w1.weight", 600_000 },
+        .{ "mtp.0.ffn.experts.0.w1.scale", 1000 },
+        .{ "mtp.0.ffn.experts.1.w1.scale", 1000 },
+        .{ "mtp.0.ffn.experts.0.w2.weight", 600_000 },
+        .{ "mtp.1.ffn.experts.0.w1.weight", 600_000 },
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    // From 1 MiB a bank is an owned region; under it, MLX's stack of the stored bytes.
+    const want = expert_io.pageRoundUp(1_200_000) + 2000 + 600_000 + 600_000;
+    try testing.expectEqual(want, try dsparkBytes(testing.io, testing.allocator, root, false));
 }
 
 test "dsv41 source: an affine embedding is loaded and billed with the trunk" {
@@ -459,7 +476,7 @@ test "dsv41 source: an affine embedding is loaded and billed with the trunk" {
     });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
-    try testing.expectEqual(expert_io.pageRoundUp(2 * mib) + 1000 + 1000 + 4000, try residentBytes(testing.io, testing.allocator, root));
+    try testing.expectEqual(expert_io.pageRoundUp(2 * mib) + 1000 + 1000 + 4000, try residentBytes(testing.io, testing.allocator, root, false));
     var w = try loadResident(testing.io, testing.allocator, root, .{});
     defer w.deinit();
     for ([_][]const u8{ "embed.weight", "embed.scales", "embed.biases", "norm.weight" }) |k| try testing.expect(w.get(k) != null);
@@ -475,8 +492,8 @@ test "dsv41 source: a router weight is billed at its stored size, in the trunk a
     });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
-    try testing.expectEqual(expert_io.pageRoundUp(gate), try residentBytes(testing.io, testing.allocator, root));
-    try testing.expectEqual(expert_io.pageRoundUp(gate), try dsparkBytes(testing.io, testing.allocator, root));
+    try testing.expectEqual(expert_io.pageRoundUp(gate), try residentBytes(testing.io, testing.allocator, root, false));
+    try testing.expectEqual(expert_io.pageRoundUp(gate), try dsparkBytes(testing.io, testing.allocator, root, false));
 }
 
 test "dsv41 source: a repack's zero pad tensors are never kept, loaded or billed" {
@@ -488,8 +505,8 @@ test "dsv41 source: a repack's zero pad tensors are never kept, loaded or billed
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
     for ([_]Parts{ .{}, .{ .dspark = true }, .{ .experts = true }, .{ .vision = true } }) |p| try testing.expect(!keeps("__pad__.model-00001-of-00002.0", p));
-    try testing.expectEqual(@as(u64, 1000), try residentBytes(testing.io, testing.allocator, root));
-    try testing.expectEqual(@as(u64, 7000), try dsparkBytes(testing.io, testing.allocator, root));
+    try testing.expectEqual(@as(u64, 1000), try residentBytes(testing.io, testing.allocator, root, false));
+    try testing.expectEqual(@as(u64, 7000), try dsparkBytes(testing.io, testing.allocator, root, false));
     var all = try loadResident(testing.io, testing.allocator, root, .{ .dspark = true, .vision = true });
     defer all.deinit();
     try testing.expectEqual(@as(usize, 2), all.count());

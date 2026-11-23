@@ -6,6 +6,7 @@
 //! The confidence calibration and the row choice follow mlx-serve's `dflash_policy.zig`
 //! (https://github.com/ddalcu/mlx-serve, MIT); the cost ladder is Qwen3.8-Flash-Next's.
 const std = @import("std");
+const round_cost = @import("round_cost.zig");
 
 /// t1 plus the drafts of the widest block a drafter serves.
 pub const MAX_ROWS: u32 = 16;
@@ -86,20 +87,6 @@ pub fn linearLadder(first: f32, step: f32) Costs {
     for (1..MAX_ROWS + 1) |r| out[r] = first + step * @as(f32, @floatFromInt(r - 1));
     return out;
 }
-
-/// GLM-5.3-Flash-Sushi-2.4bpw on an M5 Max, ms of a round by verify rows: the verify of one chain, the mean of 1K and
-/// 8K history (33-35, 38-41, 45-48, 54-59, 61-68, 76-86, 79-91 ms at 2..8 rows), plus about 7.4 ms of draft, replay
-/// and commit; one row is the plain tick, 30 ms. Past eight rows the cost grows 13 ms a row.
-pub fn glmLadder() Costs {
-    var out: Costs = undefined;
-    const ms = [_]f32{ 0, 30, 41.3, 46.9, 53.6, 63.6, 72.0, 88.1, 92.6 };
-    for (0..MAX_ROWS + 1) |r| out[r] = if (r < ms.len) ms[r] else ms[ms.len - 1] + 13 * @as(f32, @floatFromInt(r - ms.len + 1));
-    return out;
-}
-
-/// The widest tree a round drafts unless the flags ask otherwise; the ladder and the calibrated confidences decide
-/// how much of it a round uses.
-pub const GLM_USEFUL_ROWS: u32 = 8;
 
 /// Rows for a tree of drafts in the order taken (`parents[k]` is a draft index before k, or -1 under t1; `conf[k]`
 /// the drafter's probability of draft k among its siblings): a draft adds the probability that the accepted path
@@ -191,6 +178,66 @@ pub fn pickRows(calib: *const Calibration, conf: []const f32, min: u32, max: u32
 }
 
 const testing = std.testing;
+
+// DFlash has different economics from sequential-token drafters: one
+// assistant call proposes the whole block and the M5 NAX verify lane makes
+// wide blocks cheap. Per-draft percentage therefore penalizes block 16
+// even when it is decisively profitable. The stable cross-width signal is
+// accepted drafts per verify round. M5 sweeps put code/tool traffic at
+// 4.4-15.0 accepted/round and the regressing prose/vision class at
+// 1.0-1.5; two is the measured break-even boundary. M4 block-5 model-card
+// workloads accepting 62-86% remain above it as well.
+// Warmup 8, not 3 (2026-09-03): three rounds tripped on ONE dry opening
+// (llmprobe's 16k rung: 0/3, drafter off for the whole request at 25
+// tok/s; the same prompt restored from cache decoded at 73).
+pub const DFLASH_GATE_WARMUP: u64 = 8;
+/// A DFlash round that costs more per emitted token than this multiple of a serial step is dropped.
+pub const DFLASH_GATE_MARGIN: f32 = 0.05;
+
+/// Accepted drafts per round at which a round of `rows` verifier rows costs one serial step per
+/// token, used while the request's context bucket holds no serial sample. The policy's own cost ladder.
+pub fn dflashBreakEvenAccepted(rows: f32) f32 {
+    return breakEvenDrafts(rows);
+}
+
+/// Does the request's DFlash yield lose to serial decoding? With a measured serial price (the
+/// round-cost table's cell) the test is ms per emitted token; without one it is the ladder's
+/// break-even yield. Never decided before the warmup rounds.
+pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, wall_ms: f64, rows: f32, serial_ms_tok: ?f32) bool {
+    if (attempted < DFLASH_GATE_WARMUP) return false;
+    if (serial_ms_tok) |serial| {
+        if (std.math.isFinite(serial) and serial > 0) {
+            const emitted: f64 = @floatFromInt(attempted + accepted);
+            return wall_ms / emitted > @as(f64, serial) * (1.0 + DFLASH_GATE_MARGIN);
+        }
+    }
+    const avg = @as(f32, @floatFromInt(accepted)) / @as(f32, @floatFromInt(attempted));
+    return avg < dflashBreakEvenAccepted(rows);
+}
+
+/// The rounds the gate judges: those after the warmup. The warmup's own wall carries one-time costs (graph builds,
+/// first touches of a long context) that would decide a request the steady rounds win.
+pub const DflashGateWindow = struct {
+    open: bool = false,
+    attempted: u64 = 0,
+    accepted: u64 = 0,
+    wall_ms: f64 = 0,
+
+    pub fn shouldDisable(self: *DflashGateWindow, attempted: u64, accepted: u64, wall_ms: f64, rows: f32, serial_ms_tok: ?f32) bool {
+        if (attempted < DFLASH_GATE_WARMUP) return false;
+        if (!self.open) {
+            self.* = .{ .open = true, .attempted = attempted, .accepted = accepted, .wall_ms = wall_ms };
+            return false;
+        }
+        return dflashGateShouldDisable(attempted - self.attempted, accepted - self.accepted, wall_ms - self.wall_ms, rows, serial_ms_tok);
+    }
+};
+
+/// The serial price a DFlash request is held to: the plain-tick cell at width 0, which this
+/// path's own fallback ticks feed, else the serial row MTP's adaptive serial feeds.
+pub fn dflashSerialPrice(t: *const round_cost.Table, bucket: usize) ?f32 {
+    return t.msPerTok(0, bucket) orelse t.serialMsPerTok(bucket);
+}
 
 test "ladder: priced from the measured forward and the fixed round cost, never cheaper for more rows" {
     const c = ladder();
@@ -309,21 +356,4 @@ test "Calibration.observeTree: only drafts whose parent was accepted are reached
     try testing.expect(c.probability(0.5) < prior_miss);
     try testing.expectEqual(@as(f32, 0), c.seen[Calibration.bin(0.2)]);
     try testing.expect(c.probability(0.99) < Calibration.prior(0.99));
-}
-
-test "glmLadder: certain drafts take four rows or more, weak ones two, and the cost never falls" {
-    const costs = glmLadder();
-    var r: u32 = 2;
-    while (r <= MAX_ROWS) : (r += 1) try testing.expect(costs[r] > costs[r - 1]);
-    var calib = Calibration{};
-    var guess: f32 = 0;
-    while (guess < 1) : (guess += 0.01) for (0..40) |_| calib.observe(guess, true);
-    const sure_parents = [_]i32{ -1, 0, 1, 2, 3, 4, 5 };
-    const sure_conf: [7]f32 = @splat(0.99);
-    try testing.expect(pickTreeRows(&calib, &sure_parents, &sure_conf, 2, 8, &costs) >= 4);
-    const fresh = Calibration{};
-    try testing.expectEqual(@as(u32, 2), pickTreeRows(&fresh, &.{ -1, 0, 1 }, &[_]f32{ 0.5, 0.4, 0.3 }, 2, 8, &costs));
-    // Two rows cost nearly what three do, so a middling draft pair still takes the third row.
-    try testing.expectEqual(@as(u32, 3), pickTreeRows(&fresh, &.{ -1, 0 }, &[_]f32{ 0.85, 0.8 }, 2, 8, &costs));
-    try testing.expectEqual(@as(u32, 3), pickTreeRows(&calib, &sure_parents, &sure_conf, 3, 3, &costs));
 }

@@ -46,7 +46,7 @@ test "sushi_ds41 gpu: indexScoresNax gives indexScoresTile's scores, and a slice
         .{ .L = 5, .p0 = 3000, .ratio = 4, .nb = 751 },
     };
     for (cases, 0..) |c, ci_| {
-        var sc = Scope.init(testing.allocator, mlx.gpuStream());
+        var sc = Scope.plain(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
         const seed: u64 = 0x1dd0 + ci_ * 8;
         const q = try sc.astype(try randn(&sc, &.{ ci(c.L), IH, IHD }, seed, c.dt), .float32);
