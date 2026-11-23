@@ -2097,6 +2097,15 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
     var idx: A = undefined;
     // The scan's top-k launch gives the picks already masked to each query's groups.
     var below = none;
+    if (Ls > NARROW_ROWS and nb > 0 and m.fused and m.index_nax and m.trace == null and (rows.pack == null or (rows.pack.?.mode == .fp4_ue8m0 and rows.pack.?.group == 32))) {
+        const ks: index_nax.KeySource = if (rows.pack != null)
+            .{ .fp4 = .{ .codes = try sc.slice(rows.buf.array, 0, 0, nb), .scales = try sc.slice(rows.sbuf.array, 0, 0, nb), .dt = rows.dtype } }
+        else
+            .{ .plain = try sc.slice(rows.buf.array, 0, 0, nb) };
+        if (try index_nax.indexerOnlineTopk(sc, c, m.fused, m.trace != null, m.index_stream_tile, li, ks, wts, q, wscale, p0, r, cand)) |picks| {
+            return picks;
+        }
+    }
     if (streamsIndex(sc, m, Ls, nb)) {
         _ = index_streams.fetchAdd(1, .monotonic);
         const kb = if (is_source and (nb + bs - 1) / bs > c.cand_blocks) c.cand_blocks else 0;
@@ -3755,6 +3764,9 @@ pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
     if (!m.onEngine()) {
         for ([_]usize{ 1, 6 }) |w| try warmRun(try extend(m, ids[0..w], .last));
         if (m.dspark != null) try warmRound(m, ids[0], m.cfg.dspark.block + 1);
+    }
+    if (m.fused and m.index_nax and m.cfg.index_sources != 0 and scope == .all) {
+        try index_nax.warmOnlineTopk(m.gpa, m.s, &m.cfg, m.act, m.qat_on and m.pack_kv);
     }
     // The engine's kernels have one signature each, so the widths it ran above are not other pipelines here.
     if (m.onEngine() and scope == .all) {
