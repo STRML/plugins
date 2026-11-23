@@ -19,6 +19,7 @@ test {
     _ = @import("vision_key.zig");
     _ = @import("prefill_pipe_test.zig");
     _ = @import("ablation_test.zig");
+    _ = @import("cold_lead_test.zig");
 }
 
 fn randn(sc: *Scope, shape: []const c_int, seed: u64, dt: mlx.mlx_dtype) !A {

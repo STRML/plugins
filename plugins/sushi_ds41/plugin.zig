@@ -31,6 +31,7 @@ const copy_lookup = @import("src/copy_lookup.zig");
 const ablation = @import("src/ablation.zig");
 const ane_shared = @import("src/ane_shared.zig");
 const tap_files = @import("src/tap.zig");
+const cold_lead = @import("src/cold_lead.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.2.0";
@@ -449,19 +450,28 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
     var rows = media;
     const prefill_width: usize = sc.prefillWidthFor("");
     const prefix = if (want == .last and ids.len > 1) ids.len - 1 else 0;
-    var at: usize = 0;
-    while (at < prefix) {
-        var end = @min(at + prefill_width, prefix);
-        if (end < prefix and prefix - end < prefill_plan.TAIL_MERGE_MAX) end = prefix;
-        const next = if (end < prefix) @min(end + prefill_width, prefix) else ids.len;
-        // Another chunk of the prefix follows and is wider than the window (the merge keeps tails of `tail_merge_rows`
-        // rows), so its CED tail overwrites this chunk's decoder rows before anything reads them: run this one without
-        // its decoder (`extendState`, which refuses a chunk of `window` rows or fewer; sushi's `tailUnread`).
-        if (tapping) m.mdl.stream_tap.?.on = end == prefix;
-        if (end < prefix and end - at > m.mdl.cfg.window and prefix - end > m.mdl.cfg.window and m.mdl.ced_split != null) try stateRows(m, ids[at..end], ids[end..next], rows) else _ = mlx.mlx_array_free(try forwardRows(m, ids[at..end], .last, ids[end..next], rows));
-        if (rows) |*r| r.offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
-        at = end;
-        if (progress) |p| @atomicStore(u64, p, at, .monotonic);
+    const state_n: usize = if (m.mdl.dec_state) |*st| st.n else 0;
+    var chunks: cold_lead.Iter = .{
+        .prefix = prefix,
+        .total_len = ids.len,
+        .state_n = state_n,
+        .window = m.mdl.cfg.window,
+        .has_ced_split = m.mdl.ced_split != null,
+        .has_engrams = m.mdl.engrams.len > 0,
+        .has_ahead = m.mdl.engram_ahead != null,
+        .plan = .{ .chunk_width = prefill_width },
+    };
+    while (chunks.next()) |step| {
+        // On a cold prompt chunk 0 splits into an encoder-only lead (`stateRows`) with the rest of chunk 0 passed as
+        // `ahead`, and any later chunk whose CED tail a wider successor overwrites also skips its decoder (`extendState`).
+        if (tapping) m.mdl.stream_tap.?.on = step.tap_on;
+        if (step.state_only) {
+            try stateRows(m, ids[step.at..step.end], ids[step.end..step.next], rows);
+        } else {
+            _ = mlx.mlx_array_free(try forwardRows(m, ids[step.at..step.end], .last, ids[step.end..step.next], rows));
+        }
+        if (rows) |*r| r.offset += std.mem.count(u32, ids[step.at..step.end], &.{m.cfg.image_token_id});
+        if (progress) |p| @atomicStore(u64, p, step.end, .monotonic);
     }
     // Pipelined state-only layers finish before the restore point reads the state (no-op when nothing is in flight).
     // Progress above counts rows submitted; this is where they are done.
@@ -538,6 +548,7 @@ test {
     _ = @import("src/all_resident_test.zig");
     _ = ablation;
     _ = tap_files;
+    _ = cold_lead;
 }
 
 test "sushi_ds41 prefill pipeline: SUSHI_DS41_PREFILL_PIPELINE parses to layers in flight, only 0 is off, junk keeps the default, capped" {
