@@ -87,8 +87,8 @@ test "sushi_ds41 gpu: extendCold schedule drives Engram ahead prefetch + GPU deq
     defer table.close();
     const tables = [_]*const engram.Table{&table};
 
-    // Multi-chunk prompt (16500 prefix + 1 last token = 16501) -> 4 steps, all <= 8192.
-    const ids = try testing.allocator.alloc(u32, 16501);
+    // Single-chunk cold prompt (8192 prefix + 1 last token = 8193) -> 2 steps (4096 lead + 4096 rest), all <= 8192.
+    const ids = try testing.allocator.alloc(u32, 8193);
     defer testing.allocator.free(ids);
     for (ids, 0..) |*t, i| t.* = @intCast((i * 13 + 3) % 97);
 
@@ -115,7 +115,7 @@ test "sushi_ds41 gpu: extendCold schedule drives Engram ahead prefetch + GPU deq
         const cur_rows = all_row_ids[step.at * nc .. step.end * nc];
         const got_bytes = blk: {
             if (ahead_pf) |pf| {
-                // Every chunk after the cold lead (including the rest of chunk 0 and tail-merged chunk 1) must hit!
+                // Rest of chunk 0 must hit the lead sub-chunk's ahead prefetch!
                 try testing.expect(pf.matches(step.at, cur_rows));
                 const raw = try pf.take(step.at, 0, 0);
                 defer raw.deinit(testing.allocator);
@@ -139,8 +139,8 @@ test "sushi_ds41 gpu: extendCold schedule drives Engram ahead prefetch + GPU deq
         defer testing.allocator.free(ahead_rows);
         ahead_pf = try engram.Prefetch.start(testing.allocator, &tables, &.{.{ .at = step.end, .len = ahead_len, .ids = ahead_rows }}, nc, ahead_len);
     }
-    try testing.expectEqual(@as(usize, 4), step_idx);
-    // Final token (16500..16501) also adopts ahead_pf from the last prefix chunk.
+    try testing.expectEqual(@as(usize, 2), step_idx);
+    // Final token (8192..8193) also adopts ahead_pf from the rest of chunk 0.
     try testing.expect(ahead_pf != null);
     const last_rows = all_row_ids[(ids.len - 1) * nc .. ids.len * nc];
     try testing.expect(ahead_pf.?.matches(ids.len - 1, last_rows));
@@ -152,16 +152,20 @@ test "sushi_ds41 gpu: extendCold schedule drives Engram ahead prefetch + GPU deq
     defer testing.allocator.free(want_last);
     try testing.expectEqualSlices(u8, want_last, got_last);
 
-    // Non-trigger cases must never emit cold_lead and must keep chunks <= 8192 (except existing tail merge).
+    // Non-trigger cases must never emit cold_lead and must keep every chunk <= 8192.
     for ([_]cold_lead.Iter{
-        .{ .prefix = 4095, .total_len = 4096, .state_n = 0, .window = 128, .has_ced_split = true, .has_engrams = true, .has_ahead = false },
+        .{ .prefix = 2047, .total_len = 2048, .state_n = 0, .window = 128, .has_ced_split = true, .has_engrams = true, .has_ahead = false },
         .{ .prefix = 8192, .total_len = 8193, .state_n = 16384, .window = 128, .has_ced_split = true, .has_engrams = true, .has_ahead = false },
-        .{ .prefix = 32768, .total_len = 32769, .state_n = 0, .window = 128, .has_ced_split = true, .has_engrams = true, .has_ahead = true },
-        .{ .prefix = 32768, .total_len = 32769, .state_n = 0, .window = 128, .has_ced_split = false, .has_engrams = true, .has_ahead = false },
-        .{ .prefix = 32768, .total_len = 32769, .state_n = 0, .window = 128, .has_ced_split = true, .has_engrams = false, .has_ahead = false },
+        .{ .prefix = 32768, .total_len = 32769, .state_n = 0, .window = 128, .has_ced_split = true, .has_engrams = true, .has_ahead = false },
+        .{ .prefix = 8192, .total_len = 8193, .state_n = 0, .window = 128, .has_ced_split = true, .has_engrams = true, .has_ahead = true },
+        .{ .prefix = 8192, .total_len = 8193, .state_n = 0, .window = 128, .has_ced_split = false, .has_engrams = true, .has_ahead = false },
+        .{ .prefix = 8192, .total_len = 8193, .state_n = 0, .window = 128, .has_ced_split = true, .has_engrams = false, .has_ahead = false },
     }) |case_iter| {
         var ci_ = case_iter;
-        while (ci_.next()) |st| try testing.expect(!st.cold_lead);
+        while (ci_.next()) |st| {
+            try testing.expect(!st.cold_lead);
+            try testing.expect(st.end - st.at <= cold_lead.MAX_CHUNK_ROWS);
+        }
     }
 }
 
@@ -261,7 +265,7 @@ fn argmaxBytes(bytes: []const u8) usize {
     return best;
 }
 
-test "sushi_ds41 gpu: extendCold split produces identical state and greedy logits vs unsplit on multi-chunk text and vision prompts (DSV41_TINY)" {
+test "sushi_ds41 gpu: extendCold split produces identical state and greedy logits vs unsplit on single-chunk text and vision prompts (DSV41_TINY)" {
     try skipNoGpu();
     const dir = try dsv.fixtureDir();
     const s = mlx.gpuStream();
@@ -272,33 +276,34 @@ test "sushi_ds41 gpu: extendCold split produces identical state and greedy logit
     defer m.deinit();
     try testing.expect(m.ced_split != null and m.engrams.len > 0);
     // Tiny model has window = 8; use a scaled plan that stays within its 128-position RoPE table.
-    const plan: cold_lead.Plan = .{ .chunk_width = 48, .lead_min = 32, .lead_align = 8, .tail_merge_max = 8 };
+    const plan: cold_lead.Plan = .{ .chunk_width = 48, .lead_min = 24, .lead_align = 8, .tail_merge_max = 8 };
     const unsplit_plan: cold_lead.Plan = .{ .chunk_width = 48, .lead_min = std.math.maxInt(usize), .lead_align = 8, .tail_merge_max = 8 };
 
-    var ids: [97]u32 = undefined; // prefix = 96 -> chunks [0..24], [24..48], [48..96], last [96..97]
+    var ids: [97]u32 = undefined;
     for (&ids, 0..) |*t, i| t.* = if (i == 0) 2 else 3 + @as(u32, @intCast((i * 37) % 90));
+    const single = ids[0..49]; // prefix = 48 -> split [0..24] lead + [24..48] rest + [48..49] last
 
-    // 1. Plain text + Engram multi-chunk parity (extendCold vs same-cut extendAhead bit-for-bit, and vs unsplit greedy).
+    // 1. Plain text + Engram single-chunk parity (extendCold vs same-cut extendAhead bit-for-bit, and vs unsplit greedy).
     {
         dsv.resetState(m);
-        const split_run = try runTinySchedule(m, &sc, &ids, null, plan, false);
+        const split_run = try runTinySchedule(m, &sc, single, null, plan, false);
         defer split_run.deinit();
-        try testing.expectEqual(@as(u64, 2), split_run.state_only_used);
-        try testing.expectEqual(@as(u64, 3), split_run.engram_ahead_used);
+        try testing.expectEqual(@as(u64, 1), split_run.state_only_used);
+        try testing.expectEqual(@as(u64, 2), split_run.engram_ahead_used);
 
         dsv.resetState(m);
-        const same_cut_full = try runTinySchedule(m, &sc, &ids, null, plan, true);
+        const same_cut_full = try runTinySchedule(m, &sc, single, null, plan, true);
         defer same_cut_full.deinit();
         try testing.expectEqualSlices(u8, same_cut_full.logits, split_run.logits);
-        try expectSlotsLive(&sc, m, same_cut_full.slots, split_run.slots, ids.len);
+        try expectSlotsLive(&sc, m, same_cut_full.slots, split_run.slots, single.len);
 
         dsv.resetState(m);
-        const unsplit_run = try runTinySchedule(m, &sc, &ids, null, unsplit_plan, false);
+        const unsplit_run = try runTinySchedule(m, &sc, single, null, unsplit_plan, false);
         defer unsplit_run.deinit();
         try testing.expectEqual(argmaxBytes(unsplit_run.logits), argmaxBytes(split_run.logits));
     }
 
-    // 2. Vision tokens straddling the lead split boundary (0..24 and 24..48) + chunk 1.
+    // 2. Vision tokens straddling the lead split boundary (0..24 and 24..48).
     {
         const image_id: u32 = m.cfg.vocab - 1;
         m.cfg.image_token_id = image_id;
@@ -309,24 +314,23 @@ test "sushi_ds41 gpu: extendCold split produces identical state and greedy logit
             for (bias, shifted, 0..) |b, *o, e| o.* = b + (if (e % 2 == 0) @as(f32, 6) else -6);
             ly.gate_bias_vl = try sc.keep(mlx.mlx_array_new_data(shifted.ptr, &[_]c_int{ 1, sc_mod.ci(bias.len) }, 2, .float32));
         }
-        const vids = try testing.allocator.dupe(u32, &ids);
+        const vids = try testing.allocator.dupe(u32, single);
         defer testing.allocator.free(vids);
-        // Span crosses lead=24 (indices 20..28) and appears again in chunk 1 (indices 52..56).
+        // Span crosses lead=24 (indices 20..28).
         for (vids[20..28]) |*t| t.* = image_id;
-        for (vids[52..56]) |*t| t.* = image_id;
 
         var key = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_random_key(&key, 0x1a6e));
         _ = try sc.keep(key);
         var vraw = mlx.mlx_array_new();
-        const vrows = try sc.res(mlx.mlx_random_normal(&vraw, &.{ 12, sc_mod.ci(m.cfg.dim) }, 2, .float32, 0, 1, key, sc.s), &vraw);
+        const vrows = try sc.res(mlx.mlx_random_normal(&vraw, &.{ 8, sc_mod.ci(m.cfg.dim) }, 2, .float32, 0, 1, key, sc.s), &vraw);
         const vr: dsv.VisionRows = .{ .rows = vrows, .offset = 0 };
 
         dsv.resetState(m);
         const split_v = try runTinySchedule(m, &sc, vids, vr, plan, false);
         defer split_v.deinit();
-        try testing.expectEqual(@as(u64, 2), split_v.state_only_used);
-        try testing.expectEqual(@as(u64, 3), split_v.engram_ahead_used);
+        try testing.expectEqual(@as(u64, 1), split_v.state_only_used);
+        try testing.expectEqual(@as(u64, 2), split_v.engram_ahead_used);
 
         dsv.resetState(m);
         const same_cut_v = try runTinySchedule(m, &sc, vids, vr, plan, true);
@@ -340,25 +344,31 @@ test "sushi_ds41 gpu: extendCold split produces identical state and greedy logit
         try testing.expectEqual(argmaxBytes(unsplit_v.logits), argmaxBytes(split_v.logits));
     }
 
-    // 3. Non-trigger cases on live model: short prompt, cached tail resume <= 1 chunk, no CED.
+    // 3. Non-trigger cases on live model: short prompt, multi-chunk prompt, cached tail resume, no CED.
     {
         // Short prompt (< lead_min)
         dsv.resetState(m);
-        const short_run = try runTinySchedule(m, &sc, ids[0..25], null, plan, false);
+        const short_run = try runTinySchedule(m, &sc, ids[0..21], null, plan, false);
         defer short_run.deinit();
         try testing.expectEqual(@as(u64, 0), short_run.state_only_used);
 
-        // Cached tail resume <= 1 chunk (st.n = 25, tail prefix = 40 <= chunk_width = 48)
-        const tail_run = try runTinySchedule(m, &sc, ids[25..66], null, plan, false);
+        // Cached tail resume (st.n = 21, tail prefix = 40 <= chunk_width = 48)
+        const tail_run = try runTinySchedule(m, &sc, ids[21..62], null, plan, false);
         defer tail_run.deinit();
         try testing.expectEqual(@as(u64, 0), tail_run.state_only_used);
+
+        // Multi-chunk prompt (prefix = 96 > chunk_width = 48): only normal chunk 0 (0..48) uses state_only, no lead split.
+        dsv.resetState(m);
+        const multi_run = try runTinySchedule(m, &sc, &ids, null, plan, false);
+        defer multi_run.deinit();
+        try testing.expectEqual(@as(u64, 1), multi_run.state_only_used);
 
         // ced_split == null
         const saved_split = m.ced_split;
         m.ced_split = null;
         defer m.ced_split = saved_split;
         dsv.resetState(m);
-        const no_ced = try runTinySchedule(m, &sc, &ids, null, plan, false);
+        const no_ced = try runTinySchedule(m, &sc, single, null, plan, false);
         defer no_ced.deinit();
         try testing.expectEqual(@as(u64, 0), no_ced.state_only_used);
     }

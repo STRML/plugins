@@ -1,11 +1,11 @@
-//! `extendCold` prefill lead split: when a cold prompt starts without an existing Engram read-ahead, split chunk 0
-//! into an encoder-only leading sub-chunk (`extendState`) while passing the rest of chunk 0 as `ahead`, overlapping
-//! cold Engram SSD reads with GPU compute of the lead sub-chunk.
+//! `extendCold` prefill lead split: when a single-chunk cold prompt starts without an existing Engram read-ahead,
+//! split chunk 0 into an encoder-only leading sub-chunk (`extendState`) while passing the rest of chunk 0 as `ahead`,
+//! overlapping cold Engram SSD reads with GPU compute of the lead sub-chunk.
 const std = @import("std");
 const prefill_plan = @import("sushi/prefill_plan.zig");
 
-/// Minimum chunk length for `extendCold` lead splitting (matches `mlx-serve` `LEAD_MIN`).
-pub const LEAD_MIN: usize = 4096;
+/// Minimum chunk length for `extendCold` lead splitting (covers 2k..8k single-chunk cold prompts).
+pub const LEAD_MIN: usize = 2048;
 
 /// Default attention span alignment (`dsv41_model.SPAN`).
 pub const DEFAULT_ALIGN: usize = 256;
@@ -53,13 +53,13 @@ pub fn chunkEnd(at: usize, prefix: usize, chunk_width: usize, tail_merge_max: us
 }
 
 /// Rows for the leading encoder-only sub-chunk of chunk 0 (`0` when chunk 0 should run whole).
-/// Mirrors `mlx-serve`'s `leadRows` (`L / 2` aligned to `SPAN`) and skips short prompts, cached tail resumes of at
-/// most one chunk, already-prefetched chunks, models without CED or Engram, and chunks too narrow to leave a
-/// replayable window in the rest of chunk 0.
+/// Applies to single-chunk cold prompts (`prefix <= chunk_width` and `state_n == 0`) with `L / 2` aligned to `SPAN`;
+/// skips multi-chunk prompts (where chunk 0 already runs encoder-only), short prompts (`< lead_min`), cached tail
+/// resumes, already-prefetched chunks, models without CED or Engram, and chunks too narrow to leave a replayable
+/// window in the rest of chunk 0.
 pub fn coldLeadRows(args: LeadArgs) usize {
-    if (args.at != 0 or args.has_ahead or !args.has_ced_split or !args.has_engrams) return 0;
-    // A cached tail resume of <= 1 chunk stays whole; multi-chunk resumes still overlap chunk 0's cold Engram reads.
-    if (args.state_n > 0 and args.prefix <= args.chunk_width) return 0;
+    if (args.at != 0 or args.state_n > 0 or args.has_ahead or !args.has_ced_split or !args.has_engrams) return 0;
+    if (args.prefix > args.chunk_width) return 0;
     if (args.chunk_end <= args.at) return 0;
     const len = args.chunk_end - args.at;
     if (len < args.lead_min) return 0;
@@ -146,37 +146,13 @@ fn collectSteps(alloc: std.mem.Allocator, iter_init: Iter) ![]Step {
     return list.toOwnedSlice(alloc);
 }
 
-test "sushi_ds41 extendCold: splits cold 32k chunk 0 into 4096 lead + 4096 rest and preserves chunks 1..N <= 8192" {
+test "sushi_ds41 extendCold: splits cold single-chunk prompts (2048..8192) and keeps multi-chunk prompts unsplit <= 8192" {
     const t = std.testing;
-    const steps = try collectSteps(t.allocator, .{
-        .prefix = 32768,
-        .total_len = 32769,
-        .state_n = 0,
-        .window = 128,
-        .has_ced_split = true,
-        .has_engrams = true,
-        .has_ahead = false,
-    });
-    defer t.allocator.free(steps);
-    try t.expectEqual(@as(usize, 5), steps.len);
-    // Lead sub-chunk: 0..4096 encoder-only, ahead = 4096..8192 (rest of chunk 0).
-    try t.expectEqual(Step{ .at = 0, .end = 4096, .next = 8192, .state_only = true, .cold_lead = true, .tap_on = false }, steps[0]);
-    // Rest of chunk 0: 4096..8192 encoder-only (since chunks 1..3 follow), ahead = 8192..16384.
-    try t.expectEqual(Step{ .at = 4096, .end = 8192, .next = 16384, .state_only = true, .cold_lead = false, .tap_on = false }, steps[1]);
-    try t.expectEqual(Step{ .at = 8192, .end = 16384, .next = 24576, .state_only = true, .cold_lead = false, .tap_on = false }, steps[2]);
-    try t.expectEqual(Step{ .at = 16384, .end = 24576, .next = 32768, .state_only = true, .cold_lead = false, .tap_on = false }, steps[3]);
-    // Last prefix chunk runs full CED replay + tap, prefetching final token 32768..32769.
-    try t.expectEqual(Step{ .at = 24576, .end = 32768, .next = 32769, .state_only = false, .cold_lead = false, .tap_on = true }, steps[4]);
-    for (steps) |s| try t.expect(s.end - s.at <= MAX_CHUNK_ROWS);
-}
-
-test "sushi_ds41 extendCold: splits cold 4096..8500 single/tail prompts with every chunk <= 8192" {
-    const t = std.testing;
-    // 4096 prefix -> 2048 lead + 2048 rest
+    // 2048 prefix -> 1024 lead + 1024 rest
     {
         const steps = try collectSteps(t.allocator, .{
-            .prefix = 4096,
-            .total_len = 4097,
+            .prefix = 2048,
+            .total_len = 2049,
             .state_n = 0,
             .window = 128,
             .has_ced_split = true,
@@ -185,14 +161,14 @@ test "sushi_ds41 extendCold: splits cold 4096..8500 single/tail prompts with eve
         });
         defer t.allocator.free(steps);
         try t.expectEqual(@as(usize, 2), steps.len);
-        try t.expectEqual(Step{ .at = 0, .end = 2048, .next = 4096, .state_only = true, .cold_lead = true, .tap_on = false }, steps[0]);
-        try t.expectEqual(Step{ .at = 2048, .end = 4096, .next = 4097, .state_only = false, .cold_lead = false, .tap_on = true }, steps[1]);
+        try t.expectEqual(Step{ .at = 0, .end = 1024, .next = 2048, .state_only = true, .cold_lead = true, .tap_on = false }, steps[0]);
+        try t.expectEqual(Step{ .at = 1024, .end = 2048, .next = 2049, .state_only = false, .cold_lead = false, .tap_on = true }, steps[1]);
     }
-    // 8500 prefix -> never merges past 8192: 4096 lead + 4096 rest + 308 tail, all <= 8192
+    // 4095 prefix (prompt = 4096) -> 1792 lead + 2303 rest
     {
         const steps = try collectSteps(t.allocator, .{
-            .prefix = 8500,
-            .total_len = 8501,
+            .prefix = 4095,
+            .total_len = 4096,
             .state_n = 0,
             .window = 128,
             .has_ced_split = true,
@@ -200,10 +176,75 @@ test "sushi_ds41 extendCold: splits cold 4096..8500 single/tail prompts with eve
             .has_ahead = false,
         });
         defer t.allocator.free(steps);
-        try t.expectEqual(@as(usize, 3), steps.len);
+        try t.expectEqual(@as(usize, 2), steps.len);
+        try t.expectEqual(Step{ .at = 0, .end = 1792, .next = 4095, .state_only = true, .cold_lead = true, .tap_on = false }, steps[0]);
+        try t.expectEqual(Step{ .at = 1792, .end = 4095, .next = 4096, .state_only = false, .cold_lead = false, .tap_on = true }, steps[1]);
+    }
+    // 4681 prefix (prompt = 4682) -> 2304 lead + 2377 rest
+    {
+        const steps = try collectSteps(t.allocator, .{
+            .prefix = 4681,
+            .total_len = 4682,
+            .state_n = 0,
+            .window = 128,
+            .has_ced_split = true,
+            .has_engrams = true,
+            .has_ahead = false,
+        });
+        defer t.allocator.free(steps);
+        try t.expectEqual(@as(usize, 2), steps.len);
+        try t.expectEqual(Step{ .at = 0, .end = 2304, .next = 4681, .state_only = true, .cold_lead = true, .tap_on = false }, steps[0]);
+        try t.expectEqual(Step{ .at = 2304, .end = 4681, .next = 4682, .state_only = false, .cold_lead = false, .tap_on = true }, steps[1]);
+    }
+    // 8192 prefix -> 4096 lead + 4096 rest
+    {
+        const steps = try collectSteps(t.allocator, .{
+            .prefix = 8192,
+            .total_len = 8193,
+            .state_n = 0,
+            .window = 128,
+            .has_ced_split = true,
+            .has_engrams = true,
+            .has_ahead = false,
+        });
+        defer t.allocator.free(steps);
+        try t.expectEqual(@as(usize, 2), steps.len);
         try t.expectEqual(Step{ .at = 0, .end = 4096, .next = 8192, .state_only = true, .cold_lead = true, .tap_on = false }, steps[0]);
-        try t.expectEqual(Step{ .at = 4096, .end = 8192, .next = 8500, .state_only = true, .cold_lead = false, .tap_on = false }, steps[1]);
-        try t.expectEqual(Step{ .at = 8192, .end = 8500, .next = 8501, .state_only = false, .cold_lead = false, .tap_on = true }, steps[2]);
+        try t.expectEqual(Step{ .at = 4096, .end = 8192, .next = 8193, .state_only = false, .cold_lead = false, .tap_on = true }, steps[1]);
+    }
+    // 8193 prefix (multi-chunk) -> does NOT split
+    {
+        const steps = try collectSteps(t.allocator, .{
+            .prefix = 8193,
+            .total_len = 8194,
+            .state_n = 0,
+            .window = 128,
+            .has_ced_split = true,
+            .has_engrams = true,
+            .has_ahead = false,
+        });
+        defer t.allocator.free(steps);
+        try t.expectEqual(@as(usize, 2), steps.len);
+        try t.expectEqual(Step{ .at = 0, .end = 8192, .next = 8193, .state_only = false, .cold_lead = false, .tap_on = false }, steps[0]);
+        try t.expectEqual(Step{ .at = 8192, .end = 8193, .next = 8194, .state_only = false, .cold_lead = false, .tap_on = true }, steps[1]);
+    }
+    // 32768 prefix (multi-chunk) -> does NOT split; stays 4 standard 8192-row chunks
+    {
+        const steps = try collectSteps(t.allocator, .{
+            .prefix = 32768,
+            .total_len = 32769,
+            .state_n = 0,
+            .window = 128,
+            .has_ced_split = true,
+            .has_engrams = true,
+            .has_ahead = false,
+        });
+        defer t.allocator.free(steps);
+        try t.expectEqual(@as(usize, 4), steps.len);
+        try t.expectEqual(Step{ .at = 0, .end = 8192, .next = 16384, .state_only = true, .cold_lead = false, .tap_on = false }, steps[0]);
+        try t.expectEqual(Step{ .at = 8192, .end = 16384, .next = 24576, .state_only = true, .cold_lead = false, .tap_on = false }, steps[1]);
+        try t.expectEqual(Step{ .at = 16384, .end = 24576, .next = 32768, .state_only = true, .cold_lead = false, .tap_on = false }, steps[2]);
+        try t.expectEqual(Step{ .at = 24576, .end = 32768, .next = 32769, .state_only = false, .cold_lead = false, .tap_on = true }, steps[3]);
         for (steps) |s| try t.expect(s.end - s.at <= MAX_CHUNK_ROWS);
     }
     // 16500 prefix -> never emits chunk > 8192; every ahead covers the exact next chunk.
@@ -218,22 +259,21 @@ test "sushi_ds41 extendCold: splits cold 4096..8500 single/tail prompts with eve
             .has_ahead = false,
         });
         defer t.allocator.free(steps);
-        try t.expectEqual(@as(usize, 4), steps.len);
-        try t.expectEqual(@as(usize, 8192), steps[0].next);
-        try t.expectEqual(@as(usize, 16384), steps[1].next);
-        try t.expectEqual(@as(usize, 16500), steps[2].next);
-        try t.expectEqual(@as(usize, 16500), steps[3].end);
+        try t.expectEqual(@as(usize, 3), steps.len);
+        try t.expectEqual(Step{ .at = 0, .end = 8192, .next = 16384, .state_only = true, .cold_lead = false, .tap_on = false }, steps[0]);
+        try t.expectEqual(Step{ .at = 8192, .end = 16384, .next = 16500, .state_only = false, .cold_lead = false, .tap_on = false }, steps[1]);
+        try t.expectEqual(Step{ .at = 16384, .end = 16500, .next = 16501, .state_only = false, .cold_lead = false, .tap_on = true }, steps[2]);
         for (steps) |s| try t.expect(s.end - s.at <= MAX_CHUNK_ROWS);
     }
 }
 
-test "sushi_ds41 extendCold: skips short prompts, cached <= 1 chunk resumes, prefetched prompts, no-CED, and no-Engram" {
+test "sushi_ds41 extendCold: skips short prompts, cached tail resumes, prefetched prompts, no-CED, and no-Engram" {
     const t = std.testing;
     // Short prompt (< LEAD_MIN)
     {
         const steps = try collectSteps(t.allocator, .{
-            .prefix = 4095,
-            .total_len = 4096,
+            .prefix = 2047,
+            .total_len = 2048,
             .state_n = 0,
             .window = 128,
             .has_ced_split = true,
@@ -246,8 +286,8 @@ test "sushi_ds41 extendCold: skips short prompts, cached <= 1 chunk resumes, pre
         try t.expect(!steps[0].state_only);
         try t.expect(steps[0].tap_on);
     }
-    // Cached tail resume <= 1 chunk (state_n > 0, prefix <= chunk_width)
-    for ([_]usize{ 512, 4096, 8192 }) |p| {
+    // Cached tail resumes (state_n > 0) never split
+    for ([_]usize{ 512, 4096, 8192, 16384 }) |p| {
         const steps = try collectSteps(t.allocator, .{
             .prefix = p,
             .total_len = p + 1,
@@ -258,29 +298,13 @@ test "sushi_ds41 extendCold: skips short prompts, cached <= 1 chunk resumes, pre
             .has_ahead = false,
         });
         defer t.allocator.free(steps);
-        try t.expectEqual(@as(usize, 1), steps.len);
-        try t.expect(!steps[0].cold_lead);
-        try t.expect(!steps[0].state_only);
-    }
-    // Cached tail resume > 1 chunk (still benefits from cold lead when not prefetched)
-    {
-        const steps = try collectSteps(t.allocator, .{
-            .prefix = 16384,
-            .total_len = 16385,
-            .state_n = 8192,
-            .window = 128,
-            .has_ced_split = true,
-            .has_engrams = true,
-            .has_ahead = false,
-        });
-        defer t.allocator.free(steps);
-        try t.expect(steps[0].cold_lead);
+        for (steps) |s| try t.expect(!s.cold_lead);
     }
     // Already prefetched
     {
         const steps = try collectSteps(t.allocator, .{
-            .prefix = 16384,
-            .total_len = 16385,
+            .prefix = 8192,
+            .total_len = 8193,
             .state_n = 0,
             .window = 128,
             .has_ced_split = true,
@@ -288,15 +312,14 @@ test "sushi_ds41 extendCold: skips short prompts, cached <= 1 chunk resumes, pre
             .has_ahead = true,
         });
         defer t.allocator.free(steps);
-        try t.expectEqual(@as(usize, 2), steps.len);
+        try t.expectEqual(@as(usize, 1), steps.len);
         try t.expect(!steps[0].cold_lead);
-        try t.expect(steps[0].state_only);
     }
     // ced_split == null
     {
         const steps = try collectSteps(t.allocator, .{
-            .prefix = 16384,
-            .total_len = 16385,
+            .prefix = 8192,
+            .total_len = 8193,
             .state_n = 0,
             .window = 128,
             .has_ced_split = false,
@@ -304,15 +327,15 @@ test "sushi_ds41 extendCold: skips short prompts, cached <= 1 chunk resumes, pre
             .has_ahead = false,
         });
         defer t.allocator.free(steps);
-        try t.expectEqual(@as(usize, 2), steps.len);
+        try t.expectEqual(@as(usize, 1), steps.len);
         try t.expect(!steps[0].cold_lead);
         try t.expect(!steps[0].state_only);
     }
     // engrams.len == 0
     {
         const steps = try collectSteps(t.allocator, .{
-            .prefix = 16384,
-            .total_len = 16385,
+            .prefix = 8192,
+            .total_len = 8193,
             .state_n = 0,
             .window = 128,
             .has_ced_split = true,
@@ -320,9 +343,8 @@ test "sushi_ds41 extendCold: skips short prompts, cached <= 1 chunk resumes, pre
             .has_ahead = false,
         });
         defer t.allocator.free(steps);
-        try t.expectEqual(@as(usize, 2), steps.len);
+        try t.expectEqual(@as(usize, 1), steps.len);
         try t.expect(!steps[0].cold_lead);
-        try t.expect(steps[0].state_only);
     }
     // prefix <= lead + window (huge window guard)
     try t.expectEqual(@as(usize, 0), coldLeadRows(.{
@@ -332,7 +354,7 @@ test "sushi_ds41 extendCold: skips short prompts, cached <= 1 chunk resumes, pre
         .prefix = 4096,
         .chunk_width = 8192,
         .window = 2048,
-        .lead_min = 4096,
+        .lead_min = 2048,
         .lead_align = 256,
         .has_ced_split = true,
         .has_engrams = true,
@@ -340,13 +362,13 @@ test "sushi_ds41 extendCold: skips short prompts, cached <= 1 chunk resumes, pre
     }));
     // at > 0 never splits
     try t.expectEqual(@as(usize, 0), coldLeadRows(.{
-        .at = 8192,
+        .at = 4096,
         .state_n = 0,
-        .chunk_end = 16384,
-        .prefix = 16384,
+        .chunk_end = 8192,
+        .prefix = 8192,
         .chunk_width = 8192,
         .window = 128,
-        .lead_min = 4096,
+        .lead_min = 2048,
         .lead_align = 256,
         .has_ced_split = true,
         .has_engrams = true,

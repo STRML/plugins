@@ -462,8 +462,8 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
         .plan = .{ .chunk_width = prefill_width },
     };
     while (chunks.next()) |step| {
-        // On a cold prompt chunk 0 splits into an encoder-only lead (`stateRows`) with the rest of chunk 0 passed as
-        // `ahead`, and any later chunk whose CED tail a wider successor overwrites also skips its decoder (`extendState`).
+        // On a single-chunk cold prompt, chunk 0 splits into an encoder-only lead (`stateRows`) with the rest passed as
+        // `ahead`; on multi-chunk prompts, each chunk whose CED tail a wider successor overwrites skips its decoder.
         if (tapping) m.mdl.stream_tap.?.on = step.tap_on;
         if (step.state_only) {
             try stateRows(m, ids[step.at..step.end], ids[step.end..step.next], rows);
