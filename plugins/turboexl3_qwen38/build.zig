@@ -94,6 +94,7 @@ const mlx_free_filters = [_][]const u8{
 /// keep no other named test (scripts/sync-mlx-serve.sh takes them out).
 const gpu_filters = [_][]const u8{
     "direct load: a trellis n-gram table takes its per-head bias",
+    "gpu attn:",
     "pack keys: trunk_quant is a format's block",
     "qwen4_exp formats: the numerics are reordered on the EXL3 trunk profile",
     "qwen4_exp formats: an unclaimed trunk block",

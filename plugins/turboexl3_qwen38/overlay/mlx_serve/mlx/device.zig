@@ -58,6 +58,7 @@ pub fn gpuArchitecture(buf: []u8) ?[]const u8 {
 
 /// This GPU has NAX: the plugin's load refuses any GPU without it (M5-class only).
 pub fn naxPresent() bool {
+    if (mlx.virtualGpu()) return false;
     var arch_buf: [128]u8 = undefined;
     const g = naxArchGeneration(gpuArchitecture(&arch_buf) orelse "");
     if (g.gen < @as(u32, if (g.phone) 18 else 17)) return false;

@@ -111,7 +111,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     mlx.bind(h);
-    if (!device.naxPresent()) {
+    if (mlx.virtualGpu() or !device.naxPresent()) {
         log.err("[turboexl3_qwen38] turboexl3_qwen38 needs an M5-class GPU (NAX)\n", .{});
         out.* = Verdict.refuse(.unsupported, "turboexl3_qwen38 needs an M5-class GPU (NAX)");
         return null;

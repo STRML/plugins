@@ -164,6 +164,8 @@ pub const Source = struct {
     bill: Bill,
     phase: Phase = .prompt,
     released: bool = false,
+    prev_stats: expert_stream.Stats = .{},
+    meter_buf: [512]u8 = undefined,
 
     /// JOINLESS's combine, built and compiled at the load.
     jl: ?Combine = null,
@@ -180,6 +182,7 @@ pub const Source = struct {
         self.a = a;
         self.phase = .prompt;
         self.released = false;
+        self.prev_stats = .{};
         self.jl = null;
         self.bank = try expert_bank.Bank.open(a, io, dir, implementedOf(geo), null);
         errdefer self.bank.deinit();
@@ -361,6 +364,22 @@ pub const Source = struct {
         return g.keep(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(w, -1)), -2, false));
     }
 
+    /// Decode-lane `rows` with `hoist` (the model's ungated shared expert over the same rows) committed while the
+    /// routed reads wait; `out` is `rows`' sum word for word.
+    pub fn rowsHoist(self: *Source, layer: u32, x: T, idx: T, wts: T, hoist: T) !T {
+        const g = &self.g;
+        defer g.reset();
+        const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
+        self.t3_state.n = 0;
+        const arena = self.scratchBegin(ids);
+        defer if (arena) scratch_waves.callEnd();
+        const sh = g.shapeOf(ids);
+        const can_hoist = hoist.ctx != null and sh.dim(0) * sh.dim(1) <= decode_route_ids;
+        const ro = try self.hook.at(layer).routedHoist(g, x, ids, if (can_hoist) &.{hoist} else &.{});
+        const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
+        return g.keep(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(w, -1)), -2, false));
+    }
+
     /// a decode-lane call (at most `decode_route_ids` routed ids) ending in
     /// TAIL_FUSE's kernel: the call's joined rows read in place through their (source 0, row) table, each weighted, the
     /// six folded in the column reduce's order, the shared rows (`shared`, as the model made them, committed behind the
@@ -522,6 +541,24 @@ pub const Source = struct {
 
     pub fn stats(self: *Source) expert_stream.Stats {
         return self.source.stats();
+    }
+
+    /// `[stream-stats]` summary delta since the previous call, valid until the next `meters` call.
+    pub fn meters(self: *Source) []const u8 {
+        const cur = self.stats();
+        const d = cur.since(self.prev_stats);
+        self.prev_stats = cur;
+        if (d.route_calls == 0) return "";
+        const mib = @as(f64, @floatFromInt(d.expert_bytes_read)) / (1024.0 * 1024.0);
+        return std.fmt.bufPrint(&self.meter_buf, "[stream-stats] routes={d} hits={d} misses={d} evict={d} read_mib={d:.1} ahead_hits={d} ahead_demand={d}", .{
+            d.route_calls,
+            d.expert_cache_hits,
+            d.expert_cache_misses,
+            d.expert_cache_evictions,
+            mib,
+            d.ahead_hits,
+            d.ahead_demand,
+        }) catch "";
     }
 };
 

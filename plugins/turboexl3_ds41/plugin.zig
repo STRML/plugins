@@ -10,6 +10,7 @@ const mlx = kit.mlx;
 const t3 = @import("turboexl3");
 const tkit = @import("turboexl3_kit");
 const woaj = @import("src/woa_join.zig");
+const hats_cache_mod = @import("src/hats_cache.zig");
 const shared_swiglu = @import("src/shared_swiglu.zig");
 const stream = @import("mlx_stream");
 const exl3 = stream.exl3_source;
@@ -40,6 +41,8 @@ pub const table = abi.QuantTable{
     .swiglu = &swiglu,
     .bank_rows = &bankRows,
     .open_bank = &openBank,
+    .swiglu_limit_out = false,
+    .exact_rows = t3.kernels.DECODE_ROWS_MAX,
 };
 
 const Verdict = abi.Verdict;
@@ -57,7 +60,7 @@ fn open(ctx: *abi.LoadCtx) callconv(.c) Verdict {
     // The streamer's events, slot buffers and launches, and its log lines, through the server's table.
     if (!shims.install(ctx.host)) return Verdict.refuse(.unsupported, "turboexl3_ds41: the server's host table is older than this plugin's kit");
     stream.sdk.log.use(h);
-    const nax = tkit.nax.available();
+    const nax = !mlx.virtualGpu() and tkit.nax.available();
     // A streaming pack's bank needs NAX: refused here, before its trunk loads.
     if (!nax) if (ctx.dir) |d| if (d.fileBytes("experts.bin") > 0) return no_nax;
     // The banked decode: up to four row-slots of one expert a weight decode, the M = 3 member path, the t4 GEMVs.
@@ -68,6 +71,12 @@ fn open(ctx: *abi.LoadCtx) callconv(.c) Verdict {
     cf.banked_variant_gu = t3.groupVariantOf("t4") orelse return Verdict.refuse(.failed, "turboexl3_ds41: turboexl3 has no t4 GEMV variant");
     cf.banked_variant_dn = cf.banked_variant_gu;
     t3.configure(cf) catch |e| return Verdict.named(.failed, @errorName(e));
+    @atomicStore(bool, &bank_opened, false, .release);
+    {
+        hats_mu.lock();
+        defer hats_mu.unlock();
+        hats_cache.max_bytes = hatsCapBytes();
+    }
     woaj.build(gpa) catch |e| return Verdict.named(.failed, @errorName(e));
     // Prompt rows' matmul and finish as one launch at the tiles turboexl3 tables (pg2: the same words), compiled now.
     if (nax) {
@@ -79,7 +88,9 @@ fn open(ctx: *abi.LoadCtx) callconv(.c) Verdict {
     return .ok;
 }
 
-fn close(_: *abi.LoadCtx) callconv(.c) void {}
+fn close(_: *abi.LoadCtx) callconv(.c) void {
+    dropHats();
+}
 
 /// `<base>.trellis` (I16 [in/16, out/16, n]) beside `<base>.suh` (f16 [in]) and `<base>.svh` (f16 [out]), as exllamav3
 /// stores a linear; a grouped one (`wo_a`) as its slices `<base>.slice.<g>`, stacked (`grouped` set).
@@ -112,7 +123,7 @@ fn loadGroups(ctx: *const abi.LoadCtx, base: []const u8, in_dim: u32, out: *abi.
     if (!v.isOk()) return v;
     out.flags = grouped;
     // The joined run's kernels compiled at the first grouped linear's load, for the trunk's bf16 rows.
-    if (!woa_warmed) woaj.warm(.{ .ctx = ctx.stream.ctx }, projOf(out), .bfloat16) catch |e| {
+    if (!woa_warmed and !mlx.virtualGpu() and !mlx.noGpuBackend()) woaj.warm(.{ .ctx = ctx.stream.ctx }, projOf(out), .bfloat16) catch |e| {
         release(out);
         return Verdict.named(.failed, @errorName(e));
     };
@@ -217,19 +228,46 @@ fn share(a: A) abi.Array {
     return .{ .ctx = h.ctx };
 }
 
-/// A grouped linear's decoded weights, kept across one layer's runs (`woaj.run`); dropped for another weight's, at a
-/// decode call, or with the weight.
-var hats: woaj.Hats = .{};
-var hats_of: ?*anyopaque = null;
+/// Per-weight bounded LRU cache of decoded `wo_a` weights (`woaj.Hats`), keyed by `w.w.ctx`. Keeps all layers warm
+/// across prefill chunks without thrashing, bounded by physical RAM and cleared explicitly on weight release, decode
+/// phase change (to preserve streamed decode slot budget), or bank close.
+const HatsCache = hats_cache_mod.LruCache(woaj.Hats, woaj.Hats.deinit, 64);
+var hats_cache: HatsCache = HatsCache.init(hats_cache_mod.defaultCapBytes(0));
+var bank_opened: bool = false;
+var hats_live: bool = false;
+var hats_mu: struct {
+    m: std.c.pthread_mutex_t = .{},
+    fn lock(self: *@This()) void {
+        _ = std.c.pthread_mutex_lock(&self.m);
+    }
+    fn unlock(self: *@This()) void {
+        _ = std.c.pthread_mutex_unlock(&self.m);
+    }
+} = .{};
+
+fn hatsCapBytes() u64 {
+    return hats_cache_mod.defaultHostCapBytes();
+}
 
 fn dropHats() void {
-    hats.deinit();
-    hats = .{};
-    hats_of = null;
+    hats_mu.lock();
+    defer hats_mu.unlock();
+    hats_cache.clear();
+    @atomicStore(bool, &hats_live, false, .release);
+}
+
+fn hatsBytesOf(w: A) u64 {
+    const tsh = mlx.getShape(w);
+    if (tsh.len != 4) return 0;
+    return @as(u64, @intCast(tsh[0])) * @as(u64, @intCast(tsh[1])) * 16 * @as(u64, @intCast(tsh[2])) * 16 * 2;
 }
 
 fn release(w: *abi.Weight) callconv(.c) void {
-    if (hats_of != null and hats_of == w.w.ctx) dropHats();
+    if (w.w.ctx != null) {
+        hats_mu.lock();
+        defer hats_mu.unlock();
+        hats_cache.remove(w.w.ctx);
+    }
     for ([_]abi.Array{ w.w, w.scales, w.biases, w.side }) |a| if (a.ctx != null) {
         _ = mlx.mlx_array_free(.{ .ctx = a.ctx });
     };
@@ -248,15 +286,33 @@ fn matmul(w: *const abi.Weight, x: abi.Array, s: abi.Stream, out: *abi.Array) ca
 }
 
 /// x [rows, groups, in] through each group's linear: a prompt run on one prepare and one finish launch with the
-/// layer's decoded weights kept (`woaj.run`), else turboexl3's grouped linear.
+/// layer's decoded weights kept in the bounded LRU cache (`woaj.run`), else turboexl3's grouped linear.
 fn groupedMatmul(w: *const abi.Weight, x: A, s: mlx.mlx_stream) !A {
     if (mlx.getShape(x)[0] > t3.kernels.DECODE_ROWS_MAX) {
-        if (hats_of != w.w.ctx) {
-            dropHats();
-            hats_of = w.w.ctx;
+        hats_mu.lock();
+        defer hats_mu.unlock();
+        if (hats_cache.get(w.w.ctx)) |cached| {
+            if (try woaj.run(s, x, projOf(w), cached)) |y| return y;
+        } else {
+            const bytes = hatsBytesOf(arr(w.w));
+            // Reserve space before `woaj.run` allocates the replacement so live memory never overshoots `max_bytes`.
+            const cacheable = bytes > 0 and hats_cache.reserve(bytes);
+            var h: woaj.Hats = .{};
+            errdefer h.deinit();
+            if (try woaj.run(s, x, projOf(w), &h)) |y| {
+                if (cacheable and h.n > 0 and hats_cache.put(w.w.ctx, h, bytes) != null) {
+                    @atomicStore(bool, &hats_live, true, .release);
+                    return y;
+                }
+                h.deinit();
+                return y;
+            }
+            h.deinit();
         }
-        if (try woaj.run(s, x, projOf(w), &hats)) |y| return y;
-    } else if (hats_of != null) dropHats();
+    } else if (!@atomicLoad(bool, &bank_opened, .acquire) and @atomicLoad(bool, &hats_live, .acquire)) {
+        // Non-streamed packs never see `Bank.phase(..., false)`, so drop prompt hats when decode begins.
+        dropHats();
+    }
     return t3.linearGrouped(s, x, projOf(w), dec);
 }
 
@@ -294,12 +350,15 @@ fn geometry(geo: *const abi.BankGeometry) exl3.Geometry {
     return .{ .hidden_size = geo.hidden, .moe_intermediate_size = geo.inter, .n_experts_per_tok = geo.top_k, .n_routed_experts = geo.n_experts, .n_layers = geo.n_layers, .swiglu_limit = geo.swiglu_limit };
 }
 
-/// The host's budget with what this bank's decode gives back: the cache stop MLX holds less of at decode
-/// (`decode_stop.cut_bytes`), and the runtime floor the host bills decode at (512 MiB, its bill's x 5/4) over the 128
-/// MiB this bank's decode measured.
+/// The host's budget adjusted for this plugin's allocations: during prompt, the bounded `wo_a` Hats cache holds up
+/// to `hatsCapBytes()` bytes (`Bank.phase(..., false)` clears it before decode grow), while decode receives back what
+/// MLX holds less of at decode (`decode_stop.cut_bytes`) plus the runtime floor diff (512 MiB * 5/4 over 128 MiB).
 fn budgetOf(b: abi.BankBudget) exl3.Budget {
     const back: u64 = stream.decode_stop.cut_bytes + (512 - 128) * (1 << 20) * 5 / 4;
-    return .{ .prompt = b.prompt, .decode = if (b.decode > 0) b.decode + back else 0 };
+    return .{
+        .prompt = hats_cache_mod.deductPromptCap(b.prompt, hatsCapBytes()),
+        .decode = if (b.decode > 0) b.decode + back else 0,
+    };
 }
 
 fn bankRefusal(e: anyerror) Verdict {
@@ -310,7 +369,7 @@ fn bankRefusal(e: anyerror) Verdict {
 const no_nax = Verdict.refuse(.unsupported, "turboexl3_ds41: the streamed bank needs an M5 or newer GPU (its prompt kernels run on the matrix units)");
 
 fn bankRows(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.BankRows) callconv(.c) Verdict {
-    if (!tkit.nax.available()) return no_nax;
+    if (mlx.virtualGpu() or !tkit.nax.available()) return no_nax;
     const b = exl3.billOf(gpa, io, ctx.model_dir.slice(), geometry(geo), budgetOf(budget)) catch |e| return bankRefusal(e);
     out.* = .{ .prompt = b.rows.prompt, .decode = b.rows.decode, .row_bytes = b.row_bytes };
     return .ok;
@@ -335,7 +394,7 @@ fn env(comptime name: [:0]const u8) ?[]const u8 {
 var about: [160]u8 = undefined;
 
 fn openBank(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) Verdict {
-    if (!tkit.nax.available()) return no_nax;
+    if (mlx.virtualGpu() or !tkit.nax.available()) return no_nax;
     configureBank() catch |e| return Verdict.named(.unsupported, @errorName(e));
     const g = geo.gates orelse return Verdict.refuse(.failed, "turboexl3_ds41: the bank's geometry has no gates");
     const gates = gpa.alloc(exl3.Gate, geo.n_layers) catch return oom;
@@ -363,7 +422,12 @@ fn openBank(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.B
         .rows_expand_into = if (jl) &Bank.rowsExpandInto else null,
         .rows_decode_expand = &Bank.rowsDecodeExpand,
         .next_ahead = &Bank.nextAhead,
+        .meters = &Bank.meters,
+        .exact_rows = true,
+        .rows_independent = true,
+        .rows_hoist = &Bank.rowsHoist,
     };
+    @atomicStore(bool, &bank_opened, true, .release);
     return .ok;
 }
 
@@ -415,10 +479,18 @@ const Bank = struct {
         return .ok;
     }
     fn close(ctx: ?*anyopaque) callconv(.c) void {
+        @atomicStore(bool, &bank_opened, false, .release);
+        dropHats();
         of(ctx).deinit();
     }
     fn rows(ctx: ?*anyopaque, layer: u32, x: abi.Array, idx: abi.Array, wts: abi.Array, out: *abi.Array) callconv(.c) Verdict {
         return put(of(ctx).rows(layer, arr(x), arr(idx), arr(wts)), out);
+    }
+    fn rowsHoist(ctx: ?*anyopaque, layer: u32, x: abi.Array, idx: abi.Array, wts: abi.Array, hoist: abi.Array, out: *abi.Array) callconv(.c) Verdict {
+        return put(of(ctx).rowsHoist(layer, arr(x), arr(idx), arr(wts), arr(hoist)), out);
+    }
+    fn meters(ctx: ?*anyopaque, out: *abi.Str) callconv(.c) void {
+        out.* = abi.Str.of(of(ctx).meters());
     }
     /// The joinless combine runs on the wide lane's waves: a narrower call (the trunk's last-row replay) is forced there.
     fn rowsShared(ctx: ?*anyopaque, layer: u32, x: abi.Array, idx: abi.Array, wts: abi.Array, shared: abi.Array, out: *abi.Array) callconv(.c) Verdict {
@@ -439,6 +511,7 @@ const Bank = struct {
         return done(of(ctx).settle());
     }
     fn phase(ctx: ?*anyopaque, prompt: bool) callconv(.c) Verdict {
+        if (!prompt) dropHats();
         return done(of(ctx).setPhase(if (prompt) .prompt else .decode));
     }
     fn readAhead(ctx: ?*anyopaque, layer: u32, ids: [*]const u16, n: usize) callconv(.c) Verdict {

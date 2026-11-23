@@ -2,48 +2,44 @@
 #define BANKED_ru(c) (bk == 0u ? ru0[slot * ru0_strides[0] + (c) * ru0_strides[1]] : (bk == 1u ? ru1[slot * ru1_strides[0] + (c) * ru1_strides[1]] : ru2[slot * ru2_strides[0] + (c) * ru2_strides[1]]))
 
     const float SCALE = as_type<float>(1035273459u);
-    uint tid = thread_position_in_threadgroup.x;
+    uint l = thread_index_in_simdgroup;
     uint blk = threadgroup_position_in_grid.x;
     uint row = threadgroup_position_in_grid.y;
-    uint c0 = blk * 128u + tid;
-    uint c1 = c0 + 64u;
+    uint c0 = blk * 128u + 4u * l;
 
-    threadgroup float BG[128];
-    threadgroup float BU[128];
     uint slot_ = ids[row * ids_strides[0]]; uint bk = slot_ >> 24u; uint slot = slot_ & 0xFFFFFFu;
     uint t = uint(tok[row * tok_strides[0]]);
-    float x0 = float(x[t * x_strides[0] + c0 * x_strides[1]]);
-    float x1 = float(x[t * x_strides[0] + c1 * x_strides[1]]);
-    BG[tid] = x0 * float(BANKED_rg(c0));
-    BG[tid + 64u] = x1 * float(BANKED_rg(c1));
-    BU[tid] = x0 * float(BANKED_ru(c0));
-    BU[tid + 64u] = x1 * float(BANKED_ru(c1));
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    {
-    threadgroup float* B = BG;
-
-    for (uint h = 1u; h < 128u; h <<= 1u) {
-        uint k = tid & (h - 1u);
-        uint j = ((tid - k) << 1u) + k;
-        float a = B[j]; float b = B[j + h];
-        B[j] = a + b; B[j + h] = a - b;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
+    float wg[4];
+    float wu[4];
+    _Pragma("clang loop unroll(full)")
+    for (uint q = 0u; q < 4u; ++q) {
+        uint c = c0 + q;
+        float xv = float(x[t * x_strides[0] + c * x_strides[1]]);
+        wg[q] = xv * float(BANKED_rg(c));
+        wu[q] = xv * float(BANKED_ru(c));
     }
     {
-    threadgroup float* B = BU;
-
-    for (uint h = 1u; h < 128u; h <<= 1u) {
-        uint k = tid & (h - 1u);
-        uint j = ((tid - k) << 1u) + k;
-        float a = B[j]; float b = B[j + h];
-        B[j] = a + b; B[j + h] = a - b;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float a0 = wg[0] + wg[1]; float a1 = wg[0] - wg[1];
+        float a2 = wg[2] + wg[3]; float a3 = wg[2] - wg[3];
+        wg[0] = a0 + a2; wg[2] = a0 - a2;
+        wg[1] = a1 + a3; wg[3] = a1 - a3;
     }
-
+    {
+        float a0 = wu[0] + wu[1]; float a1 = wu[0] - wu[1];
+        float a2 = wu[2] + wu[3]; float a3 = wu[2] - wu[3];
+        wu[0] = a0 + a2; wu[2] = a0 - a2;
+        wu[1] = a1 + a3; wu[3] = a1 - a3;
     }
-    xg[row * 5120u + c0] = BG[tid] * SCALE;
-    xg[row * 5120u + c1] = BG[tid + 64u] * SCALE;
-    xu[row * 5120u + c0] = BU[tid] * SCALE;
-    xu[row * 5120u + c1] = BU[tid + 64u] * SCALE;
+    _Pragma("clang loop unroll(full)")
+    for (uint h = 1u; h < 32u; h <<= 1u) {
+        bool upper = (l & h) != 0u;
+        _Pragma("clang loop unroll(full)")
+        for (uint q = 0u; q < 4u; ++q) {
+            float og = simd_shuffle_xor(wg[q], (ushort)h);
+            float ou = simd_shuffle_xor(wu[q], (ushort)h);
+            wg[q] = upper ? (og - wg[q]) : (wg[q] + og);
+            wu[q] = upper ? (ou - wu[q]) : (wu[q] + ou);
+        }
+    }
+    *(device float4*)(xg + row * 5120u + c0) = float4(wg[0], wg[1], wg[2], wg[3]) * SCALE;
+    *(device float4*)(xu + row * 5120u + c0) = float4(wu[0], wu[1], wu[2], wu[3]) * SCALE;

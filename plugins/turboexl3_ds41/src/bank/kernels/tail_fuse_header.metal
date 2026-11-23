@@ -1,4 +1,14 @@
 #pragma METAL fp contract(off)
+template <typename U>
+inline float4 tf_load4(const device U* p) {
+    return float4(*reinterpret_cast<const device vec<U, 4>*>(p));
+}
+
+template <typename U>
+inline void tf_store4(device U* p, float4 v) {
+    *reinterpret_cast<device vec<U, 4>*>(p) = vec<U, 4>(v);
+}
+
 // the joinless combine's source pick (header_joinless's q3jl_pick).
 template <typename S>
 inline const device S* tf_pick(int s, const device S* s0, const device S* s1, const device S* s2, const device S* s3, const device S* s4, const device S* s5, const device S* s6, const device S* s7, const device S* s8, const device S* s9, const device S* s10, const device S* s11, const device S* s12, const device S* s13, const device S* s14, const device S* s15, const device S* s16, const device S* s17, const device S* s18, const device S* s19, const device S* s20, const device S* s21, const device S* s22, const device S* s23) {

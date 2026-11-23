@@ -1,25 +1,31 @@
 #define BANKED_rn(c) (bk == 0u ? rn0[slot * rn0_strides[0] + (c) * rn0_strides[1]] : (bk == 1u ? rn1[slot * rn1_strides[0] + (c) * rn1_strides[1]] : rn2[slot * rn2_strides[0] + (c) * rn2_strides[1]]))
 
     const float SCALE = as_type<float>(1035273459u);
-    uint tid = thread_position_in_threadgroup.x;
+    uint l = thread_index_in_simdgroup;
     uint blk = threadgroup_position_in_grid.x;
     uint row = threadgroup_position_in_grid.y;
-    uint c0 = blk * 128u + tid;
-    uint c1 = c0 + 64u;
+    uint c0 = blk * 128u + 4u * l;
 
-    threadgroup float B[128];
     uint slot_ = ids[row * ids_strides[0]]; uint bk = slot_ >> 24u; uint slot = slot_ & 0xFFFFFFu;
-    B[tid] = hid[row * hid_strides[0] + c0 * hid_strides[1]] * float(BANKED_rn(c0));
-    B[tid + 64u] = hid[row * hid_strides[0] + c1 * hid_strides[1]] * float(BANKED_rn(c1));
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint h = 1u; h < 128u; h <<= 1u) {
-        uint k = tid & (h - 1u);
-        uint j = ((tid - k) << 1u) + k;
-        float a = B[j]; float b = B[j + h];
-        B[j] = a + b; B[j + h] = a - b;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    float w[4];
+    _Pragma("clang loop unroll(full)")
+    for (uint q = 0u; q < 4u; ++q) {
+        uint c = c0 + q;
+        w[q] = hid[row * hid_strides[0] + c * hid_strides[1]] * float(BANKED_rn(c));
     }
-
-    out[row * 2304u + c0] = B[tid] * SCALE;
-    out[row * 2304u + c1] = B[tid + 64u] * SCALE;
+    {
+        float a0 = w[0] + w[1]; float a1 = w[0] - w[1];
+        float a2 = w[2] + w[3]; float a3 = w[2] - w[3];
+        w[0] = a0 + a2; w[2] = a0 - a2;
+        w[1] = a1 + a3; w[3] = a1 - a3;
+    }
+    _Pragma("clang loop unroll(full)")
+    for (uint h = 1u; h < 32u; h <<= 1u) {
+        bool upper = (l & h) != 0u;
+        _Pragma("clang loop unroll(full)")
+        for (uint q = 0u; q < 4u; ++q) {
+            float o = simd_shuffle_xor(w[q], (ushort)h);
+            w[q] = upper ? (o - w[q]) : (w[q] + o);
+        }
+    }
+    *(device float4*)(out + row * 2304u + c0) = float4(w[0], w[1], w[2], w[3]) * SCALE;

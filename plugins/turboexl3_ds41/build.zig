@@ -60,8 +60,15 @@ pub fn build(b: *std.Build) void {
     // The lane's MLX-free tests (src/*_test.zig), each a root of its own: the a4k record layout through the kit's read
     // pool, the half-integer-rate tiles against turboexl3's format.
     const format = b.createModule(.{ .root_source_file = dep.path("src/core/format.zig"), .target = target, .optimize = optimize });
-    for ([_][]const u8{ "frac", "a4k" }) |name| {
-        const m = b.createModule(.{ .root_source_file = b.path(b.fmt("src/{s}_test.zig", .{name})), .target = target, .optimize = optimize, .link_libc = true });
+    for ([_][]const u8{ "frac", "a4k", "hats_cache", "tail_fuse" }) |name| {
+        const path = if (std.mem.eql(u8, name, "hats_cache"))
+            "src/hats_cache.zig"
+        else if (std.mem.eql(u8, name, "tail_fuse"))
+            "src/bank/tail_fuse.zig"
+        else
+            b.fmt("src/{s}_test.zig", .{name});
+        const m = b.createModule(.{ .root_source_file = b.path(path), .target = target, .optimize = optimize, .link_libc = true });
+        if (std.mem.eql(u8, name, "tail_fuse")) m.addImport("mlx_serve", kit);
         if (std.mem.eql(u8, name, "frac")) {
             m.addImport("turboexl3_format", format);
             m.addImport("sdk", ssdk);
@@ -71,5 +78,28 @@ pub fn build(b: *std.Build) void {
             kit_build.streamSources(b, m, false);
         }
         b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = name, .root_module = m })).step);
+    }
+
+    const gpu_step = b.step("gpu-test", "Run live Metal GPU parity tests for b3_prep and tail_fuse: -Dmlx-lib=<dir>");
+    const gpu_build_step = b.step("gpu-test-build", "Compile live Metal GPU parity tests without running them: -Dmlx-lib=<dir>");
+    if (b.option([]const u8, "mlx-lib", "Directory containing libmlx.dylib and libmlxc.dylib (gpu-test)")) |mlx_lib| {
+        const gm = b.createModule(.{
+            .root_source_file = b.path("src/gpu_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{ .{ .name = "mlx_serve", .module = kit }, .{ .name = "sdk", .module = ssdk } },
+        });
+        gm.addLibraryPath(.{ .cwd_relative = mlx_lib });
+        gm.addRPath(.{ .cwd_relative = mlx_lib });
+        gm.linkSystemLibrary("mlxc", .{});
+        gm.linkSystemLibrary("mlx", .{});
+        const gt = b.addTest(.{ .name = "gpu-test", .root_module = gm });
+        gpu_step.dependOn(&b.addRunArtifact(gt).step);
+        gpu_build_step.dependOn(&b.addInstallArtifact(gt, .{}).step);
+    } else {
+        const fail = b.addFail("gpu-test needs -Dmlx-lib=<directory holding libmlx.dylib and libmlxc.dylib>");
+        gpu_step.dependOn(&fail.step);
+        gpu_build_step.dependOn(&fail.step);
     }
 }

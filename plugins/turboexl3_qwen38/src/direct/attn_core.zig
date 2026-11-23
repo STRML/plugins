@@ -247,7 +247,7 @@ fn gatedOut(self: *Trunk, attn_out: mlx.mlx_array, gs: fusion.GateSrc, fa: *cons
 /// takes its merge, the gate's product and o_proj's prepare in one launch. Null: the split pass with its merge, then the
 /// tail.
 fn mergedGatedOut(self: *Trunk, q_rope: mlx.mlx_array, kv_view: *const DenseKVView, blocks: mlx.mlx_array, gs: fusion.GateSrc, fa: *const FullAttnWeights, flat_shape: [3]c_int, batch: c_int, seq_len: c_int, ratio: c_int, attn_scale: f32) !?mlx.mlx_array {
-    if (seq_len < 2 or seq_len >= PREFILL_ROWS) return null;
+    if (seq_len < 1 or seq_len >= PREFILL_ROWS or (seq_len == 1 and !kv_view.has_quant_triple)) return null;
     const t = self.formats.trunk orelse return null;
     const call = t.merged_gated_out orelse return null;
     const o = self.formats.linearOf(fa.o_w) orelse return null;
@@ -262,12 +262,15 @@ fn mergedGatedOut(self: *Trunk, q_rope: mlx.mlx_array, kv_view: *const DenseKVVi
 
 // ── the arms ──
 
-/// One slot's attention over its block picks: a decode row on the decode kernel, or on an affine cache the decode gather
-/// (`dec_row`; a batched tick's rows take the split pass), up to 15 rows the split pass and its merge, from 16 the prefill
-/// gather. Each serves every K-path shape: a decline is a shape the K packs never make.
+/// One slot's attention over its block picks: a decode row on the decode kernel (dense) or the split pass (`qsplit`
+/// for affine KV, falling back to `decodeGather` if `sparseAttn` declines), up to 15 rows the split pass and its
+/// merge, from 16 the prefill gather. Each serves every K-path shape: a decline is a shape the K packs never make.
 fn picksAttn(s: mlx.mlx_stream, q: mlx.mlx_array, kv_view: *const DenseKVView, blocks: mlx.mlx_array, seq_len: c_int, ratio: c_int, attn_scale: f32, dec_row: bool) !mlx.mlx_array {
     const out = if (dec_row and seq_len == 1)
-        (if (kv_view.has_quant_triple) try decodeGather(s, q, kv_view, blocks, ratio, attn_scale) else try qsaDecAttend(s, q, kv_view.k, kv_view.v, blocks, ratio, attn_scale))
+        (if (kv_view.has_quant_triple)
+            (try sparseAttn(s, q, kv_view[0..1], &.{blocks}, ratio, attn_scale, null)) orelse try decodeGather(s, q, kv_view, blocks, ratio, attn_scale)
+        else
+            try qsaDecAttend(s, q, kv_view.k, kv_view.v, blocks, ratio, attn_scale))
     else if (seq_len < PREFILL_ROWS)
         try sparseAttn(s, q, kv_view[0..1], &.{blocks}, ratio, attn_scale, null)
     else
@@ -314,9 +317,52 @@ fn sdpa(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array,
 
 // ── the batched tick ──
 
-/// A batched tick where some slot holds block picks: 2..4 affine slots' decode rows all on picks in one launch of the
-/// split pass, else each slot's rows over its own view, through its mask, its picks (the split pass even for a decode
-/// row), or causal SDPA below the budget; stacked on the batch axis.
+fn nextSlotsChunk(total: usize, off: usize) usize {
+    return @min(4, total - off);
+}
+
+fn slotsSparseChunked(s: mlx.mlx_stream, q_rope: mlx.mlx_array, views: []const DenseKVView, blocks: []const mlx.mlx_array, ratio: c_int, attn_scale: f32) !?mlx.mlx_array {
+    const nv = views.len;
+    if (nv <= 4) return sparseAttn(s, q_rope, views, blocks, ratio, attn_scale, null);
+    if (mlx.mlx_array_ndim(q_rope) != 4) return null;
+    const qs = mlx.getShape(q_rope);
+    if (qs[0] != @as(c_int, @intCast(nv)) or qs[2] != 1) return null;
+    var chunks: [(MAX_BATCH_ROWS + 3) / 4]mlx.mlx_array = undefined;
+    var nc: usize = 0;
+    defer for (chunks[0..nc]) |c| {
+        _ = mlx.mlx_array_free(c);
+    };
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    var off: usize = 0;
+    while (off < nv) {
+        const len = nextSlotsChunk(nv, off);
+        const q_c = if (len == 1)
+            try axisView(s, q_rope, 0, off)
+        else blk: {
+            var sliced = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(sliced);
+            const start = [_]c_int{ @intCast(off), 0, 0, 0 };
+            const stop = [_]c_int{ @intCast(off + len), qs[1], qs[2], qs[3] };
+            try mlx.check(mlx.mlx_slice(&sliced, q_rope, &start, 4, &stop, 4, &strides, 4, s));
+            break :blk sliced;
+        };
+        defer _ = mlx.mlx_array_free(q_c);
+        chunks[nc] = (try sparseAttn(s, q_c, views[off..][0..len], blocks[off..][0..len], ratio, attn_scale, null)) orelse return null;
+        nc += 1;
+        off += len;
+    }
+    const vec = mlx.mlx_vector_array_new_data(&chunks, nc);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var stacked = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(stacked);
+    try mlx.check(mlx.mlx_concatenate_axis(&stacked, vec, 0, s));
+    return stacked;
+}
+
+/// A batched tick where some slot holds block picks: 2+ affine slots' decode rows all on picks in chunks of up to 4
+/// slots per `qsplit_slots` launch (so >4 slots avoid falling back to N serial 1-slot launches), else each slot's rows
+/// over its own view, through its mask, its picks (the split pass even for a decode row), or causal SDPA below the
+/// budget; stacked on the batch axis.
 fn slotsAttn(self: *Trunk, slots: []const *ForwardCtx, q_rope: mlx.mlx_array, layer: u32, seq_len: c_int, ratio: c_int, attn_scale: f32) !mlx.mlx_array {
     var views: [MAX_BATCH_ROWS]DenseKVView = undefined;
     var blocks: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
@@ -329,7 +375,9 @@ fn slotsAttn(self: *Trunk, slots: []const *ForwardCtx, q_rope: mlx.mlx_array, la
         nv += 1;
         all_picks = all_picks and sc.qsa_blocks.ctx != null and sc.qsa_mask.ctx == null;
     }
-    if (nv >= 2 and seq_len == 1 and all_picks) if (try sparseAttn(self.s, q_rope, views[0..nv], blocks[0..nv], ratio, attn_scale, null)) |out| return out;
+    if (nv >= 2 and seq_len == 1 and all_picks and views[0].has_quant_triple) {
+        if (try slotsSparseChunked(self.s, q_rope, views[0..nv], blocks[0..nv], ratio, attn_scale)) |out| return out;
+    }
     var outs: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
     var n: usize = 0;
     defer for (outs[0..n]) |o| {
@@ -1255,5 +1303,186 @@ test "direct attn: each attention kernel's header and source define every msv_ h
             std.debug.print("{s}: calls {s}, which neither its header nor its source defines\n", .{ k[0], name });
             return error.UndefinedMetalHelper;
         }
+    }
+}
+
+test "direct attn: slotsAttn chunks batches > 4 into <= 4-slot dispatches" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 4), nextSlotsChunk(8, 0));
+    try t.expectEqual(@as(usize, 4), nextSlotsChunk(8, 4));
+    try t.expectEqual(@as(usize, 4), nextSlotsChunk(5, 0));
+    try t.expectEqual(@as(usize, 1), nextSlotsChunk(5, 4));
+    try t.expectEqual(@as(usize, 3), nextSlotsChunk(7, 4));
+}
+
+test "gpu attn: seq_len=1 affine QSA sparseAttn matches decodeGather" {
+    const t = std.testing;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const hq: usize = 8;
+    const hk: usize = 1;
+    const kv: usize = 64;
+    const d: usize = 256;
+    const ratio: c_int = 4;
+    const kb: usize = 8;
+    const scale: f32 = 1.0 / @sqrt(256.0);
+
+    var q_host: [hq * d]u16 = undefined;
+    var k_host: [hk * kv * d]u16 = undefined;
+    var v_host: [hk * kv * d]u16 = undefined;
+    const bf16 = struct {
+        fn fromF32(x: f32) u16 {
+            return @truncate(@as(u32, @bitCast(x)) >> 16);
+        }
+        fn toF32(b: u16) f32 {
+            return @bitCast(@as(u32, b) << 16);
+        }
+    };
+    for (0..q_host.len) |i| q_host[i] = bf16.fromF32(@as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.05);
+    for (0..k_host.len) |i| {
+        k_host[i] = bf16.fromF32(@as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 19)) - 9)) * 0.04);
+        v_host[i] = bf16.fromF32(@as(f32, @floatFromInt(@as(i32, @intCast((i * 11) % 23)) - 11)) * 0.04);
+    }
+
+    const q = mlx.mlx_array_new_data(&q_host, &[_]c_int{ 1, hq, 1, d }, 4, .bfloat16);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = mlx.mlx_array_new_data(&k_host, &[_]c_int{ 1, hk, kv, d }, 4, .bfloat16);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = mlx.mlx_array_new_data(&v_host, &[_]c_int{ 1, hk, kv, d }, 4, .bfloat16);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    var kq = try kv_quant.quantizeAffine(s, k_dense, 64, 4);
+    defer kq.deinit();
+    var vq = try kv_quant.quantizeAffine(s, v_dense, 64, 4);
+    defer vq.deinit();
+    try mlx.check(mlx.mlx_array_eval(kq.q));
+    try mlx.check(mlx.mlx_array_eval(vq.q));
+
+    const blk_ids = [_]i32{ 0, 2, 4, 5, 7, 9, 12, 14 };
+    const blocks = mlx.mlx_array_new_data(&blk_ids, &[_]c_int{ 1, 1, kb }, 3, .int32);
+    defer _ = mlx.mlx_array_free(blocks);
+
+    const view: DenseKVView = .{
+        .k = k_dense,
+        .v = v_dense,
+        .owned = false,
+        .k_triple_q = kq.q,
+        .k_triple_scales = kq.scales,
+        .k_triple_biases = kq.biases,
+        .v_triple_q = vq.q,
+        .v_triple_scales = vq.scales,
+        .v_triple_biases = vq.biases,
+        .has_quant_triple = true,
+        .bits = 4,
+        .group_size = 64,
+        .kv_cap = kv,
+    };
+
+    const got = try picksAttn(s, q, &view, blocks, 1, ratio, scale, true);
+    defer _ = mlx.mlx_array_free(got);
+    const ref = (try decodeGather(s, q, &view, blocks, ratio, scale)).?;
+    defer _ = mlx.mlx_array_free(ref);
+    try mlx.check(mlx.mlx_array_eval(got));
+    try mlx.check(mlx.mlx_array_eval(ref));
+
+    const gp = mlx.mlx_array_data_bfloat16(got).?;
+    const rp = mlx.mlx_array_data_bfloat16(ref).?;
+    var max_err: f32 = 0;
+    for (0..hq * d) |i| {
+        const diff = @abs(bf16.toF32(gp[i]) - bf16.toF32(rp[i]));
+        if (diff > max_err) max_err = diff;
+    }
+    try t.expect(max_err < 1e-2);
+}
+
+test "gpu attn: slotsSparseChunked lifts the 4-slot cap to 6 affine slots matching solo sparseAttn" {
+    const t = std.testing;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const n_slots: usize = 6;
+    const hq: usize = 8;
+    const hk: usize = 1;
+    const kv: usize = 48;
+    const d: usize = 256;
+    const ratio: c_int = 4;
+    const kb: usize = 8;
+    const scale: f32 = 1.0 / @sqrt(256.0);
+
+    const bf16 = struct {
+        fn fromF32(x: f32) u16 {
+            return @truncate(@as(u32, @bitCast(x)) >> 16);
+        }
+        fn toF32(b: u16) f32 {
+            return @bitCast(@as(u32, b) << 16);
+        }
+    };
+
+    var q_host: [n_slots * hq * d]u16 = undefined;
+    for (0..q_host.len) |i| q_host[i] = bf16.fromF32(@as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 15)) - 7)) * 0.05);
+    const q_all = mlx.mlx_array_new_data(&q_host, &[_]c_int{ n_slots, hq, 1, d }, 4, .bfloat16);
+    defer _ = mlx.mlx_array_free(q_all);
+
+    var k_denses: [n_slots]mlx.mlx_array = undefined;
+    var v_denses: [n_slots]mlx.mlx_array = undefined;
+    var kqs: [n_slots]kv_quant.QuantizedKV = undefined;
+    var vqs: [n_slots]kv_quant.QuantizedKV = undefined;
+    var blks: [n_slots]mlx.mlx_array = undefined;
+    var views: [n_slots]DenseKVView = undefined;
+    var made: usize = 0;
+    defer for (0..made) |i| {
+        _ = mlx.mlx_array_free(k_denses[i]);
+        _ = mlx.mlx_array_free(v_denses[i]);
+        kqs[i].deinit();
+        vqs[i].deinit();
+        _ = mlx.mlx_array_free(blks[i]);
+    };
+
+    var k_buf: [hk * kv * d]u16 = undefined;
+    var v_buf: [hk * kv * d]u16 = undefined;
+    for (0..n_slots) |si| {
+        for (0..k_buf.len) |j| {
+            k_buf[j] = bf16.fromF32(@as(f32, @floatFromInt(@as(i32, @intCast((j * 5 + si * 3) % 17)) - 8)) * 0.04);
+            v_buf[j] = bf16.fromF32(@as(f32, @floatFromInt(@as(i32, @intCast((j * 9 + si * 7) % 19)) - 9)) * 0.04);
+        }
+        k_denses[si] = mlx.mlx_array_new_data(&k_buf, &[_]c_int{ 1, hk, kv, d }, 4, .bfloat16);
+        v_denses[si] = mlx.mlx_array_new_data(&v_buf, &[_]c_int{ 1, hk, kv, d }, 4, .bfloat16);
+        kqs[si] = try kv_quant.quantizeAffine(s, k_denses[si], 64, 4);
+        vqs[si] = try kv_quant.quantizeAffine(s, v_denses[si], 64, 4);
+        try mlx.check(mlx.mlx_array_eval(kqs[si].q));
+        try mlx.check(mlx.mlx_array_eval(vqs[si].q));
+        const bid = [_]i32{ 0, 1, 2, 3, 5, 7, 9, 10 };
+        blks[si] = mlx.mlx_array_new_data(&bid, &[_]c_int{ 1, 1, kb }, 3, .int32);
+        views[si] = .{
+            .k = k_denses[si],
+            .v = v_denses[si],
+            .owned = false,
+            .k_triple_q = kqs[si].q,
+            .k_triple_scales = kqs[si].scales,
+            .k_triple_biases = kqs[si].biases,
+            .v_triple_q = vqs[si].q,
+            .v_triple_scales = vqs[si].scales,
+            .v_triple_biases = vqs[si].biases,
+            .has_quant_triple = true,
+            .bits = 4,
+            .group_size = 64,
+            .kv_cap = kv,
+        };
+        made = si + 1;
+    }
+
+    const got = (try slotsSparseChunked(s, q_all, &views, &blks, ratio, scale)).?;
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(got));
+    const gp = mlx.mlx_array_data_bfloat16(got).?;
+
+    for (0..n_slots) |si| {
+        const q_i = try axisView(s, q_all, 0, si);
+        defer _ = mlx.mlx_array_free(q_i);
+        const ref_i = (try sparseAttn(s, q_i, views[si .. si + 1], blks[si .. si + 1], ratio, scale, null)).?;
+        defer _ = mlx.mlx_array_free(ref_i);
+        try mlx.check(mlx.mlx_array_eval(ref_i));
+        const rp = mlx.mlx_array_data_bfloat16(ref_i).?;
+        const off = si * hq * d;
+        try t.expectEqualSlices(u16, rp[0 .. hq * d], gp[off .. off + hq * d]);
     }
 }

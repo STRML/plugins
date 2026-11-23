@@ -53,7 +53,7 @@ pub fn expand(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A, res: 
     const hc = dimOf(res, 1);
     const d = dimOf(res, 2);
     const k = dimOf(w, 1);
-    if (n == 0 or d % 4 != 0 or dimOf(w, 0) != n or dimOf(shared, 0) != n or dimOf(shared, 1) != d or dimOf(pc, 0) != n or dimOf(pc, 1) != hc + hc * hc)
+    if (n == 0 or hc == 0 or k == 0 or d == 0 or d % 4 != 0 or dimOf(w, 0) != n or dimOf(shared, 0) != n or dimOf(shared, 1) != d or dimOf(pc, 0) != n or dimOf(pc, 1) != hc + hc * hc)
         return error.TailFuseShape;
     if (mlx.mlx_array_dtype(w) != .float32 or mlx.mlx_array_dtype(pc) != .float32 or mlx.mlx_array_dtype(loc) != .int32)
         return error.TailFuseDtype;
@@ -66,7 +66,7 @@ pub fn expand(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A, res: 
     const shape = [_]c_int{ ci(n), ci(hc), ci(d) };
     const dt = mlx.mlx_array_dtype(res);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(n * (d / 4)), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(d / 4), ci(n), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", ci(k)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", ci(d)));
@@ -98,7 +98,7 @@ pub fn expandDecode(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A,
     const hc = dimOf(res, 1);
     const d = dimOf(res, 2);
     const k = dimOf(w, 1);
-    if (n == 0 or n > decode_rows or d % 4 != 0 or dimOf(w, 0) != n or dimOf(shared, 0) != n or dimOf(shared, 1) != d or dimOf(pc, 0) != n or dimOf(pc, 1) != hc + hc * hc)
+    if (n == 0 or n > decode_rows or hc == 0 or k == 0 or d == 0 or d % 4 != 0 or dimOf(w, 0) != n or dimOf(shared, 0) != n or dimOf(shared, 1) != d or dimOf(pc, 0) != n or dimOf(pc, 1) != hc + hc * hc)
         return error.TailFuseShape;
     if (mlx.mlx_array_dtype(w) != .float32 or mlx.mlx_array_dtype(pc) != .float32 or mlx.mlx_array_dtype(loc) != .int32)
         return error.TailFuseDtype;
@@ -111,7 +111,7 @@ pub fn expandDecode(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A,
     const shape = [_]c_int{ ci(n), ci(hc), ci(d) };
     const dt = mlx.mlx_array_dtype(res);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(n * (d / 4)), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(d / 4), ci(n), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", ci(k)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", ci(d)));
@@ -138,10 +138,10 @@ pub fn expandDecode(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A,
 /// stock's): Metal's argument table holds 31 (sx3's twin bound a `dst` and an `after` beside them, 32, and did not
 /// compile). A missed anchor refuses by name.
 var into_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const into_head_old = "const uint g = thread_position_in_grid.x;\n";
-const into_head_new = "const uint g = thread_position_in_grid.x;\nif (g == 0) carrier[0] = 0;\n";
-const into_store_old = "        out[(ulong(row) * ulong(HC) + ulong(k2)) * ulong(D) + ulong(col) + i] = static_cast<T>(metal::fma(pr[k2], y[i], acc));";
-const into_store_new = "        ((device T*)res)[(ulong(row) * ulong(HC) + ulong(k2)) * ulong(D) + ulong(col) + i] = static_cast<T>(metal::fma(pr[k2], y[i], acc));";
+const into_head_old = "const uint dc_idx = thread_position_in_grid.x;\nconst uint row = thread_position_in_grid.y;\n";
+const into_head_new = "const uint dc_idx = thread_position_in_grid.x;\nconst uint row = thread_position_in_grid.y;\nif (dc_idx == 0 && row == 0) carrier[0] = 0;\n";
+const into_store_old = "    tf_store4(out + (ulong(row) * ulong(HC) + ulong(k2)) * ulong(D) + ulong(col), metal::fma(tg_pc[k2], y, acc));";
+const into_store_new = "    tf_store4((device T*)res + (ulong(row) * ulong(HC) + ulong(k2)) * ulong(D) + ulong(col), metal::fma(tg_pc[k2], y, acc));";
 
 /// The buffers one Metal kernel binds: its argument table's indices 0 to 30.
 pub const metal_buffers = 31;
@@ -197,7 +197,7 @@ pub fn expandInto(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A, r
     const hc = dimOf(res, 1);
     const d = dimOf(res, 2);
     const k = dimOf(w, 1);
-    if (n == 0 or d % 4 != 0 or dimOf(w, 0) != n or dimOf(shared, 0) != n or dimOf(shared, 1) != d or dimOf(pc, 0) != n or dimOf(pc, 1) != hc + hc * hc)
+    if (n == 0 or hc == 0 or k == 0 or d == 0 or d % 4 != 0 or dimOf(w, 0) != n or dimOf(shared, 0) != n or dimOf(shared, 1) != d or dimOf(pc, 0) != n or dimOf(pc, 1) != hc + hc * hc)
         return error.TailFuseShape;
     if (mlx.mlx_array_dtype(w) != .float32 or mlx.mlx_array_dtype(pc) != .float32 or mlx.mlx_array_dtype(loc) != .int32)
         return error.TailFuseDtype;
@@ -210,7 +210,7 @@ pub fn expandInto(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A, r
     const one = [_]c_int{1};
     const dt = mlx.mlx_array_dtype(res);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &one, one.len, .uint32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(n * (d / 4)), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(d / 4), ci(n), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", ci(k)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", ci(d)));
@@ -227,4 +227,13 @@ pub fn expandInto(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A, r
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
     return out;
+}
+
+test "tail_fuse: intoSource transforms vectorized tail_fuse.metal cleanly" {
+    const t = std.testing;
+    const src = try intoSource(t.allocator, body);
+    defer t.allocator.free(src);
+    try t.expect(std.mem.indexOf(u8, src, "if (dc_idx == 0 && row == 0) carrier[0] = 0;") != null);
+    try t.expect(std.mem.indexOf(u8, src, "tf_store4((device T*)res +") != null);
+    try t.expect(std.mem.indexOf(u8, src, "tf_store4(out +") == null);
 }

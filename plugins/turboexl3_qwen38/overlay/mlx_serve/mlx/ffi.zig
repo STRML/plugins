@@ -143,9 +143,18 @@ pub fn getShape(arr: mlx_array) []const c_int {
     return c.mlx_array_shape(arr)[0..ndim];
 }
 
-/// An outside plugin runs inside the macOS server, whose MLX has Metal.
+var no_gpu_backend_cache: ?bool = null;
+
+/// True when MLX has no Metal/GPU backend (headless, sandboxed, or non-Metal build).
 pub fn noGpuBackend() bool {
-    return false;
+    if (no_gpu_backend_cache == null) {
+        var avail: bool = false;
+        if (comptime builtin.os.tag.isDarwin()) {
+            _ = c.mlx_metal_is_available(&avail);
+        }
+        no_gpu_backend_cache = !avail;
+    }
+    return no_gpu_backend_cache.?;
 }
 
 // Metal only. These are inline so their answers are known at compile time: a copy's CUDA path and its fallback for a
@@ -214,6 +223,22 @@ pub fn gpuArchitectureName() []const u8 {
     }
     arch_len = n;
     return arch_buf[0..n];
+}
+
+var virtual_gpu_cache: ?bool = null;
+
+/// A virtual Metal GPU (a macOS VM, GitHub's macOS runners) names no Apple GPU family (`architecture` "air64_v27",
+/// not "applegpu_gNN"). Metal proofs and GPU kernel launches must skip or refuse there.
+pub fn virtualGpu() bool {
+    if (virtual_gpu_cache == null) {
+        const arch = gpuArchitectureName();
+        virtual_gpu_cache = (comptime builtin.os.tag.isDarwin()) and !noGpuBackend() and arch.len > 0 and virtualArch(arch);
+    }
+    return virtual_gpu_cache.?;
+}
+
+fn virtualArch(arch: []const u8) bool {
+    return !std.mem.startsWith(u8, arch, "applegpu");
 }
 
 pub fn maxRecommendedWorkingSet() usize {

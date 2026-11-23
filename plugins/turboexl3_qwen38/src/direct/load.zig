@@ -1428,6 +1428,7 @@ test "direct load: an EXL3 trunk pack warms the n-gram table only when its weigh
 
 test "direct load: a trellis n-gram table takes its per-head bias from the map, and a pack without one is refused" {
     const testing = std.testing;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const empty: [0]u8 align(std.heap.page_size_min) = .{};
     var table: NgramTable = .{ .map = &empty, .rows = 1, .dim = 4, .bits = 6, .group_size = 0, .w_off = 0, .s_off = 0, .b_off = 0, .wcols = 3, .scols = 0, .trellis_k = 6, .gpu_owns_map = true };
     defer table.close();

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const abi = @import("mlx_serve").abi.quant;
+const hats_cache = @import("src/hats_cache.zig");
 
 /// The exllamav3 codebook this plugin serves: the joined `wo_a` run, the fused shared expert and the streamed bank
 /// decode mul1 only.
@@ -53,11 +54,24 @@ pub fn validate(block_json: abi.Str, config_json: abi.Str, dir: *const abi.PackD
     return .ok;
 }
 
-/// Resident as the pack stores it.
+pub fn hasExpertsBin(model_dir: []const u8) bool {
+    if (model_dir.len == 0) return false;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.Io.Dir.cwd().openDir(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    const file = dir.openFile(io, "experts.bin", .{}) catch return false;
+    defer file.close(io);
+    const st = file.stat(io) catch return false;
+    return st.size > 0;
+}
+
+/// Resident bytes of the EXL3 weights once loaded. Streamed packs (`experts.bin`) clear `hats_cache` on decode
+/// phase and deduct its prompt headroom in `budgetOf`; non-streamed packs have no bank phase hook so bill its peak
+/// cache capacity directly when `experts.bin` is absent.
 pub fn bill(block_json: abi.Str, model_dir: abi.Str, stored: u64) callconv(.c) u64 {
     _ = block_json;
-    _ = model_dir;
-    return stored;
+    if (stored == 0 or hasExpertsBin(model_dir.slice())) return stored;
+    return stored +| hats_cache.defaultHostCapBytes();
 }
 
 // ── tests ──
@@ -84,4 +98,21 @@ test "turboexl3_ds41 config: claims exllamav3's block on a DeepSeek-V4.1 pack on
 test "turboexl3_ds41 config: the trunk's hyper-connection streams from text_config" {
     try testing.expectEqual(@as(?u32, 4), hcOf(sc281));
     try testing.expectEqual(@as(?u32, null), hcOf("{\"model_type\":\"deepseek_v41\"}"));
+}
+
+test "turboexl3_ds41 config: bill adds hats cache cap only for non-streamed packs" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(dir_path);
+
+    const block = abi.Str.of("{\"quant_method\":\"exl3\",\"codebook\":\"mul1\"}");
+    try testing.expectEqual(@as(u64, 0), bill(block, abi.Str.of(dir_path), 0));
+    try testing.expectEqual(1000 + hats_cache.defaultHostCapBytes(), bill(block, abi.Str.of(dir_path), 1000));
+
+    var f = try tmp.dir.createFile(io, "experts.bin", .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, "exl3");
+    try testing.expectEqual(@as(u64, 1000), bill(block, abi.Str.of(dir_path), 1000));
 }

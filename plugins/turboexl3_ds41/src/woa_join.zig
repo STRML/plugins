@@ -81,6 +81,7 @@ const finish_outs: []const [*:0]const u8 = &.{"y"};
 
 /// The two kernels from turboexl3's texts (built once; `deinit` at the model's).
 pub fn build(a: std.mem.Allocator) !void {
+    if (mlx.noGpuBackend() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return;
     if (kernels.prep != null) return;
     const pt = try derive(a, t3.dense.text_prep, prep_prologue, &prep_subs);
     defer a.free(pt);
@@ -147,7 +148,7 @@ fn launch(k: mlx.mlx_fast_metal_kernel, ins: []const A, out_shape: []const c_int
 pub fn run(s: mlx.mlx_stream, x: A, p: t3.Proj, hats: *Hats) !?A {
     const kp = kernels.prep orelse return null;
     const kf = kernels.finish orelse return null;
-    if (!mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsGpu(s) or mlx.virtualGpu()) return null;
     const xsh = mlx.getShape(x);
     const tsh = mlx.getShape(p.trellis);
     if (xsh.len != 3 or tsh.len != 4) return null;
